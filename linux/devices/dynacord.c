@@ -9,7 +9,8 @@
  * The core's bulk/interrupt URB model can't express that, so this device
  * runs its own URBs through the start_urbs/stop_urbs ops.
  *
- * Capture (bulk 0x86) is drained but not yet exposed to ALSA.
+ * Capture is bulk 0x86 in the Xone's 64-byte frame format, of which only
+ * channels 1-4 carry data.
  */
 
 #include <linux/jiffies.h>
@@ -23,6 +24,7 @@
 #include "dynacord.h"
 #include "../../common/devices/ploytec/ploytec_defs.h"
 #include "../../common/devices/ploytec/ploytec_protocol.h"
+#include "../../common/devices/ploytec/ploytec_codec.h"
 #include "../../common/devices/ploytec/dynacord_pacer.h"
 #include "../../common/devices/ploytec/dynacord_feedback.h"
 
@@ -35,7 +37,10 @@
 #define CMS_FB_URBS      8
 #define CMS_FB_PKTS      5
 #define CMS_IN_URBS      4
-#define CMS_IN_URB_SIZE  18432  /* 3 ms at 96 kHz, a multiple of 512 */
+#define CMS_IN_URB_MAX   18432  /* 3 ms at 96 kHz, a multiple of 512 */
+
+/* Bytes 0x1b and 0x3b of every capture frame are always this */
+#define CMS_IN_MARKER    0xce
 
 /* No valid feedback for this long means the device has stopped streaming */
 #define CMS_FB_TIMEOUT_MS 50
@@ -54,6 +59,7 @@ struct dynacord_private {
 	bool fb_lost;                 /* feedback went silent; reported once */
 	bool stopping;                /* handlers must not resubmit */
 	bool running;                 /* URBs allocated and submitted */
+	bool misaligned;              /* capture frames lost alignment; reported once */
 
 	unsigned int out_stride;      /* wMaxPacketSize of the PCM out endpoint */
 	unsigned int fb_stride;       /* wMaxPacketSize of the feedback endpoint */
@@ -393,13 +399,60 @@ static void dynacord_fb_complete(struct urb *urb)
 	dynacord_resubmit(chip, urb);
 }
 
-/* Capture isn't exposed yet; keep the bulk IN endpoint drained. */
+/*
+ * dynacord_in_complete - Decode capture frames into the ALSA ring.
+ *
+ * ploytec_decode_frame() gives 8 channels; the CMS fills only the first 4,
+ * so copy those. Frames whose marker bytes are wrong are dropped, since
+ * decoding them would give noise.
+ */
 static void dynacord_in_complete(struct urb *urb)
 {
 	struct ozzy_chip *chip = urb->context;
+	struct dynacord_private *priv = chip->private_data;
+	struct pcm_substream *sub = &chip->pcm->capture;
+	struct snd_pcm_substream *elapsed = NULL;
+	const u8 *buf = urb->transfer_buffer;
+	unsigned int frames = urb->actual_length / PLOYTEC_IN_FRAME_SIZE;
+	unsigned long flags;
+	u8 decoded[PLOYTEC_CHANNELS * 3];
+	unsigned int f;
 
 	if (dynacord_urb_dead(chip, urb))
 		return;
+
+	spin_lock_irqsave(&sub->lock, flags);
+	if (sub->active && !urb->status) {
+		u8 *ring = sub->instance->runtime->dma_area;
+		unsigned int ring_size = snd_pcm_lib_buffer_bytes(sub->instance);
+		unsigned int off = sub->dma_off;
+		unsigned int written = 0;
+
+		for (f = 0; f < frames; f++) {
+			const u8 *src = buf + f * PLOYTEC_IN_FRAME_SIZE;
+
+			if (src[0x1b] != CMS_IN_MARKER || src[0x3b] != CMS_IN_MARKER) {
+				if (!xchg(&priv->misaligned, true))
+					dynacord_err(&chip->dev->dev,
+						     "capture frame without 0xce markers; dropping\n");
+				continue;
+			}
+			ploytec_decode_frame(decoded, src);
+			/* the ring holds whole frames, so one never wraps */
+			memcpy(ring + off, decoded, DYNACORD_OUT_FRAME_SIZE);
+			off += DYNACORD_OUT_FRAME_SIZE;
+			if (off >= ring_size)
+				off = 0;
+			written += DYNACORD_OUT_FRAME_SIZE;
+		}
+		if (ozzy_pcm_advance(sub, written))
+			elapsed = sub->instance;
+	}
+	spin_unlock_irqrestore(&sub->lock, flags);
+
+	if (elapsed)
+		snd_pcm_period_elapsed(elapsed);
+
 	dynacord_resubmit(chip, urb);
 }
 
@@ -441,7 +494,7 @@ static void dynacord_free_urb(struct urb *urb)
 }
 
 /*
- * dynacord_start_urbs - Allocate and submit feedback, capture-drain and
+ * dynacord_start_urbs - Allocate and submit feedback, capture and
  * playback URBs, in that order, with the pacer reset to the current rate.
  */
 static int dynacord_start_urbs(struct ozzy_chip *chip)
@@ -451,6 +504,7 @@ static int dynacord_start_urbs(struct ozzy_chip *chip)
 	struct usb_host_endpoint *ep_out = dev->ep_out[DYNACORD_EP_PCM_OUT & USB_ENDPOINT_NUMBER_MASK];
 	struct usb_host_endpoint *ep_fb = dev->ep_in[DYNACORD_EP_FEEDBACK & USB_ENDPOINT_NUMBER_MASK];
 	struct usb_host_endpoint *ep_in = dev->ep_in[DYNACORD_EP_PCM_IN & USB_ENDPOINT_NUMBER_MASK];
+	unsigned int rate, in_size;
 	int i, ret;
 
 	if (!priv)
@@ -480,10 +534,16 @@ static int dynacord_start_urbs(struct ozzy_chip *chip)
 		return -ENODEV;
 	}
 
+	/* 3 ms of capture per URB, as the Windows driver does */
+	rate = chip->info->rates[chip->current_rate];
+	in_size = min_t(unsigned int, ((rate * 3 / 1000) & ~7u) * PLOYTEC_IN_FRAME_SIZE,
+			CMS_IN_URB_MAX);
+
 	WRITE_ONCE(priv->stopping, false);
+	priv->misaligned = false;
 	priv->fb_seen = false;
 	priv->fb_lost = false;
-	pacer_init(&priv->pacer, chip->info->rates[chip->current_rate]);
+	pacer_init(&priv->pacer, rate);
 
 	/* High-speed iso intervals are 2^(bInterval-1) microframes */
 	for (i = 0; i < CMS_FB_URBS; i++) {
@@ -495,7 +555,7 @@ static int dynacord_start_urbs(struct ozzy_chip *chip)
 			goto nomem;
 	}
 	for (i = 0; i < CMS_IN_URBS; i++) {
-		void *buf = kmalloc(CMS_IN_URB_SIZE, GFP_KERNEL);
+		void *buf = kmalloc(in_size, GFP_KERNEL);
 
 		priv->in[i] = usb_alloc_urb(0, GFP_KERNEL);
 		if (!priv->in[i] || !buf) {
@@ -503,7 +563,7 @@ static int dynacord_start_urbs(struct ozzy_chip *chip)
 			goto nomem;
 		}
 		usb_fill_bulk_urb(priv->in[i], dev, usb_rcvbulkpipe(dev, DYNACORD_EP_PCM_IN),
-				  buf, CMS_IN_URB_SIZE, dynacord_in_complete, chip);
+				  buf, in_size, dynacord_in_complete, chip);
 	}
 	for (i = 0; i < CMS_OUT_URBS; i++) {
 		priv->out[i] = dynacord_alloc_iso(chip, usb_sndisocpipe(dev, DYNACORD_EP_PCM_OUT),
@@ -592,7 +652,7 @@ static void dynacord_stop_urbs(struct ozzy_chip *chip)
 const struct ozzy_device_info dynacord_info = {
 	.name                  = "Dynacord CMS 600-3",
 	.playback_channels     = DYNACORD_CHANNELS,
-	.capture_channels      = 0,
+	.capture_channels      = DYNACORD_CHANNELS,
 	/* one URB at 48 kHz; sizes the ALSA period and buffer limits */
 	.frames_per_out_packet = CMS_OUT_PKTS * 6,
 	.out_ep                = DYNACORD_EP_PCM_OUT,
