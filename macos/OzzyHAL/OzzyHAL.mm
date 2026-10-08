@@ -2,6 +2,11 @@
 #include "../Devices/Ploytec/PloytecCodec.h"
 #include "../Devices/Ploytec/PloytecProtocol.h"
 #include "../Shared/OzzyLog.h"
+#include "../Devices/Dynacord/DynacordCodec.h"
+#include "../Devices/Dynacord/DynacordRing.h"
+#include <algorithm>
+#include <cstring>
+#include <mach/mach_time.h>
 #include <CoreAudio/CoreAudio.h>
 
 static CFStringRef SafeCreateString(const char* str) {
@@ -10,6 +15,22 @@ static CFStringRef SafeCreateString(const char* str) {
     if (!s) s = CFStringCreateWithCString(NULL, str, kCFStringEncodingMacRoman);
     if (!s) s = CFStringCreateWithCString(NULL, str, kCFStringEncodingASCII);
     return s;
+}
+
+/* The segment is world-writable and its strings carry no NUL guarantee. */
+struct SHMName { char s[65]; };
+static SHMName CopyName(const char (&src)[64]) {
+    SHMName n;
+    size_t len = strnlen(src, sizeof(src));
+    memcpy(n.s, src, len);
+    n.s[len] = 0;
+    return n;
+}
+
+static uint64_t MsToHostTicks(uint64_t ms) {
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    return ms * 1000000ull * tb.denom / tb.numer;
 }
 
 static UInt32 GetAudioBufferListSize(UInt32 numBuffers) {
@@ -109,14 +130,88 @@ void OzzyHAL::RebuildStreamConfigs() {
     const uint32_t kBytesPerFrame = mCurrentStreamFormat.mBytesPerFrame;
 
     mInputConfig.mNumberBuffers = 1;
-    mInputConfig.mBuffers[0].mNumberChannels = 8;
+    mInputConfig.mBuffers[0].mNumberChannels = mChannels;
     mInputConfig.mBuffers[0].mDataByteSize = kDefaultIOFrames * kBytesPerFrame;
     mInputConfig.mBuffers[0].mData = nullptr;
 
     mOutputConfig.mNumberBuffers = 1;
-    mOutputConfig.mBuffers[0].mNumberChannels = 8;
+    mOutputConfig.mBuffers[0].mNumberChannels = mChannels;
     mOutputConfig.mBuffers[0].mDataByteSize = kDefaultIOFrames * kBytesPerFrame;
     mOutputConfig.mBuffers[0].mData = nullptr;
+}
+
+/* Layout v1 (Xone): 8x8 at 96 kHz in 80-frame packet rings. Returns false, leaving state untouched, if the segment's values are unusable. */
+bool OzzyHAL::ApplyPacketLayout() {
+    const uint32_t fpp = mSHM->audio.framesPerPacket;
+    const uint32_t outBytes = mSHM->audio.outputBytesPerFrame;
+    const uint32_t inBytes = mSHM->audio.inputBytesPerFrame;
+    /* The Xone codecs index 80-frame logical packets at kOzzyMaxPacketSize strides, so fpp <= 80 keeps every index inside the buffers. */
+    if (fpp < 1 || fpp > 80) { LogOzzyHALError("bad shm framesPerPacket %{public}u", fpp); return false; }
+    if (outBytes != 48) { LogOzzyHALError("bad shm outputBytesPerFrame %{public}u", outBytes); return false; }
+    if (inBytes != 64) { LogOzzyHALError("bad shm inputBytesPerFrame %{public}u", inBytes); return false; }
+
+    mIsDynacord = false;
+    mFramesPerPacket = fpp;
+    mRingSize = kOzzyNumPackets * fpp;
+    mRingSizeIn = mRingSize;
+    mOutputBytesPerFrame = outBytes;
+    mInputBytesPerFrame = inBytes;
+    mZeroTimestampPeriod = 2 * fpp * 4;
+    mSafetyOffsetOut = mSafetyOffsetIn = 2 * fpp;
+    mChannels = 8;
+    mCurrentStreamFormat.mSampleRate = 96000.0;
+    mAvailableSampleRates.mMinimum = mAvailableSampleRates.mMaximum = 96000.0;
+    mCurrentStreamFormat.mChannelsPerFrame = mChannels;
+    mCurrentStreamFormat.mBytesPerFrame = mCurrentStreamFormat.mBytesPerPacket = 4 * mChannels;
+    RebuildStreamConfigs();
+    return true;
+}
+
+/* Layout v2 (Dynacord, kext or daemon): everything comes from the segment. Returns false, leaving state untouched, if any value is unusable. */
+bool OzzyHAL::ApplyFrameLayout() {
+    const uint32_t vendor = mSHM->vendorID;
+    const uint32_t rate = mSHM->audio.sampleRate.load();
+    const uint32_t outBytes = mSHM->audio.outputBytesPerFrame;
+    const uint32_t inBytes = mSHM->audio.inputBytesPerFrame;
+    const uint32_t ringOut = mSHM->audio.ringFramesOut;
+    const uint32_t ringIn = mSHM->audio.ringFramesIn;
+    const uint32_t period = mSHM->audio.zeroTimestampPeriod;
+    const uint32_t safeOut = mSHM->audio.safetyOffsetOut;
+    const uint32_t safeIn = mSHM->audio.safetyOffsetIn;
+    const uint32_t bufBytes = kOzzyMaxPacketSize * kOzzyNumPackets;
+
+    if (vendor != DYNACORD_VENDOR_ID) { LogOzzyHALError("v2 shm with vendorID 0x%{public}04X", vendor); return false; }
+    if (rate != 44100 && rate != 48000 && rate != 96000) { LogOzzyHALError("bad shm sampleRate %{public}u", rate); return false; }
+    if (outBytes != kDynacordOutFrameBytes) { LogOzzyHALError("bad shm outputBytesPerFrame %{public}u", outBytes); return false; }
+    if (inBytes != kDynacordInFrameBytes) { LogOzzyHALError("bad shm inputBytesPerFrame %{public}u", inBytes); return false; }
+    if (ringOut < 1 || ringOut > bufBytes / kDynacordOutFrameBytes) { LogOzzyHALError("bad shm ringFramesOut %{public}u", ringOut); return false; }
+    if (ringIn < 1 || ringIn > bufBytes / kDynacordInFrameBytes) { LogOzzyHALError("bad shm ringFramesIn %{public}u", ringIn); return false; }
+    /* CoreAudio stalls if the anchor period is shorter than its IO buffer (512 frames by default); 1024 leaves room. */
+    if (period < 1024 || period > std::min(ringOut, ringIn)) { LogOzzyHALError("bad shm zeroTimestampPeriod %{public}u", period); return false; }
+    if (safeOut >= ringOut) { LogOzzyHALError("bad shm safetyOffsetOut %{public}u", safeOut); return false; }
+    if (safeIn >= ringIn) { LogOzzyHALError("bad shm safetyOffsetIn %{public}u", safeIn); return false; }
+
+    mIsDynacord = true;
+    mRingSize = ringOut;
+    mRingSizeIn = ringIn;
+    mOutputBytesPerFrame = outBytes;
+    mInputBytesPerFrame = inBytes;
+    mZeroTimestampPeriod = period;
+    mSafetyOffsetOut = safeOut;
+    mSafetyOffsetIn = safeIn;
+    mChannels = DYNACORD_CHANNELS;
+    mCurrentStreamFormat.mSampleRate = (Float64)rate;
+    mAvailableSampleRates.mMinimum = mAvailableSampleRates.mMaximum = (Float64)rate;
+    mCurrentStreamFormat.mChannelsPerFrame = mChannels;
+    mCurrentStreamFormat.mBytesPerFrame = mCurrentStreamFormat.mBytesPerPacket = 4 * mChannels;
+    RebuildStreamConfigs();
+    return true;
+}
+
+/* Release the mapping now, or if IO may still be running, only mark it dead so the IO path stops touching it; the monitor unmaps after StopIO. */
+void OzzyHAL::DropMapping() {
+    mMappingDead.store(true);   // first: StartIO and the IO path see this before they touch the segment
+    if (mIOClients.load() == 0) UnmapSharedMemory();
 }
 
 void OzzyHAL::MapSharedMemory() {
@@ -159,7 +254,7 @@ void OzzyHAL::MapSharedMemory() {
         mSHMFd = shm_open(kOzzySharedMemName, O_RDWR, 0666);
         if (mSHMFd != -1) {
             struct stat sb;
-            if (fstat(mSHMFd, &sb) == 0) {
+            if (fstat(mSHMFd, &sb) == 0 && (size_t)sb.st_size >= sizeof(OzzySharedMemory)) {
                 mSHMInode = sb.st_ino;
                 void* ptr = mmap(NULL, sizeof(OzzySharedMemory), PROT_READ | PROT_WRITE, MAP_SHARED, mSHMFd, 0);
                 if (ptr != MAP_FAILED) {
@@ -181,8 +276,25 @@ void OzzyHAL::MapSharedMemory() {
             UnmapSharedMemory();
             return;
         }
+        if (mSHM->version != kOzzyLayoutPackets && mSHM->version != kOzzyLayoutFrames) {
+            LogOzzyHALError("unknown shm layout version %{public}u", mSHM->version);
+            UnmapSharedMemory();
+            return;
+        }
+        // The kext or daemon publishes its identity before the engine has run
+        // init and described the rings; come back on the next poll.
+        if (mSHM->version == kOzzyLayoutFrames && mSHM->audio.ringFramesOut == 0) {
+            UnmapSharedMemory();
+            return;
+        }
 
         if (mSHM->vendorID == 0) {
+            UnmapSharedMemory();
+            return;
+        }
+
+        bool layoutOK = (mSHM->version == kOzzyLayoutFrames) ? ApplyFrameLayout() : ApplyPacketLayout();
+        if (!layoutOK) {
             UnmapSharedMemory();
             return;
         }
@@ -190,34 +302,26 @@ void OzzyHAL::MapSharedMemory() {
         mLastSessionID = mSHM->sessionID;
         mInputBufferAddr = mSHM->audio.inputBuffer;
         mOutputBufferAddr = mSHM->audio.outputBuffer;
-        
-        // Cache frame format for real-time I/O performance
-        mFramesPerPacket = mSHM->audio.framesPerPacket;  // e.g., 80 frames per logical packet
-        // Ring buffer size in FRAMES: 128 logical packets * 80 frames = 10,240 frames
-        mRingSize = kOzzyNumPackets * mFramesPerPacket;
-        mOutputBytesPerFrame = mSHM->audio.outputBytesPerFrame;
-        mInputBytesPerFrame = mSHM->audio.inputBytesPerFrame;
-        
-        // Calculate zero timestamp period: 2 URBs * framesPerPacket * 4
-        mZeroTimestampPeriod = 2 * mFramesPerPacket * 4;
-        
-        // Set codec based on device (vendorID/productID)
-        bool isBulk = (mSHM->audio.deviceFlags & 1);
-        if (mSHM->vendorID == PLOYTEC_VENDOR_ID) {
+        mMappingDead.store(false);
+
+        mLastHeartbeat = mSHM->heartbeat.load(std::memory_order_relaxed);
+        mHeartbeatSeenAt = mach_absolute_time();
+
+        if (mIsDynacord) {
+            mEncode = nullptr;
+            mDecode = nullptr;
+            mWriteOutput = DynacordWriteOutput;
+            mReadInput = DynacordReadInput;
+            mClearOutput = DynacordClearOutput;
+            LogOzzyHAL("using Dynacord codec at %{public}u Hz", mSHM->audio.sampleRate.load());
+        } else {
+            bool isBulk = (mSHM->audio.deviceFlags & 1);
             mEncode = PloytecEncodePCM;
             mDecode = PloytecDecodePCM;
             mWriteOutput = isBulk ? PloytecWriteOutputBulk : PloytecWriteOutputInterrupt;
             mReadInput = PloytecReadInput;
             mClearOutput = isBulk ? PloytecClearOutputBulk : PloytecClearOutputInterrupt;
             LogOzzyHAL("using Ploytec codec (%{public}s) for VID:0x%{public}04X",
-                       isBulk ? "bulk" : "interrupt", mSHM->vendorID);
-        } else {
-            mEncode = PloytecEncodePCM;
-            mDecode = PloytecDecodePCM;
-            mWriteOutput = isBulk ? PloytecWriteOutputBulk : PloytecWriteOutputInterrupt;
-            mReadInput = PloytecReadInput;
-            mClearOutput = isBulk ? PloytecClearOutputBulk : PloytecClearOutputInterrupt;
-            LogOzzyHAL("using default codec (%{public}s) for VID:0x%{public}04X",
                        isBulk ? "bulk" : "interrupt", mSHM->vendorID);
         }
     }
@@ -226,27 +330,34 @@ void OzzyHAL::MapSharedMemory() {
 void OzzyHAL::UnmapSharedMemory() {
     if (!mSHM) return;
 
-    if (mIsKextMapping) {
-        // Cleanup Kext
-        if (mKextMapAddress) {
-            IOConnectUnmapMemory(mKextConnect, 0, mach_task_self(), mKextMapAddress);
-            mKextMapAddress = 0;
-        }
-        if (mKextConnect != IO_OBJECT_NULL) {
-            IOServiceClose(mKextConnect);
-            mKextConnect = IO_OBJECT_NULL;
-        }
-    } else {
-        // Cleanup Daemon
-        munmap(mSHM, sizeof(OzzySharedMemory));
-        if (mSHMFd != -1) { close(mSHMFd); mSHMFd = -1; }
-        mSHMInode = 0;
-    }
-
+    // Hide the mapping from the IO path before it goes away.
+    OzzySharedMemory* shm = mSHM;
+    mMappingDead.store(true);
     mSHM = nullptr;
     mInputBufferAddr = nullptr;
     mOutputBufferAddr = nullptr;
+
+    if (mIsKextMapping) {
+        // Cleanup Kext
+        mach_vm_address_t addr = mKextMapAddress;
+        io_connect_t conn = mKextConnect;
+        mKextMapAddress = 0;
+        mKextConnect = IO_OBJECT_NULL;
+        if (addr) IOConnectUnmapMemory(conn, 0, mach_task_self(), addr);
+        if (conn != IO_OBJECT_NULL) IOServiceClose(conn);
+    } else {
+        // Cleanup Daemon
+        int fd = mSHMFd;
+        mSHMFd = -1;
+        munmap(shm, sizeof(OzzySharedMemory));
+        if (fd != -1) close(fd);
+        mSHMInode = 0;
+    }
+
     mIsKextMapping = false;
+    mMappingDead.store(false);
+    mLastAnchorSample = 0;
+    mLastAnchorHost = 0;
 }
 
 void* OzzyHAL::MonitorEntry(void* arg) {
@@ -259,7 +370,10 @@ void OzzyHAL::MonitorLoop() {
     if (mSHM) {
         bool hwReady = mSHM->audio.hardwarePresent.load();
         bool drvReady = mSHM->audio.driverReady.load();
-        bool metaReady = (mSHM->productName[0] != 0);
+        SHMName product = CopyName(mSHM->productName);
+        SHMName manufacturer = CopyName(mSHM->manufacturerName);
+        SHMName serial = CopyName(mSHM->serialNumber);
+        bool metaReady = (product.s[0] != 0);
         bool initiallyConnected = (hwReady && drvReady && metaReady);
         
         if (initiallyConnected) {
@@ -267,18 +381,18 @@ void OzzyHAL::MonitorLoop() {
             mLastConnectedState = true;
             
             // Update device metadata
-            if (mSHM->productName[0] != 0) {
+            if (product.s[0] != 0) {
                 if (mModelUID) CFRelease(mModelUID);
-                mModelUID = SafeCreateString(mSHM->productName);
+                mModelUID = SafeCreateString(product.s);
             }
-            if (mSHM->manufacturerName[0] != 0) {
+            if (manufacturer.s[0] != 0) {
                 if (mManufacturerUID) CFRelease(mManufacturerUID);
-                mManufacturerUID = SafeCreateString(mSHM->manufacturerName);
+                mManufacturerUID = SafeCreateString(manufacturer.s);
             }
-            if (mSHM->serialNumber[0] != 0) {
+            if (serial.s[0] != 0) {
                 if (mDeviceUID) CFRelease(mDeviceUID);
                 char uidBuf[128];
-                snprintf(uidBuf, sizeof(uidBuf), "OzzyHAL.%s", mSHM->serialNumber);
+                snprintf(uidBuf, sizeof(uidBuf), "OzzyHAL.%s", serial.s);
                 mDeviceUID = SafeCreateString(uidBuf);
             }
             
@@ -302,6 +416,9 @@ void OzzyHAL::MonitorLoop() {
                 continue;
             }
             mLoggedWaitingForDriver = false;
+        } else if (mMappingDead.load()) {
+            // Dropped while IO was running: unmap once CoreAudio has stopped it.
+            if (mIOClients.load() == 0) UnmapSharedMemory();
         } else {
             // Check Health
             if (mIsKextMapping) {
@@ -311,7 +428,7 @@ void OzzyHAL::MonitorLoop() {
                 
                 if (!magicValid || !hwPresent) {
                      LogOzzyHAL("device disconnected (magic: %{public}d, hw: %{public}d)", magicValid, hwPresent);
-                     UnmapSharedMemory();
+                     DropMapping();
                      // Don't continue - let state update happen below
                 }
             } else {
@@ -319,7 +436,7 @@ void OzzyHAL::MonitorLoop() {
                 struct stat sb;
                 if (fstat(mSHMFd, &sb) != 0 || sb.st_nlink == 0 || sb.st_ino != mSHMInode) {
                     LogOzzyHALError("shared memory unlinked (daemon died)");
-                    UnmapSharedMemory();
+                    DropMapping();
                     // Don't continue - let state update happen below
                 } else {
                     // Also check if hardware is still present
@@ -328,35 +445,63 @@ void OzzyHAL::MonitorLoop() {
 
                     if (!magicValid || !hwPresent) {
                         LogOzzyHAL("device disconnected (magic: %{public}d, hw: %{public}d)", magicValid, hwPresent);
-                        UnmapSharedMemory();
+                        DropMapping();
                         // Don't continue - let state update happen below
+                    }
+                    if (mSHM && !mMappingDead.load() && mSHM->version == kOzzyLayoutFrames) {
+                        uint32_t hb = mSHM->heartbeat.load(std::memory_order_relaxed);
+                        uint64_t now = mach_absolute_time();
+                        if (hb != mLastHeartbeat) {
+                            mLastHeartbeat = hb;
+                            mHeartbeatSeenAt = now;
+                        } else if (now - mHeartbeatSeenAt > MsToHostTicks(500)) {
+                            LogOzzyHALError("daemon heartbeat stopped");
+                            DropMapping();
+                        }
+                    }
+                    if (mSHM && !mMappingDead.load() && mSHM->sessionID != mLastSessionID) {
+                        LogOzzyHAL("session changed: 0x%{public}08X -> 0x%{public}08X", mLastSessionID, mSHM->sessionID);
+                        mLastSessionID = mSHM->sessionID;
                     }
                 }
             }
         }
 
-        bool hwReady = (mSHM && mSHM->audio.hardwarePresent.load());
-        bool drvReady = (mSHM && mSHM->audio.driverReady.load());
-        bool metaReady = (mSHM && mSHM->productName[0] != 0);
+        bool live = (mSHM && !mMappingDead.load());
+        SHMName product = {}, manufacturer = {}, serial = {};
+        if (live) {
+            product = CopyName(mSHM->productName);
+            manufacturer = CopyName(mSHM->manufacturerName);
+            serial = CopyName(mSHM->serialNumber);
+        }
+        bool hwReady = (live && mSHM->audio.hardwarePresent.load());
+        bool drvReady = (live && mSHM->audio.driverReady.load());
+        bool metaReady = (live && product.s[0] != 0);
         bool currentlyConnected = (hwReady && drvReady && metaReady);
 
         if (currentlyConnected != mLastConnectedState) {
             if (currentlyConnected) {
-                if (mSHM->productName[0] != 0) {
+                // The engine may have restarted with new rings; re-read and re-check them.
+                if (!(mIsDynacord ? ApplyFrameLayout() : ApplyPacketLayout())) {
+                    DropMapping();
+                    usleep(250000);
+                    continue;
+                }
+                if (product.s[0] != 0) {
                     if (mModelUID) CFRelease(mModelUID);
-                    mModelUID = SafeCreateString(mSHM->productName);
+                    mModelUID = SafeCreateString(product.s);
                 }
-                if (mSHM->manufacturerName[0] != 0) {
+                if (manufacturer.s[0] != 0) {
                     if (mManufacturerUID) CFRelease(mManufacturerUID);
-                    mManufacturerUID = SafeCreateString(mSHM->manufacturerName);
+                    mManufacturerUID = SafeCreateString(manufacturer.s);
                 }
-                if (mSHM->serialNumber[0] != 0) {
+                if (serial.s[0] != 0) {
                     if (mDeviceUID) CFRelease(mDeviceUID);
                     char uidBuf[128];
-                    snprintf(uidBuf, sizeof(uidBuf), "OzzyHAL.%s", mSHM->serialNumber);
+                    snprintf(uidBuf, sizeof(uidBuf), "OzzyHAL.%s", serial.s);
                     mDeviceUID = SafeCreateString(uidBuf);
                 }
-                LogOzzyHAL("device ready: '%{public}s'", mSHM->productName);
+                LogOzzyHAL("device ready: '%{public}s'", product.s);
             }
 
             mLastConnectedState = currentlyConnected;
@@ -399,9 +544,14 @@ bool OzzyHAL::IsConnected() { return mLastConnectedState; }
 
 kern_return_t OzzyHAL::StartIO() {
     if (!IsConnected()) return kAudioHardwareNotRunningError;
-    if (mSHM) {
-        mSHM->audio.halWritePosition.store(0, std::memory_order_relaxed);
+    // Count first, then look at the mapping: the monitor marks it dead first
+    // and then reads the count, so one of the two sides always sees the other.
+    mIOClients.fetch_add(1);
+    if (mMappingDead.load() || !mSHM) {
+        mIOClients.fetch_sub(1);
+        return kAudioHardwareNotRunningError;
     }
+    mSHM->audio.halWritePosition.store(0, std::memory_order_relaxed);
     LogOzzyHAL("start I/O");
     mIOStarted = true;
     mTimestampSeed++;
@@ -413,29 +563,43 @@ kern_return_t OzzyHAL::StopIO() {
     mIOStarted = false;
     mTimestampSeed++;
     ClearOutputBuffer();
+    // Never below zero.
+    uint32_t n = mIOClients.load();
+    while (n > 0 && !mIOClients.compare_exchange_weak(n, n - 1)) {}
     return kIOReturnSuccess;
 }
 
 HRESULT OzzyHAL::GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID, Float64* outSampleTime, UInt64* outHostTime, UInt64* outSeed) {
-    if (!mSHM) return kAudioHardwareNotRunningError;
+    if (!mSHM || mMappingDead.load()) return kAudioHardwareNotRunningError;
 
     auto& ts = mSHM->audio.timestamp;
-    uint64_t sTime, hTime;
-    uint32_t seq1, seq2;
-    int retries = 0;
+    uint64_t sTime = 0, hTime = 0;
+    bool got = false;
 
-    do {
-        seq1 = ts.sequence.load(std::memory_order_acquire);
-        if (seq1 & 1) {
-            std::atomic_thread_fence(std::memory_order_acquire);
-            continue;
-        }
+    for (int retries = 0; retries < 100; ++retries) {
+        uint32_t seq1 = ts.sequence.load(std::memory_order_acquire);
+        if (seq1 & 1) continue;   // writer mid-update: retry
         sTime = ts.sampleTime.load(std::memory_order_relaxed);
         hTime = ts.hostTime.load(std::memory_order_relaxed);
-        std::atomic_thread_fence(std::memory_order_acquire); 
-        seq2 = ts.sequence.load(std::memory_order_relaxed);
-    } while (seq1 != seq2 && ++retries < 100);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        uint32_t seq2 = ts.sequence.load(std::memory_order_relaxed);
+        if (seq1 == seq2) { got = true; break; }
+    }
+    if (!got) {
+        // Never got a consistent read: serve the last anchor we had.
+        sTime = mLastAnchorSample;
+        hTime = mLastAnchorHost;
+    }
 
+    if (hTime == 0 && mLastAnchorHost != 0) {
+        // The engine is restarting and has no anchor yet: keep serving the last one.
+        sTime = mLastAnchorSample;
+        hTime = mLastAnchorHost;
+    } else if (hTime != 0) {
+        if (sTime < mLastAnchorSample) mTimestampSeed++;   // a new timeline started
+        mLastAnchorSample = sTime;
+        mLastAnchorHost = hTime;
+    }
     if (outSampleTime) *outSampleTime = (Float64)sTime;
     if (outHostTime) *outHostTime = hTime;
     if (outSeed) *outSeed = mTimestampSeed;
@@ -444,7 +608,7 @@ HRESULT OzzyHAL::GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioObje
 }
 
 OSStatus OzzyHAL::ioOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inStreamObjectID, UInt32 inClientID, UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo, void* ioMainBuffer, void* ioSecondaryBuffer) {
-    if (!mSHM || !mInputBufferAddr || !mOutputBufferAddr) return kAudioHardwareNoError;
+    if (!mSHM || mMappingDead.load() || !mInputBufferAddr || !mOutputBufferAddr) return kAudioHardwareNoError;
 
     if (inOperationID == kAudioServerPlugInIOOperationWriteMix) {
         if (mWriteOutput) {
@@ -456,7 +620,7 @@ OSStatus OzzyHAL::ioOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID
     else if (inOperationID == kAudioServerPlugInIOOperationReadInput) {
         if (mReadInput) {
             uint64_t sampleTime = (uint64_t)inIOCycleInfo->mInputTime.mSampleTime;
-            mReadInput((float*)ioMainBuffer, mInputBufferAddr, sampleTime, inIOBufferFrameSize, mRingSize, mInputBytesPerFrame);
+            mReadInput((float*)ioMainBuffer, mInputBufferAddr, sampleTime, inIOBufferFrameSize, mRingSizeIn, mInputBytesPerFrame);
         }
     }
     return kAudioHardwareNoError;
@@ -468,7 +632,7 @@ CFStringRef OzzyHAL::GetDeviceUID() const { return mDeviceUID; }
 CFStringRef OzzyHAL::GetModelUID() const { return mModelUID; }
 UInt32 OzzyHAL::GetTransportType() const { return kAudioDeviceTransportTypeUSB; }
 UInt32 OzzyHAL::GetClockDomain() const { return 0x504C4F59; }
-Float64 OzzyHAL::GetNominalSampleRate() const { return 96000.0; }
+Float64 OzzyHAL::GetNominalSampleRate() const { return mCurrentStreamFormat.mSampleRate; }
 AudioValueRange OzzyHAL::GetAvailableSampleRates() const { return mAvailableSampleRates; }
 AudioBufferList* OzzyHAL::GetInputStreamConfiguration() const { return const_cast<AudioBufferList*>(&mInputConfig); }
 AudioBufferList* OzzyHAL::GetOutputStreamConfiguration() const { return const_cast<AudioBufferList*>(&mOutputConfig); }
@@ -477,7 +641,7 @@ AudioObjectID OzzyHAL::GetOutputStreamID() const { return kOzzyOutputStreamID; }
 AudioStreamBasicDescription OzzyHAL::GetStreamFormat() const { return mCurrentStreamFormat; }
 AudioStreamRangedDescription OzzyHAL::GetStreamRangedDescription() const {
     AudioStreamRangedDescription outDesc; outDesc.mFormat = GetStreamFormat();
-    outDesc.mSampleRateRange.mMinimum = 96000.0; outDesc.mSampleRateRange.mMaximum = 96000.0;
+    outDesc.mSampleRateRange.mMinimum = mCurrentStreamFormat.mSampleRate; outDesc.mSampleRateRange.mMaximum = mCurrentStreamFormat.mSampleRate;
     return outDesc;
 }
 UInt32 OzzyHAL::GetZeroTimestampPeriod() const { return mZeroTimestampPeriod; }
@@ -486,8 +650,8 @@ AudioChannelLayout* OzzyHAL::GetPreferredChannelLayout(AudioObjectPropertyScope 
     AudioChannelLayout* layout = (AudioChannelLayout*)mChannelLayoutBuffer;
     layout->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
     layout->mChannelBitmap = 0;
-    layout->mNumberChannelDescriptions = 8;
-    for (UInt32 i = 0; i < 8; ++i) {
+    layout->mNumberChannelDescriptions = mChannels;
+    for (UInt32 i = 0; i < mChannels; ++i) {
         layout->mChannelDescriptions[i].mChannelLabel = kAudioChannelLabel_Unknown;
         layout->mChannelDescriptions[i].mChannelFlags = kAudioChannelFlags_AllOff;
     }
@@ -495,7 +659,7 @@ AudioChannelLayout* OzzyHAL::GetPreferredChannelLayout(AudioObjectPropertyScope 
 }
 
 UInt32 OzzyHAL::GetPreferredChannelLayoutSize(AudioObjectPropertyScope inScope) const {
-    return offsetof(AudioChannelLayout, mChannelDescriptions) + (8 * sizeof(AudioChannelDescription));
+    return offsetof(AudioChannelLayout, mChannelDescriptions) + (mChannels * sizeof(AudioChannelDescription));
 }
 
 extern "C" HRESULT OzzyInitialize(AudioServerPlugInDriverRef, AudioServerPlugInHostRef inHost) {
@@ -657,7 +821,7 @@ extern "C" HRESULT OzzyGetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
             }
             case kAudioDevicePropertyClockDomain: return WriteUInt32(inMax, outSize, outData, OzzyHAL::Get().GetClockDomain());
             case kAudioDevicePropertyLatency: return WriteUInt32(inMax, outSize, outData, OzzyHAL::Get().GetLatency());
-            case kAudioDevicePropertySafetyOffset: return WriteUInt32(inMax, outSize, outData, OzzyHAL::Get().GetSafetyOffset());
+            case kAudioDevicePropertySafetyOffset: return WriteUInt32(inMax, outSize, outData, OzzyHAL::Get().GetSafetyOffset(inAddress->mScope));
             case kAudioDevicePropertyZeroTimeStampPeriod: return WriteUInt32(inMax, outSize, outData, OzzyHAL::Get().GetZeroTimestampPeriod());
             case kAudioDevicePropertyPreferredChannelLayout: {
                 UInt32 size = OzzyHAL::Get().GetPreferredChannelLayoutSize(inAddress->mScope);

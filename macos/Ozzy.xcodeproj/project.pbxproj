@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		D1C0DEC0A10000000000A002 /* DynacordCodec.cpp in Sources */ = {isa = PBXBuildFile; fileRef = D1C0DEC0A10000000000A001 /* DynacordCodec.cpp */; };
+		D1C0DEC0A10000000000A004 /* ploytec_codec.c in Sources */ = {isa = PBXBuildFile; fileRef = D1C0DEC0A10000000000A003 /* ploytec_codec.c */; };
 		1F5418052F1C6900003FECA9 /* PloytecCodec.mm in Sources */ = {isa = PBXBuildFile; fileRef = 1F5418042F1C6900003FECA9 /* PloytecCodec.mm */; };
 		1FB396AA2F0AECA200073667 /* OzzyHAL.mm in Sources */ = {isa = PBXBuildFile; fileRef = 1FB396A92F0AECA200073667 /* OzzyHAL.mm */; };
 		1FC985E22F05B4B700668435 /* OzzyMIDI.mm in Sources */ = {isa = PBXBuildFile; fileRef = 1FC985DF2F05B4B700668435 /* OzzyMIDI.mm */; };
@@ -15,6 +17,8 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		D1C0DEC0A10000000000A001 /* DynacordCodec.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = DynacordCodec.cpp; path = Devices/Dynacord/DynacordCodec.cpp; sourceTree = SOURCE_ROOT; };
+		D1C0DEC0A10000000000A003 /* ploytec_codec.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; name = ploytec_codec.c; path = ../common/devices/ploytec/ploytec_codec.c; sourceTree = SOURCE_ROOT; };
 		1F5418042F1C6900003FECA9 /* PloytecCodec.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; name = PloytecCodec.mm; path = Devices/Ploytec/PloytecCodec.mm; sourceTree = SOURCE_ROOT; };
 		1FADCD2B2F05C8AC0059FC84 /* OzzyMIDI.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = OzzyMIDI.h; sourceTree = "<group>"; };
 		1FADCD2E2F05C9960059FC84 /* CoreFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreFoundation.framework; path = System/Library/Frameworks/CoreFoundation.framework; sourceTree = SDKROOT; };
@@ -75,6 +79,8 @@
 			isa = PBXGroup;
 			children = (
 				1F5418042F1C6900003FECA9 /* PloytecCodec.mm */,
+				D1C0DEC0A10000000000A001 /* DynacordCodec.cpp */,
+				D1C0DEC0A10000000000A003 /* ploytec_codec.c */,
 				1FC985D32F05B4AE00668435 /* Info.plist */,
 				1FB396A92F0AECA200073667 /* OzzyHAL.mm */,
 				1FB396A82F0AECA200073667 /* OzzyHAL.h */,
@@ -213,6 +219,8 @@
 			files = (
 				1FB396AA2F0AECA200073667 /* OzzyHAL.mm in Sources */,
 				1F5418052F1C6900003FECA9 /* PloytecCodec.mm in Sources */,
+				D1C0DEC0A10000000000A002 /* DynacordCodec.cpp in Sources */,
+				D1C0DEC0A10000000000A004 /* ploytec_codec.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

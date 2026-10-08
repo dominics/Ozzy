@@ -56,7 +56,9 @@ public:
     AudioStreamRangedDescription GetStreamRangedDescription() const;
     
     UInt32 GetLatency() const { return 0; }
-    UInt32 GetSafetyOffset() const { return 2 * mFramesPerPacket; }  // 2 URBs worth of frames
+    UInt32 GetSafetyOffset(AudioObjectPropertyScope scope) const {
+        return scope == kAudioObjectPropertyScopeInput ? mSafetyOffsetIn : mSafetyOffsetOut;
+    }
     UInt32 GetZeroTimestampPeriod() const;
     
     AudioChannelLayout* GetPreferredChannelLayout(AudioObjectPropertyScope inScope);
@@ -81,6 +83,25 @@ private:
     uint32_t mRingSize = 10240; // kOzzyNumPackets * mFramesPerPacket
     uint32_t mOutputBytesPerFrame = 48;
     uint32_t mInputBytesPerFrame = 64;
+
+    // Device shape, set by ApplyPacketLayout() / ApplyFrameLayout() on attach
+    uint32_t mChannels = 8;
+    uint32_t mRingSizeIn = 10240;        // input ring, frames (kext: same as mRingSize)
+    uint32_t mSafetyOffsetOut = 160;
+    uint32_t mSafetyOffsetIn = 160;
+    bool mIsDynacord = false;
+
+    // Set when the mapping must no longer be touched by the IO path but IO is
+    // still running; the monitor unmaps once StopIO has been seen.
+    std::atomic<bool> mMappingDead { false };
+    std::atomic<uint32_t> mIOClients { 0 };   // StartIO calls minus StopIO calls (one per client)
+
+    // Daemon liveness (layout v2 only)
+    uint32_t mLastHeartbeat = 0;
+    uint64_t mHeartbeatSeenAt = 0;       // mach_absolute_time of the last change
+
+    // Last anchor served by GetZeroTimeStamp()
+    uint64_t mLastAnchorSample = 0, mLastAnchorHost = 0;
     
     // Codec function pointers (set based on device vendor/product ID)
     PCMEncoderFunc mEncode = nullptr;
@@ -123,6 +144,9 @@ private:
     static void* MonitorEntry(void* arg);
     void MonitorLoop();
     void RebuildStreamConfigs();
+    bool ApplyPacketLayout();
+    bool ApplyFrameLayout();
+    void DropMapping();
 
     void ClearOutputBuffer();
 };
