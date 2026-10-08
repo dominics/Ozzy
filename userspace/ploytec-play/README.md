@@ -41,7 +41,7 @@ The mixer's USB card only enumerates if the mixer is powered on with the USB cab
 Once a second:
 
 ```
-t=  5.0s frames=480000 F=95.996 pkts 11:4 12:7996 underruns=0 iso_err=0 fb_bad=0 in=11059200B
+t=  5.0s frames=480000 F=95.996 pkts 11:4 12:7996 underruns=0 iso_err=0 fb_bad=0 in=11059200B in dBFS: -138.5 -138.5 -138.5 -138.5
 ```
 
 - `frames`: total frames sent
@@ -50,6 +50,8 @@ t=  5.0s frames=480000 F=95.996 pkts 11:4 12:7996 underruns=0 iso_err=0 fb_bad=0
 - `underruns`: packets that ran short because the source couldn't keep up
 - `iso_err`: iso OUT packets that failed
 - `fb_bad`: feedback readings ignored for being more than 2 away from nominal
-- `in`: bytes read from the input endpoint (read only to keep the mixer streaming, then discarded)
+- `in`: bytes read from the input endpoint
+- `in dBFS`: peak level of USB inputs 1-4 over the last second; -138.5 is one LSB, the idle noise floor, and -144.0 means exactly zero
+- `misaligned`: input frames skipped because their fixed framing bits were wrong, shown only when non-zero
 
-A healthy run has `underruns=0` and `iso_err=0`.
+A healthy run has `underruns=0`, `iso_err=0` and no `misaligned`.

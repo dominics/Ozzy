@@ -40,8 +40,13 @@ static void print_stats(const struct stats *now, const struct stats *prev, doubl
 	for (int i = 0; i <= DYNACORD_OUT_MAX_FRAMES_PER_PKT; i++)
 		if (now->pkt_hist[i] - prev->pkt_hist[i])
 			fprintf(stderr, " %d:%llu", i, now->pkt_hist[i] - prev->pkt_hist[i]);
-	fprintf(stderr, " underruns=%llu iso_err=%llu fb_bad=%llu in=%lluB\n",
+	fprintf(stderr, " underruns=%llu iso_err=%llu fb_bad=%llu in=%lluB in dBFS:",
 		now->underruns, now->iso_errors, now->fb_invalid, now->in_bytes);
+	for (int c = 0; c < METER_CHANNELS; c++)
+		fprintf(stderr, " %.1f", meter_dbfs(now->in.peak[c]));
+	if (now->in.misaligned)
+		fprintf(stderr, " misaligned=%llu", now->in.misaligned);
+	fputc('\n', stderr);
 }
 
 /* Top up the ring from the tone or WAV; sets *eof when the WAV ends. */

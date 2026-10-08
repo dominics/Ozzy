@@ -10,6 +10,7 @@
 #include "../source.h"
 #include "../packetize.h"
 #include "../xfer.h"
+#include "../meter.h"
 
 int test_failures;
 
@@ -276,6 +277,96 @@ static void test_xfer_action(void)
 	CHECK_EQ(xfer_action(LIBUSB_TRANSFER_NO_DEVICE, 1), XFER_RETIRE);
 }
 
+/*
+ * Build one bulk IN frame from 4 samples, independently of Ozzy's decoder:
+ * slices are MSB-first, so byte i of each half carries sample bit 23 - i;
+ * ch1/ch3 are bits 0/1 of the first half, ch2/ch4 bits 0/1 of the second.
+ */
+static void make_in_frame(uint8_t *f, const int32_t s[4])
+{
+	memset(f, 0, METER_FRAME_SIZE);
+	for (int i = 0; i < 24; i++) {
+		int b = 23 - i;
+		f[i] = (uint8_t)(0xfc | ((s[0] >> b) & 1) | ((s[2] >> b) & 1) << 1);
+		f[0x20 + i] = (uint8_t)(0xfc | ((s[1] >> b) & 1) | ((s[3] >> b) & 1) << 1);
+	}
+	f[0x1b] = 0xce;
+	f[0x3b] = 0xce;
+}
+
+static void test_meter_channels(void)
+{
+	static const int32_t levels[] = { -8388608, 4194304, -4194304 };
+	static const double want_db[] = { 0.0, -6.02, -6.02 };
+	for (int c = 0; c < 4; c++) {
+		for (int l = 0; l < 3; l++) {
+			struct meter m = { 0 };
+			int32_t s[4] = { 0, 0, 0, 0 };
+			uint8_t f[3 * METER_FRAME_SIZE];
+			make_in_frame(f, s);
+			s[c] = levels[l];
+			make_in_frame(f + METER_FRAME_SIZE, s);
+			s[c] = levels[l] / 2;
+			make_in_frame(f + 2 * METER_FRAME_SIZE, s);
+
+			meter_feed(&m, f, sizeof(f));
+
+			CHECK_EQ(m.frames, 3);
+			CHECK_EQ(m.misaligned, 0);
+			for (int o = 0; o < 4; o++)
+				CHECK_EQ(m.peak[o], o == c ? abs(levels[l]) : 0);
+			CHECK(fabs(meter_dbfs(m.peak[c]) - want_db[l]) < 0.05);
+		}
+	}
+}
+
+static void test_meter_floor(void)
+{
+	struct meter m = { 0 };
+	uint8_t f[METER_FRAME_SIZE];
+	int32_t silence[4] = { 0, 0, 0, 0 }, lsb[4] = { -1, 0, 1, 0 };
+
+	make_in_frame(f, silence);
+	meter_feed(&m, f, sizeof(f));
+	CHECK_EQ(m.peak[0], 0);
+	CHECK(meter_dbfs(m.peak[0]) == METER_FLOOR_DB);
+
+	make_in_frame(f, lsb);
+	meter_feed(&m, f, sizeof(f));
+	CHECK_EQ(m.peak[0], 1);
+	CHECK_EQ(m.peak[2], 1);
+	CHECK(fabs(meter_dbfs(1) - -138.47) < 0.05);
+}
+
+static void test_meter_misaligned(void)
+{
+	static const int bad_byte[] = { 0x05, 0x1b, 0x2a, 0x3b };
+	int32_t loud[4] = { -8388608, -8388608, -8388608, -8388608 };
+	for (int i = 0; i < 4; i++) {
+		struct meter m = { 0 };
+		uint8_t f[2 * METER_FRAME_SIZE];
+		int32_t quiet[4] = { 100, 0, 0, 0 };
+		make_in_frame(f, loud);
+		f[bad_byte[i]] &= 0x7f;   /* clears a fixed bit, or breaks 0xce */
+		make_in_frame(f + METER_FRAME_SIZE, quiet);
+
+		meter_feed(&m, f, sizeof(f));
+
+		CHECK_EQ(m.misaligned, 1);
+		CHECK_EQ(m.frames, 1);
+		CHECK_EQ(m.peak[0], 100);   /* the bad frame isn't decoded */
+		CHECK_EQ(m.peak[1], 0);
+	}
+
+	/* A trailing partial frame counts as misaligned too. */
+	struct meter m = { 0 };
+	uint8_t f[METER_FRAME_SIZE + 10];
+	make_in_frame(f, loud);
+	meter_feed(&m, f, sizeof(f));
+	CHECK_EQ(m.frames, 1);
+	CHECK_EQ(m.misaligned, 1);
+}
+
 int main(void)
 {
 	test_feedback();
@@ -289,6 +380,9 @@ int main(void)
 	test_wav();
 	test_fill_packets();
 	test_xfer_action();
+	test_meter_channels();
+	test_meter_floor();
+	test_meter_misaligned();
 	if (test_failures) {
 		fprintf(stderr, "%d failure(s)\n", test_failures);
 		return 1;

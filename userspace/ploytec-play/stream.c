@@ -124,6 +124,8 @@ static void in_cb(struct libusb_transfer *t)
 	struct stream *s = t->user_data;
 	pthread_mutex_lock(&s->lock);
 	s->stats.in_bytes += (unsigned long long)t->actual_length;
+	if (t->status == LIBUSB_TRANSFER_COMPLETED)
+		meter_feed(&s->stats.in, t->buffer, (size_t)t->actual_length);
 	pthread_mutex_unlock(&s->lock);
 	resubmit(s, t);
 }
@@ -228,6 +230,7 @@ void stream_stats(struct stream *s, struct stats *out)
 {
 	pthread_mutex_lock(&s->lock);
 	*out = s->stats;
+	memset(s->stats.in.peak, 0, sizeof(s->stats.in.peak));
 	pthread_mutex_unlock(&s->lock);
 }
 
