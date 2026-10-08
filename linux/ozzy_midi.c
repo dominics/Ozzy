@@ -24,13 +24,16 @@
 /*
  * ozzy_midi_consume - Read pending MIDI output bytes from the send buffer.
  * Fills with idle_byte when no data is pending. Called from device's
- * fill_midi_out in URB handler context (atomic).
+ * fill_midi_out in URB handler context (atomic). Takes out_lock, since
+ * the output trigger compacts and appends to the buffer concurrently.
  */
 void ozzy_midi_consume(struct midi_runtime *rt, u8 *buffer, int count,
 		       u8 idle_byte)
 {
+	unsigned long flags;
 	int i;
 
+	spin_lock_irqsave(&rt->out_lock, flags);
 	for (i = 0; i < count; i++) {
 		if (rt->send_pending > 0) {
 			buffer[i] = rt->send_buffer[rt->send_count];
@@ -41,6 +44,7 @@ void ozzy_midi_consume(struct midi_runtime *rt, u8 *buffer, int count,
 			buffer[i] = idle_byte;
 		}
 	}
+	spin_unlock_irqrestore(&rt->out_lock, flags);
 }
 
 /* ========================================================================
