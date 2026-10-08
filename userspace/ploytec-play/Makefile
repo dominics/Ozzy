@@ -19,11 +19,15 @@ tests/run: $(TEST_SRC) *.h tests/*.h
 tests/golden: tests/test_golden.c pacer.c pacer.h tests/fixtures/*.h
 	$(CC) $(CFLAGS) -o $@ tests/test_golden.c pacer.c $(LDLIBS)
 
-test: tests/run tests/golden
+tests/midi: tests/test_midi.c ../../common/devices/ploytec/dynacord_midi.c ../../common/devices/ploytec/dynacord_midi.h tests/fixtures/midi_captures.h
+	$(CC) $(CFLAGS) -o $@ tests/test_midi.c ../../common/devices/ploytec/dynacord_midi.c
+
+test: tests/run tests/golden tests/midi
 	./tests/run
 	./tests/golden
+	./tests/midi
 
 clean:
-	rm -rf ploytec-play tests/run tests/golden *.dSYM tests/*.dSYM
+	rm -rf ploytec-play tests/run tests/golden tests/midi *.dSYM tests/*.dSYM
 
 .PHONY: all test clean

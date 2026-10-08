@@ -2,3 +2,4 @@ ploytec-play
 tests/run
 *.dSYM
 tests/golden
+tests/midi

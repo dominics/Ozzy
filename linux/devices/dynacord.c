@@ -11,6 +11,12 @@
  *
  * Capture is bulk 0x86 in the Xone's 64-byte frame format, of which only
  * channels 1-4 carry data.
+ *
+ * MIDI is two ports, "USB-MIDI" (the DIN sockets) and "SystemCtrl" (FX
+ * control), multiplexed in 9-byte packets on bulk 0x04 out and 0x83 in (see
+ * dynacord_midi.h). The firmware only moves MIDI while audio streams, so the
+ * MIDI URBs live alongside the PCM ones. The mixer echoes SystemCtrl
+ * messages back on SystemCtrl.
  */
 
 #include <linux/jiffies.h>
@@ -21,12 +27,14 @@
 #include "../ozzy.h"
 #include "../ozzy_log.h"
 #include "../ozzy_pcm.h"
+#include <sound/rawmidi.h>
 #include "dynacord.h"
 #include "../../common/devices/ploytec/ploytec_defs.h"
 #include "../../common/devices/ploytec/ploytec_protocol.h"
 #include "../../common/devices/ploytec/ploytec_codec.h"
 #include "../../common/devices/ploytec/dynacord_pacer.h"
 #include "../../common/devices/ploytec/dynacord_feedback.h"
+#include "../../common/devices/ploytec/dynacord_midi.h"
 
 /*
  * The firmware stops streaming for good if its OUT buffer runs dry, so keep
@@ -37,6 +45,10 @@
 #define CMS_FB_URBS      8
 #define CMS_FB_PKTS      5
 #define CMS_IN_URBS      4
+#define CMS_MIDI_EP_OUT  0x04
+#define CMS_MIDI_EP_IN   0x83
+#define CMS_MIDI_IN_URBS 4
+#define CMS_MIDI_IN_MAX  512    /* wMaxPacketSize; the device sends 9 */
 #define CMS_IN_URB_MAX   18432  /* 3 ms at 96 kHz, a multiple of 512 */
 
 /* Bytes 0x1b and 0x3b of every capture frame are always this */
@@ -67,12 +79,38 @@ struct dynacord_private {
 	struct urb *out[CMS_OUT_URBS];
 	struct urb *fb[CMS_FB_URBS];
 	struct urb *in[CMS_IN_URBS];
+
+	struct snd_rawmidi *rmidi;
+	/*
+	 * Triggered substreams, NULL when not. Accessed without a lock: ALSA
+	 * may call trigger(0) under the substream lock that transmit takes.
+	 */
+	struct snd_rawmidi_substream *midi_in_sub[DYNACORD_MIDI_PORTS];
+	struct snd_rawmidi_substream *midi_out_sub[DYNACORD_MIDI_PORTS];
+	spinlock_t midi_lock;         /* guards midi_out and midi_out_busy */
+	struct urb *midi_out;         /* bulk 0x04, one in flight at a time */
+	bool midi_out_busy;
+	struct urb *midi_in[CMS_MIDI_IN_URBS];
 };
 
 static const unsigned int dynacord_rates[] = { 44100, 48000, 96000 };
 
 static int dynacord_start_urbs(struct ozzy_chip *chip);
 static void dynacord_stop_urbs(struct ozzy_chip *chip);
+static int dynacord_midi_new(struct ozzy_chip *chip);
+
+/*
+ * dynacord_release - Detach the private data from the chip. Frees it
+ * unless the rawmidi device owns it (see dynacord_midi_free).
+ */
+static void dynacord_release(struct ozzy_chip *chip)
+{
+	struct dynacord_private *priv = chip->private_data;
+
+	chip->private_data = NULL;
+	if (priv && !priv->rmidi)
+		kfree(priv);
+}
 
 /* ========================================================================
  * Vendor Handshake
@@ -169,8 +207,9 @@ static int dynacord_handshake(struct ozzy_chip *chip, unsigned int rate_index)
  * ======================================================================== */
 
 /*
- * dynacord_init - Allocate private data and run the handshake.
- * Also called from post_reset, when private data already exists.
+ * dynacord_init - Allocate private data, run the handshake and, the first
+ * time, create the rawmidi device. Also called from post_reset, when
+ * private data already exists.
  */
 static int dynacord_init(struct ozzy_chip *chip)
 {
@@ -182,14 +221,16 @@ static int dynacord_init(struct ozzy_chip *chip)
 		if (!priv)
 			return -ENOMEM;
 		spin_lock_init(&priv->pacer_lock);
+		spin_lock_init(&priv->midi_lock);
 		chip->private_data = priv;
 	}
 
 	ret = dynacord_handshake(chip, chip->requested_rate);
+	if (!ret && !priv->rmidi)
+		ret = dynacord_midi_new(chip);
 	if (ret < 0) {
-		dynacord_err(&chip->dev->dev, "handshake failed (ret=%d)\n", ret);
-		kfree(priv);
-		chip->private_data = NULL;
+		dynacord_err(&chip->dev->dev, "init failed (ret=%d)\n", ret);
+		dynacord_release(chip);
 	}
 	return ret;
 }
@@ -197,8 +238,7 @@ static int dynacord_init(struct ozzy_chip *chip)
 static void dynacord_free(struct ozzy_chip *chip)
 {
 	dynacord_stop_urbs(chip);
-	kfree(chip->private_data);
-	chip->private_data = NULL;
+	dynacord_release(chip);
 }
 
 /*
@@ -339,6 +379,178 @@ static void dynacord_resubmit(struct ozzy_chip *chip, struct urb *urb)
 	}
 }
 
+/* ========================================================================
+ * MIDI
+ * ======================================================================== */
+
+/*
+ * dynacord_midi_send - Send the next packet of pending rawmidi output.
+ *
+ * Takes up to 4 bytes from each triggered output port straight into its
+ * slot. Called from the output trigger, chained from the 0x04 completion
+ * while there is more, and every 3 ms from the PCM out handler.
+ */
+static void dynacord_midi_send(struct dynacord_private *priv)
+{
+	unsigned long flags;
+	bool any = false;
+	u8 *pkt;
+	int port;
+
+	spin_lock_irqsave(&priv->midi_lock, flags);
+	if (!priv->midi_out || priv->midi_out_busy)
+		goto out;
+
+	pkt = priv->midi_out->transfer_buffer;
+	dynacord_midi_out_init(pkt);
+	for (port = 0; port < DYNACORD_MIDI_PORTS; port++) {
+		struct snd_rawmidi_substream *sub = READ_ONCE(priv->midi_out_sub[port]);
+
+		if (sub && snd_rawmidi_transmit(sub, dynacord_midi_slot(pkt, port),
+						DYNACORD_MIDI_SLOT_LEN) > 0)
+			any = true;
+	}
+	if (!any)
+		goto out;
+
+	priv->midi_out_busy = true;
+	if (usb_submit_urb(priv->midi_out, GFP_ATOMIC) < 0)
+		priv->midi_out_busy = false;
+out:
+	spin_unlock_irqrestore(&priv->midi_lock, flags);
+}
+
+static void dynacord_midi_out_complete(struct urb *urb)
+{
+	struct ozzy_chip *chip = urb->context;
+	struct dynacord_private *priv = chip->private_data;
+	unsigned long flags;
+
+	spin_lock_irqsave(&priv->midi_lock, flags);
+	priv->midi_out_busy = false;
+	spin_unlock_irqrestore(&priv->midi_lock, flags);
+
+	if (!dynacord_urb_dead(chip, urb))
+		dynacord_midi_send(priv);
+}
+
+/*
+ * dynacord_midi_in_complete - Hand each port's bytes to its input
+ * substream, if open.
+ */
+static void dynacord_midi_in_complete(struct urb *urb)
+{
+	struct ozzy_chip *chip = urb->context;
+	struct dynacord_private *priv = chip->private_data;
+	const u8 *buf = urb->transfer_buffer;
+	unsigned int off;
+	int port;
+
+	if (dynacord_urb_dead(chip, urb))
+		return;
+
+	if (!urb->status) {
+		for (off = 0; off + DYNACORD_MIDI_PKT_LEN <= urb->actual_length;
+		     off += DYNACORD_MIDI_PKT_LEN) {
+			for (port = 0; port < DYNACORD_MIDI_PORTS; port++) {
+				struct snd_rawmidi_substream *sub = READ_ONCE(priv->midi_in_sub[port]);
+				const u8 *data;
+				unsigned int n = dynacord_midi_in_slot(buf + off, DYNACORD_MIDI_PKT_LEN,
+								       port, &data);
+
+				if (n && sub)
+					snd_rawmidi_receive(sub, data, n);
+			}
+		}
+	}
+
+	dynacord_resubmit(chip, urb);
+}
+
+static int dynacord_midi_open(struct snd_rawmidi_substream *sub)
+{
+	return 0;
+}
+
+static int dynacord_midi_close(struct snd_rawmidi_substream *sub)
+{
+	return 0;
+}
+
+static void dynacord_midi_in_trigger(struct snd_rawmidi_substream *sub, int up)
+{
+	struct dynacord_private *priv = sub->rmidi->private_data;
+
+	WRITE_ONCE(priv->midi_in_sub[sub->number], up ? sub : NULL);
+}
+
+static void dynacord_midi_out_trigger(struct snd_rawmidi_substream *sub, int up)
+{
+	struct dynacord_private *priv = sub->rmidi->private_data;
+
+	WRITE_ONCE(priv->midi_out_sub[sub->number], up ? sub : NULL);
+	if (up)
+		dynacord_midi_send(priv);
+}
+
+static const struct snd_rawmidi_ops dynacord_midi_out_ops = {
+	.open    = dynacord_midi_open,
+	.close   = dynacord_midi_close,
+	.trigger = dynacord_midi_out_trigger,
+};
+
+static const struct snd_rawmidi_ops dynacord_midi_in_ops = {
+	.open    = dynacord_midi_open,
+	.close   = dynacord_midi_close,
+	.trigger = dynacord_midi_in_trigger,
+};
+
+/*
+ * The rawmidi device can call in until the card is freed, which may be
+ * after disconnect (an open file still closes), so it owns the private
+ * data from creation on.
+ */
+static void dynacord_midi_free(struct snd_rawmidi *rmidi)
+{
+	kfree(rmidi->private_data);
+}
+
+/*
+ * dynacord_midi_new - Create the rawmidi device: one subdevice per port,
+ * in the order of enum dynacord_midi_port.
+ */
+static int dynacord_midi_new(struct ozzy_chip *chip)
+{
+	static const char * const names[DYNACORD_MIDI_PORTS] = {
+		[DYNACORD_MIDI_PORT_USB]     = "USB-MIDI",
+		[DYNACORD_MIDI_PORT_SYSCTRL] = "SystemCtrl",
+	};
+	struct dynacord_private *priv = chip->private_data;
+	struct snd_rawmidi_substream *sub;
+	struct snd_rawmidi *rmidi;
+	int dir, ret;
+
+	ret = snd_rawmidi_new(chip->card, "CMS 600-3 MIDI", 0, DYNACORD_MIDI_PORTS,
+			      DYNACORD_MIDI_PORTS, &rmidi);
+	if (ret < 0)
+		return ret;
+
+	strscpy(rmidi->name, "CMS 600-3 MIDI", sizeof(rmidi->name));
+	rmidi->info_flags = SNDRV_RAWMIDI_INFO_OUTPUT | SNDRV_RAWMIDI_INFO_INPUT |
+			    SNDRV_RAWMIDI_INFO_DUPLEX;
+	rmidi->private_data = priv;
+	rmidi->private_free = dynacord_midi_free;
+	snd_rawmidi_set_ops(rmidi, SNDRV_RAWMIDI_STREAM_OUTPUT, &dynacord_midi_out_ops);
+	snd_rawmidi_set_ops(rmidi, SNDRV_RAWMIDI_STREAM_INPUT, &dynacord_midi_in_ops);
+
+	for (dir = SNDRV_RAWMIDI_STREAM_OUTPUT; dir <= SNDRV_RAWMIDI_STREAM_INPUT; dir++)
+		list_for_each_entry(sub, &rmidi->streams[dir].substreams, list)
+			strscpy(sub->name, names[sub->number], sizeof(sub->name));
+
+	priv->rmidi = rmidi;
+	return 0;
+}
+
 static void dynacord_out_complete(struct urb *urb)
 {
 	struct ozzy_chip *chip = urb->context;
@@ -359,6 +571,7 @@ static void dynacord_out_complete(struct urb *urb)
 	}
 
 	dynacord_fill_out(chip, urb);
+	dynacord_midi_send(priv);
 	dynacord_resubmit(chip, urb);
 }
 
@@ -504,6 +717,8 @@ static int dynacord_start_urbs(struct ozzy_chip *chip)
 	struct usb_host_endpoint *ep_out = dev->ep_out[DYNACORD_EP_PCM_OUT & USB_ENDPOINT_NUMBER_MASK];
 	struct usb_host_endpoint *ep_fb = dev->ep_in[DYNACORD_EP_FEEDBACK & USB_ENDPOINT_NUMBER_MASK];
 	struct usb_host_endpoint *ep_in = dev->ep_in[DYNACORD_EP_PCM_IN & USB_ENDPOINT_NUMBER_MASK];
+	struct urb *midi_out = NULL;
+	unsigned long flags;
 	unsigned int rate, in_size;
 	int i, ret;
 
@@ -575,6 +790,26 @@ static int dynacord_start_urbs(struct ozzy_chip *chip)
 		dynacord_fill_out(chip, priv->out[i]);
 	}
 
+	for (i = 0; i < CMS_MIDI_IN_URBS; i++) {
+		void *buf = kmalloc(CMS_MIDI_IN_MAX, GFP_KERNEL);
+
+		priv->midi_in[i] = usb_alloc_urb(0, GFP_KERNEL);
+		if (!priv->midi_in[i] || !buf) {
+			kfree(buf);
+			goto nomem;
+		}
+		usb_fill_bulk_urb(priv->midi_in[i], dev, usb_rcvbulkpipe(dev, CMS_MIDI_EP_IN),
+				  buf, CMS_MIDI_IN_MAX, dynacord_midi_in_complete, chip);
+	}
+	midi_out = usb_alloc_urb(0, GFP_KERNEL);
+	if (!midi_out)
+		goto nomem;
+	usb_fill_bulk_urb(midi_out, dev, usb_sndbulkpipe(dev, CMS_MIDI_EP_OUT),
+			  kmalloc(DYNACORD_MIDI_PKT_LEN, GFP_KERNEL), DYNACORD_MIDI_PKT_LEN,
+			  dynacord_midi_out_complete, chip);
+	if (!midi_out->transfer_buffer)
+		goto nomem;
+
 	priv->running = true;
 
 	for (i = 0; i < CMS_FB_URBS; i++) {
@@ -592,6 +827,18 @@ static int dynacord_start_urbs(struct ozzy_chip *chip)
 		if (ret < 0)
 			goto fail;
 	}
+	for (i = 0; i < CMS_MIDI_IN_URBS; i++) {
+		ret = usb_submit_urb(priv->midi_in[i], GFP_KERNEL);
+		if (ret < 0)
+			goto fail;
+	}
+
+	/* Publish last: the rawmidi trigger may send as soon as it sees it */
+	spin_lock_irqsave(&priv->midi_lock, flags);
+	priv->midi_out = midi_out;
+	priv->midi_out_busy = false;
+	spin_unlock_irqrestore(&priv->midi_lock, flags);
+	dynacord_midi_send(priv);
 
 	dynacord_log(&dev->dev, "streaming at %u Hz\n",
 		     chip->info->rates[chip->current_rate]);
@@ -601,6 +848,7 @@ nomem:
 	ret = -ENOMEM;
 fail:
 	dynacord_err(&dev->dev, "starting URBs failed (%d)\n", ret);
+	dynacord_free_urb(midi_out);
 	priv->running = true;
 	dynacord_stop_urbs(chip);
 	return ret;
@@ -612,12 +860,29 @@ fail:
 static void dynacord_stop_urbs(struct ozzy_chip *chip)
 {
 	struct dynacord_private *priv = chip->private_data;
+	struct urb *midi_out;
+	unsigned long flags;
 	int i;
 
 	if (!priv || !priv->running)
 		return;
 
 	WRITE_ONCE(priv->stopping, true);
+
+	/* Unpublish first so the rawmidi trigger stops submitting it */
+	spin_lock_irqsave(&priv->midi_lock, flags);
+	midi_out = priv->midi_out;
+	priv->midi_out = NULL;
+	spin_unlock_irqrestore(&priv->midi_lock, flags);
+	if (midi_out)
+		usb_kill_urb(midi_out);
+	dynacord_free_urb(midi_out);
+	for (i = 0; i < CMS_MIDI_IN_URBS; i++) {
+		if (priv->midi_in[i])
+			usb_kill_urb(priv->midi_in[i]);
+		dynacord_free_urb(priv->midi_in[i]);
+		priv->midi_in[i] = NULL;
+	}
 
 	for (i = 0; i < CMS_OUT_URBS; i++)
 		if (priv->out[i])
@@ -659,6 +924,7 @@ const struct ozzy_device_info dynacord_info = {
 	.in_ep                 = DYNACORD_EP_PCM_IN & USB_ENDPOINT_NUMBER_MASK,
 	.alsa_format           = SNDRV_PCM_FMTBIT_S24_3LE,
 	.bytes_per_sample      = 3,
+	/* MIDI is device-owned (dynacord_midi_new), so no core MIDI eps */
 	.num_interfaces        = 2,
 	.alt_setting           = 1,
 	.rates                 = dynacord_rates,
