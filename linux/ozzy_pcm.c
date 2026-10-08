@@ -147,8 +147,8 @@ static void ozzy_pcm_in_urb_handler(struct urb *usb_urb)
 			sub->dma_off -= pcm_buffer_size;
 
 		sub->period_off += bytes;
-		if (sub->period_off >= alsa_rt->period_size) {
-			sub->period_off %= alsa_rt->period_size;
+		if (sub->period_off >= snd_pcm_lib_period_bytes(sub->instance)) {
+			sub->period_off %= snd_pcm_lib_period_bytes(sub->instance);
 			do_period_elapsed = true;
 		}
 	}
@@ -209,8 +209,8 @@ static void ozzy_pcm_out_urb_handler(struct urb *usb_urb)
 			sub->dma_off -= pcm_buffer_size;
 
 		sub->period_off += bytes;
-		if (sub->period_off >= alsa_rt->period_size) {
-			sub->period_off %= alsa_rt->period_size;
+		if (sub->period_off >= snd_pcm_lib_period_bytes(sub->instance)) {
+			sub->period_off %= snd_pcm_lib_period_bytes(sub->instance);
 			do_period_elapsed = true;
 		}
 	} else {
