@@ -142,6 +142,10 @@ static void ozzy_midi_out_trigger(struct snd_rawmidi_substream *alsa_sub, int up
 				ozzy_midi_notice(&rt->chip->dev->dev,
 					    "send buffer overflow\n");
 			} else {
+				/* compact unread bytes to the front before appending */
+				memmove(rt->send_buffer, rt->send_buffer + rt->send_count,
+					rt->send_pending);
+				rt->send_count = 0;
 				memcpy(rt->send_buffer + rt->send_pending,
 				       rt->out_buffer, ret);
 				rt->send_pending += ret;
