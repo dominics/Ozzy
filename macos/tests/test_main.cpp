@@ -12,6 +12,10 @@ int main()
 	test_ring_take_output_wraps_and_zeroes();
 	test_ring_take_output_large_position();
 	test_ring_input_slot();
+	test_codec_encode_walking_bits();
+	test_codec_encode_clamps();
+	test_codec_read_input_matches_shared_decoder();
+	test_codec_wrap_large_sample_time();
 	if (test_failures) {
 		std::fprintf(stderr, "%d failure(s)\n", test_failures);
 		return 1;

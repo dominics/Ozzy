@@ -8,15 +8,18 @@ LDLIBS   :=
 
 C_SRC := \
 	$(COMMON)/dynacord_pacer.c \
-	$(COMMON)/dynacord_feedback.c
+	$(COMMON)/dynacord_feedback.c \
+	$(COMMON)/ploytec_codec.c
 
 LIB_SRC := \
-	../Devices/Dynacord/DynacordRing.cpp
+	../Devices/Dynacord/DynacordRing.cpp \
+	../Devices/Dynacord/DynacordCodec.cpp
 
 TEST_SRC := \
 	test_main.cpp \
 	test_golden.cpp \
-	test_ring.cpp
+	test_ring.cpp \
+	test_codec.cpp
 
 OBJ := $(addprefix build/,$(notdir $(C_SRC:.c=.o) $(LIB_SRC:.cpp=.o) $(TEST_SRC:.cpp=.o)))
 vpath %.c $(sort $(dir $(C_SRC)))
