@@ -2,6 +2,10 @@
 #ifndef DYNACORD_PACER_H
 #define DYNACORD_PACER_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Shared copy of userspace/ploytec-play/pacer.h for the kernel driver. */
 
 /*
@@ -42,4 +46,7 @@ int pacer_next(struct pacer *p);
  * or ceil(total / 8). */
 int pacer_spread(int total, int slot);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

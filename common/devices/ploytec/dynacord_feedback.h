@@ -8,6 +8,10 @@
 #include <stdint.h>
 #endif
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /*
  * Parse one iso packet from the feedback endpoint. Each packet is a sliding
  * window of the frames the device consumed in each of the last 3 ms, newest
@@ -15,4 +19,7 @@
  */
 int feedback_parse(const uint8_t *pkt, int len);
 
+#ifdef __cplusplus
+}
+#endif
 #endif
