@@ -10,11 +10,13 @@ C_SRC := \
 	$(COMMON)/dynacord_pacer.c \
 	$(COMMON)/dynacord_feedback.c
 
-LIB_SRC :=
+LIB_SRC := \
+	../Devices/Dynacord/DynacordRing.cpp
 
 TEST_SRC := \
 	test_main.cpp \
-	test_golden.cpp
+	test_golden.cpp \
+	test_ring.cpp
 
 OBJ := $(addprefix build/,$(notdir $(C_SRC:.c=.o) $(LIB_SRC:.cpp=.o) $(TEST_SRC:.cpp=.o)))
 vpath %.c $(sort $(dir $(C_SRC)))

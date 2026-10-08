@@ -21,6 +21,15 @@
 #define kOzzySharedMemName          "/ozzy_shared_mem"
 #define kOzzyMagic                  0x4F5A5A59 // "OZZY"
 
+// How the engine laid out the segment. Xone engines write 1 (packet rings);
+// Dynacord engines write 2 (frame-indexed rings plus the timing fields
+// below), whether the kext or the userspace daemon hosts them. The HAL
+// accepts exactly these two.
+enum OzzyLayoutVersion : uint32_t {
+    kOzzyLayoutPackets = 1,
+    kOzzyLayoutFrames  = 2,
+};
+
 // Sizing: 8KB covers High Speed USB max packet size, devices use what they need
 #define kOzzyMaxPacketSize          8192
 #define kOzzyNumPackets             128  // Total ring buffer size for HAL (large for stability)
@@ -44,6 +53,14 @@ struct OzzyAudioBuffer {
     uint32_t samplesPerPacket;    // How many samples per USB packet (e.g., 10 for Ploytec)
     uint32_t outputBytesPerFrame; // Encoded bytes per frame for output (e.g., 48)
     uint32_t inputBytesPerFrame;  // Encoded bytes per frame for input (e.g., 64)
+
+    // Layout v2 only (set by the Dynacord engine; zero in layout v1)
+    AtomicU32  requestedRate;       // HAL -> engine: rate to switch to, 0 = none
+    uint32_t   ringFramesOut;       // output ring capacity, frames
+    uint32_t   ringFramesIn;        // input ring capacity, frames
+    uint32_t   zeroTimestampPeriod; // frames between published anchors
+    uint32_t   safetyOffsetOut;     // frames
+    uint32_t   safetyOffsetIn;      // frames
 
     struct {
         AtomicU32 sequence; 
