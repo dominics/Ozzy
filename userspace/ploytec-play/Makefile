@@ -15,10 +15,14 @@ ploytec-play: main.c $(APP_SRC) *.h
 tests/run: $(TEST_SRC) *.h tests/*.h
 	$(CC) $(CFLAGS) -o $@ $(TEST_SRC) $(LDLIBS)
 
-test: tests/run
+tests/golden: tests/test_golden.c pacer.c pacer.h tests/fixtures/*.h
+	$(CC) $(CFLAGS) -o $@ tests/test_golden.c pacer.c $(LDLIBS)
+
+test: tests/run tests/golden
 	./tests/run
+	./tests/golden
 
 clean:
-	rm -rf ploytec-play tests/run *.dSYM tests/*.dSYM
+	rm -rf ploytec-play tests/run tests/golden *.dSYM tests/*.dSYM
 
 .PHONY: all test clean

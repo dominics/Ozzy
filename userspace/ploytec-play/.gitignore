@@ -1,3 +1,4 @@
 ploytec-play
 tests/run
 *.dSYM
+tests/golden
