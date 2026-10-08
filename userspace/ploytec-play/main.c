@@ -23,13 +23,14 @@ static void usage(void)
 {
 	fprintf(stderr,
 		"usage: ploytec-play [--rate HZ] [--tone HZ | --wav FILE] [--channel N|all]\n"
-		"                    [--level DBFS] [--seconds N] [--verbose]\n"
+		"                    [--level DBFS] [--seconds N] [--out-xfers N] [--verbose]\n"
 		"  --rate     44100, 48000 (default) or 96000\n"
 		"  --tone     sine frequency (default 1000 Hz when no --wav)\n"
 		"  --wav      play a WAV at --rate; channels 1-4 map to outputs 1-4, mono goes to --channel\n"
 		"  --channel  output 1-4 for tone or mono WAV, or 'all' (default all)\n"
 		"  --level    tone level in dBFS (default -12)\n"
-		"  --seconds  stop after N seconds (default: until Ctrl-C or end of WAV)\n");
+		"  --seconds  stop after N seconds (default: until Ctrl-C or end of WAV)\n"
+		"  --out-xfers  iso OUT transfers kept queued, 3 ms each (default 8)\n");
 }
 
 static void print_stats(const struct stats *now, const struct stats *prev, double t)
@@ -69,15 +70,16 @@ int main(int argc, char **argv)
 		{ "rate", required_argument, NULL, 'r' }, { "tone", required_argument, NULL, 't' },
 		{ "wav", required_argument, NULL, 'w' }, { "channel", required_argument, NULL, 'c' },
 		{ "level", required_argument, NULL, 'l' }, { "seconds", required_argument, NULL, 's' },
-		{ "verbose", no_argument, NULL, 'v' }, { "help", no_argument, NULL, 'h' }, { 0 },
+		{ "out-xfers", required_argument, NULL, 'x' }, { "verbose", no_argument, NULL, 'v' },
+		{ "help", no_argument, NULL, 'h' }, { 0 },
 	};
 	unsigned rate = 48000;
 	double hz = 1000.0, dbfs = -12.0, seconds = 0;
 	const char *wav_path = NULL;
-	int channel = 0, verbose = 0, opt, rc = 0, eof = 0;
+	int channel = 0, verbose = 0, opt, rc = 0, eof = 0, out_xfers = 8;
 	char err[512];
 
-	while ((opt = getopt_long(argc, argv, "r:t:w:c:l:s:vh", opts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "r:t:w:c:l:s:x:vh", opts, NULL)) != -1) {
 		switch (opt) {
 		case 'r': rate = (unsigned)atoi(optarg); break;
 		case 't': hz = atof(optarg); break;
@@ -85,12 +87,17 @@ int main(int argc, char **argv)
 		case 'c': channel = strcmp(optarg, "all") == 0 ? 0 : atoi(optarg); break;
 		case 'l': dbfs = atof(optarg); break;
 		case 's': seconds = atof(optarg); break;
+		case 'x': out_xfers = atoi(optarg); break;
 		case 'v': verbose = 1; break;
 		default: usage(); return opt == 'h' ? 0 : 2;
 		}
 	}
 	if (rate != 44100 && rate != 48000 && rate != 96000) {
 		fprintf(stderr, "ploytec-play: unsupported rate %u\n", rate);
+		return 2;
+	}
+	if (out_xfers < 1 || out_xfers > STREAM_MAX_OUT_XFERS) {
+		fprintf(stderr, "ploytec-play: --out-xfers must be 1-%d\n", STREAM_MAX_OUT_XFERS);
 		return 2;
 	}
 	if (channel < 0 || channel > DYNACORD_CHANNELS) {
@@ -126,7 +133,7 @@ int main(int argc, char **argv)
 	refill(&ring, &tone, wav, buf, chunk, &eof);
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
-	if (!(st = stream_start(&dev, &ring, rate, err, sizeof(err)))) {
+	if (!(st = stream_start(&dev, &ring, rate, out_xfers, err, sizeof(err)))) {
 		fprintf(stderr, "ploytec-play: %s\n", err);
 		rc = 1;
 		goto out;

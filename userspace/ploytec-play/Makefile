@@ -5,7 +5,7 @@ LDLIBS   += $(shell pkg-config --libs $(PKGS)) -lpthread -lm
 
 PURE_SRC := feedback.c pacer.c ring.c source.c packetize.c xfer.c meter.c \
             ../../common/devices/ploytec/ploytec_codec.c
-APP_SRC  := $(PURE_SRC) device.c init.c stream.c
+APP_SRC  := $(PURE_SRC) device.c init.c stream.c rt.c
 TEST_SRC := tests/test_main.c $(PURE_SRC)
 
 all: ploytec-play

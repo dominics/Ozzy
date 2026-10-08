@@ -16,12 +16,16 @@ struct stats {
 
 struct stream;
 
+#define STREAM_MAX_OUT_XFERS 64
+
 /*
  * Start streaming: iso OUT audio from the ring, iso IN feedback driving the
- * pacer, and bulk IN reads that feed the input meter. Returns NULL with a message
- * in err on failure.
+ * pacer, and bulk IN reads that feed the input meter. out_xfers iso OUT
+ * transfers of 3 ms each are kept queued (1..STREAM_MAX_OUT_XFERS). Returns NULL
+ * with a message in err on failure.
  */
-struct stream *stream_start(struct device *d, struct ring *ring, unsigned rate, char *err, size_t errlen);
+struct stream *stream_start(struct device *d, struct ring *ring, unsigned rate, int out_xfers, char *err,
+			    size_t errlen);
 
 /* Send a little silence, cancel all transfers, wait for them, and free s. */
 void stream_stop(struct stream *s);

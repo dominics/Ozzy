@@ -30,7 +30,12 @@ Linux needs `libusb-1.0-0-dev`, `libsndfile1-dev` and `pkg-config`, and either r
 - `--channel N|all`: output for the tone or a mono WAV (default `all`)
 - `--level DBFS`: tone level (default -12)
 - `--seconds N`: stop after N seconds; otherwise runs until Ctrl-C or the end of the WAV
+- `--out-xfers N`: iso OUT transfers kept queued, 3 ms each (default 8, so 24 ms of output latency). The mixer stops streaming for good if this queue ever runs dry, so a value below 4 is likely to halt.
 - `--verbose`: log libusb and the control-request exchange
+
+## Real-time threads on macOS
+
+Ordinary threads on macOS can go unscheduled for 10-30 ms at a time, longer than a short OUT queue lasts. USB completions pass through two threads: libusb's internal `org.libusb.device-hotplug` thread, which receives them from IOKit, and ours, which runs the callbacks. Both are given a Mach time-constraint policy at start-up, the same kind Core Audio uses for its IO threads. With it the worst callback gap measured was 4.5 ms. Promoting only one of the two isn't enough: with only libusb's thread the mixer halted at a 12 ms queue, and with only ours it survived but with gaps of up to 9.4 ms, right at the limit a 12 ms queue can absorb.
 
 ## Power-cycle quirk
 

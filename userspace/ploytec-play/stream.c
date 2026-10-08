@@ -7,10 +7,10 @@
 #include "stream.h"
 #include "feedback.h"
 #include "pacer.h"
+#include "rt.h"
 #include "packetize.h"
 #include "xfer.h"
 
-#define OUT_XFERS 32
 #define OUT_PKTS 24
 #define FB_XFERS 8
 #define FB_PKTS 5
@@ -31,7 +31,8 @@ struct stream {
 	atomic_int stopping;
 	atomic_int active;
 	atomic_int failed;
-	struct libusb_transfer *out[OUT_XFERS], *fb[FB_XFERS], *in[IN_XFERS];
+	int out_xfers;
+	struct libusb_transfer *out[STREAM_MAX_OUT_XFERS], *fb[FB_XFERS], *in[IN_XFERS];
 };
 
 static void *event_thread(void *arg)
@@ -140,17 +141,19 @@ static struct libusb_transfer *make_iso(struct stream *s, unsigned char ep, int 
 	return t;
 }
 
-struct stream *stream_start(struct device *d, struct ring *ring, unsigned rate, char *err, size_t errlen)
+struct stream *stream_start(struct device *d, struct ring *ring, unsigned rate, int out_xfers, char *err,
+			    size_t errlen)
 {
 	struct stream *s = calloc(1, sizeof(*s));
 	int in_size = (int)((rate * 3 / 1000) & ~7u) * IN_FRAME_SIZE;
 
 	s->d = d;
 	s->ring = ring;
+	s->out_xfers = out_xfers;
 	pacer_init(&s->pacer, rate);
 	pthread_mutex_init(&s->lock, NULL);
 
-	for (int i = 0; i < OUT_XFERS; i++) {
+	for (int i = 0; i < s->out_xfers; i++) {
 		s->out[i] = make_iso(s, DYNACORD_EP_PCM_OUT, OUT_PKTS,
 				     DYNACORD_OUT_MAX_FRAMES_PER_PKT * DYNACORD_OUT_FRAME_SIZE, out_cb);
 		fill_out(s, s->out[i]);
@@ -164,7 +167,7 @@ struct stream *stream_start(struct device *d, struct ring *ring, unsigned rate, 
 	}
 
 	struct libusb_transfer **all[] = { s->fb, s->in, s->out };
-	int counts[] = { FB_XFERS, IN_XFERS, OUT_XFERS };
+	int counts[] = { FB_XFERS, IN_XFERS, s->out_xfers };
 	for (int g = 0; g < 3 && !atomic_load(&s->failed); g++) {
 		for (int i = 0; i < counts[g]; i++) {
 			int r = libusb_submit_transfer(all[g][i]);
@@ -178,6 +181,9 @@ struct stream *stream_start(struct device *d, struct ring *ring, unsigned rate, 
 		}
 	}
 	pthread_create(&s->thread, NULL, event_thread, s);
+	char rterr[256];
+	if (rt_usb_threads(s->thread, rterr, sizeof(rterr)) < 0)
+		fprintf(stderr, "ploytec-play: warning: %s; expect halts with a short OUT queue\n", rterr);
 	if (atomic_load(&s->failed)) {
 		stream_stop(s);
 		return NULL;
@@ -188,11 +194,11 @@ struct stream *stream_start(struct device *d, struct ring *ring, unsigned rate, 
 void stream_stop(struct stream *s)
 {
 	struct libusb_transfer **all[] = { s->fb, s->in, s->out };
-	int counts[] = { FB_XFERS, IN_XFERS, OUT_XFERS };
+	int counts[] = { FB_XFERS, IN_XFERS, s->out_xfers };
 
 	if (!atomic_load(&s->failed)) {
 		atomic_store(&s->silence, 1);
-		usleep(OUT_XFERS * OUT_PKTS * 125 + 10000);
+		usleep((useconds_t)(s->out_xfers * OUT_PKTS * 125 + 10000));
 	}
 	atomic_store(&s->stopping, 1);
 	/* Cancel repeatedly: a callback already running when stopping was set
