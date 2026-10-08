@@ -3,7 +3,7 @@ CFLAGS   += -std=c11 -O2 -g -Wall -Wextra -Werror -I../../common/devices/ploytec
             $(shell pkg-config --cflags $(PKGS))
 LDLIBS   += $(shell pkg-config --libs $(PKGS)) -lpthread -lm
 
-PURE_SRC := feedback.c pacer.c
+PURE_SRC := feedback.c pacer.c ring.c source.c packetize.c xfer.c
 APP_SRC  := $(PURE_SRC)
 TEST_SRC := tests/test_main.c $(PURE_SRC)
 
