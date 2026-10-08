@@ -23,6 +23,8 @@
 #include "ozzy_pcm.h"
 #include "ozzy_midi.h"
 #include "devices/ploytec.h"
+#include "devices/dynacord.h"
+#include "../common/devices/ploytec/ploytec_defs.h"
 
 MODULE_AUTHOR("Marcel Bierling <marcel@hackerman.art>");
 MODULE_DESCRIPTION("Ozzy USB Audio Driver");
@@ -48,12 +50,19 @@ static const struct ozzy_device_desc ploytec_desc = {
 	.ops  = &ploytec_ops,
 };
 
+static const struct ozzy_device_desc dynacord_desc = {
+	.info = &dynacord_info,
+	.ops  = &dynacord_ops,
+};
+
 static const struct usb_device_id ozzy_id_table[] = {
 	{ USB_DEVICE(0x0a4a, 0xffdb), .driver_info = (kernel_ulong_t)&ploytec_desc }, /* Xone:DB4 */
 	{ USB_DEVICE(0x0a4a, 0xffd2), .driver_info = (kernel_ulong_t)&ploytec_desc }, /* Xone:DB2 */
 	{ USB_DEVICE(0x0a4a, 0xffdd), .driver_info = (kernel_ulong_t)&ploytec_desc }, /* Xone:DX */
 	{ USB_DEVICE(0x0a4a, 0xff4d), .driver_info = (kernel_ulong_t)&ploytec_desc }, /* Xone:4D */
 	{ USB_DEVICE(0x0a4a, 0xffad), .driver_info = (kernel_ulong_t)&ploytec_desc }, /* Wizard 4 */
+	{ USB_DEVICE(DYNACORD_VENDOR_ID, DYNACORD_PID_CMS600_3),
+	  .driver_info = (kernel_ulong_t)&dynacord_desc }, /* Dynacord CMS 600-3 */
 	{}
 };
 MODULE_DEVICE_TABLE(usb, ozzy_id_table);

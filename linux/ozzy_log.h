@@ -37,4 +37,7 @@
 #define ploytec_dbg(dev, fmt, ...)  dev_dbg(dev, "[ploytec] " fmt, ##__VA_ARGS__)
 #define ploytec_notice(dev, fmt, ...) dev_notice(dev, "[ploytec] " fmt, ##__VA_ARGS__)
 
+#define dynacord_log(dev, fmt, ...) dev_info(dev, "[dynacord] " fmt, ##__VA_ARGS__)
+#define dynacord_err(dev, fmt, ...) dev_err(dev, "[dynacord] " fmt, ##__VA_ARGS__)
+
 #endif /* OZZY_LOG_H */

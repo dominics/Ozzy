@@ -21,7 +21,10 @@ $(MODULE_NAME)-y := ozzy_core.o \
                     ozzy_pcm.o \
                     ozzy_midi.o \
                     devices/ploytec.o \
-                    ../common/devices/ploytec/ploytec_codec.o
+                    devices/dynacord.o \
+                    ../common/devices/ploytec/ploytec_codec.o \
+                    ../common/devices/ploytec/dynacord_pacer.o \
+                    ../common/devices/ploytec/dynacord_feedback.o
 
 # To add a new device family, append:
 #   devices/newdevice.o
