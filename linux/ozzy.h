@@ -93,6 +93,7 @@ struct ozzy_device_ops {
 	/*
 	 * reset - Perform a USB device reset (e.g. for sample rate changes).
 	 * Called when the rate change requires a full device reset.
+	 * NULL if set_rate fully applies the new rate on its own.
 	 * The core's pre_reset/post_reset callbacks handle URB teardown/reinit.
 	 * Returns 0 on success, negative errno on failure.
 	 */
@@ -153,6 +154,26 @@ struct ozzy_device_ops {
 	 * @is_bulk: true if the output endpoint uses bulk transfers
 	 */
 	unsigned int (*get_out_packet_size)(struct ozzy_chip *chip, bool is_bulk);
+
+	/*
+	 * start_urbs - Allocate and submit the device's own streaming URBs.
+	 * For devices whose transport the core URB model can't express
+	 * (e.g. isochronous endpoints with feedback). When set, the core
+	 * calls this instead of setting up its own PCM URBs, and
+	 * process_out_packet, process_in_packet and init_out_urb are unused.
+	 * Called with the PCM stream mutex held. Completion handlers advance
+	 * the ALSA position with ozzy_pcm_advance().
+	 * Returns 0 on success, negative errno on failure (with nothing left
+	 * submitted).
+	 */
+	int (*start_urbs)(struct ozzy_chip *chip);
+
+	/*
+	 * stop_urbs - Kill and free the URBs from start_urbs.
+	 * Required if start_urbs is set. Called from process context during
+	 * disconnect and pre-reset; must be safe to call when nothing is running.
+	 */
+	void (*stop_urbs)(struct ozzy_chip *chip);
 };
 
 /*

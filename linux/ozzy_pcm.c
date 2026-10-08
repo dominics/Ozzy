@@ -108,6 +108,29 @@ static void ozzy_pcm_poison_urbs(struct pcm_runtime *rt)
  * ======================================================================== */
 
 /*
+ * ozzy_pcm_advance - Advance a substream's DMA position after a transfer.
+ * Call with sub->lock held. Returns true if a period boundary was crossed,
+ * in which case the caller must call snd_pcm_period_elapsed() after
+ * dropping the lock.
+ */
+bool ozzy_pcm_advance(struct pcm_substream *sub, unsigned int bytes)
+{
+	unsigned int pcm_buffer_size = snd_pcm_lib_buffer_bytes(sub->instance);
+	unsigned int period_bytes = snd_pcm_lib_period_bytes(sub->instance);
+
+	sub->dma_off += bytes;
+	if (sub->dma_off >= pcm_buffer_size)
+		sub->dma_off -= pcm_buffer_size;
+
+	sub->period_off += bytes;
+	if (sub->period_off >= period_bytes) {
+		sub->period_off %= period_bytes;
+		return true;
+	}
+	return false;
+}
+
+/*
  * ozzy_pcm_in_urb_handler - Input URB completion handler.
  * Calls the device's process_in_packet to decode audio into the ALSA DMA area.
  */
@@ -142,15 +165,7 @@ static void ozzy_pcm_in_urb_handler(struct urb *usb_urb)
 						     sub->dma_off,
 						     pcm_buffer_size);
 
-		sub->dma_off += bytes;
-		if (sub->dma_off >= pcm_buffer_size)
-			sub->dma_off -= pcm_buffer_size;
-
-		sub->period_off += bytes;
-		if (sub->period_off >= snd_pcm_lib_period_bytes(sub->instance)) {
-			sub->period_off %= snd_pcm_lib_period_bytes(sub->instance);
-			do_period_elapsed = true;
-		}
+		do_period_elapsed = ozzy_pcm_advance(sub, bytes);
 	}
 	spin_unlock_irqrestore(&sub->lock, flags);
 
@@ -204,15 +219,7 @@ static void ozzy_pcm_out_urb_handler(struct urb *usb_urb)
 						      sub->dma_off,
 						      pcm_buffer_size);
 
-		sub->dma_off += bytes;
-		if (sub->dma_off >= pcm_buffer_size)
-			sub->dma_off -= pcm_buffer_size;
-
-		sub->period_off += bytes;
-		if (sub->period_off >= snd_pcm_lib_period_bytes(sub->instance)) {
-			sub->period_off %= snd_pcm_lib_period_bytes(sub->instance);
-			do_period_elapsed = true;
-		}
+		do_period_elapsed = ozzy_pcm_advance(sub, bytes);
 	} else {
 		/* No active playback -- re-initialize silence pattern */
 		chip->ops->init_out_urb(chip, out_urb->buffer);
@@ -330,6 +337,7 @@ static int ozzy_pcm_close(struct snd_pcm_substream *alsa_sub)
 static int ozzy_pcm_set_rate(struct pcm_runtime *rt)
 {
 	struct ozzy_chip *chip = rt->chip;
+	int ret;
 
 	chip->requested_rate = rt->rate;
 
@@ -340,12 +348,19 @@ static int ozzy_pcm_set_rate(struct pcm_runtime *rt)
 			   chip->info->rates[chip->requested_rate]);
 
 		/* Set the new rate via device ops */
-		chip->ops->set_rate(chip, chip->requested_rate);
+		ret = chip->ops->set_rate(chip, chip->requested_rate);
+		if (ret < 0)
+			return ret;
 
-		/* Reset the device -- pre_reset/post_reset handle URB lifecycle */
-		mutex_unlock(&rt->stream_mutex);
-		chip->ops->reset(chip);
-		mutex_lock(&rt->stream_mutex);
+		/*
+		 * Reset the device -- pre_reset/post_reset handle URB lifecycle.
+		 * Devices without a reset op restart their own streams in set_rate.
+		 */
+		if (chip->ops->reset) {
+			mutex_unlock(&rt->stream_mutex);
+			chip->ops->reset(chip);
+			mutex_lock(&rt->stream_mutex);
+		}
 	}
 
 	return 0;
@@ -579,6 +594,16 @@ int ozzy_pcm_init_urbs(struct ozzy_chip *chip)
 
 	rt->chip = chip;
 
+	/* Devices that manage their own URBs */
+	if (chip->ops->start_urbs) {
+		mutex_lock(&rt->stream_mutex);
+		ret = chip->ops->start_urbs(chip);
+		mutex_unlock(&rt->stream_mutex);
+		if (ret < 0)
+			ozzy_pcm_err(&chip->dev->dev, "PCM URB initialization failed\n");
+		return ret;
+	}
+
 	/* Initialize input URBs */
 	for (i = 0; i < OZZY_PCM_N_URBS; i++) {
 		ret = ozzy_pcm_init_in_urb(&rt->pcm_in_urbs[i], chip);
@@ -646,7 +671,10 @@ void ozzy_pcm_abort(struct ozzy_chip *chip)
 	if (rt) {
 		rt->panic = true;
 		ozzy_pcm_stream_stop(rt);
-		ozzy_pcm_poison_urbs(rt);
+		if (chip->ops->stop_urbs)
+			chip->ops->stop_urbs(chip);
+		else
+			ozzy_pcm_poison_urbs(rt);
 	}
 }
 
@@ -671,7 +699,8 @@ int ozzy_pcm_init(struct ozzy_chip *chip)
 	spin_lock_init(&rt->playback.lock);
 	spin_lock_init(&rt->capture.lock);
 
-	ret = snd_pcm_new(chip->card, chip->dev->product, 0, 1, 1, &pcm);
+	ret = snd_pcm_new(chip->card, chip->dev->product, 0, 1,
+			  chip->info->capture_channels ? 1 : 0, &pcm);
 	if (ret < 0) {
 		kfree(rt);
 		ozzy_pcm_err(&chip->dev->dev, "Cannot create PCM instance\n");
@@ -682,7 +711,8 @@ int ozzy_pcm_init(struct ozzy_chip *chip)
 
 	strscpy(pcm->name, chip->dev->product, sizeof(pcm->name));
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &ozzy_pcm_ops);
-	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &ozzy_pcm_ops);
+	if (chip->info->capture_channels)
+		snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &ozzy_pcm_ops);
 	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC, NULL, 0, 0);
 
 	rt->instance = pcm;

@@ -71,6 +71,14 @@ int ozzy_pcm_init(struct ozzy_chip *chip);
 int ozzy_pcm_init_urbs(struct ozzy_chip *chip);
 
 /*
+ * ozzy_pcm_advance - Advance a substream's DMA position by `bytes`.
+ * For devices that run their own URBs. Call with sub->lock held.
+ * Returns true if the caller must call snd_pcm_period_elapsed() after
+ * dropping the lock.
+ */
+bool ozzy_pcm_advance(struct pcm_substream *sub, unsigned int bytes);
+
+/*
  * ozzy_pcm_abort - Emergency stop all PCM URBs.
  * Called during disconnect and pre-reset. Sets panic flag.
  */
