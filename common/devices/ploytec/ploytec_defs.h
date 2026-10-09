@@ -76,6 +76,8 @@ extern "C" {
 #define DYNACORD_EP_PCM_OUT             0x02    /* iso OUT, interface 0 alt 1 */
 #define DYNACORD_EP_FEEDBACK            0x81    /* iso IN, interface 1 alt 1 */
 #define DYNACORD_EP_PCM_IN              0x86    /* bulk IN, interface 1 alt 1 */
+#define DYNACORD_EP_MIDI_OUT            0x04    /* bulk OUT, interface 0 alt 1 */
+#define DYNACORD_EP_MIDI_IN             0x83    /* bulk IN, interface 0 alt 1 */
 #define DYNACORD_EP_RATE_OUT            0x0002  /* SET_CUR wIndex for the PCM out rate */
 #define DYNACORD_CHANNELS               4
 #define DYNACORD_OUT_FRAME_SIZE         12      /* S24_3LE x 4 channels */

@@ -11,8 +11,13 @@ CXX_SOURCES=(
 	Backends/OzzyKext/KextBus.cpp
 	OzzyCore/OzzyEngine.cpp
 	Devices/Ploytec/PloytecEngine.cpp
+	Devices/Dynacord/DynacordEngine.cpp
+	Devices/Dynacord/DynacordRing.cpp
 )
-C_SOURCES=()
+C_SOURCES=(
+	../common/devices/ploytec/dynacord_pacer.c
+	../common/devices/ploytec/dynacord_feedback.c
+)
 
 # The Xcode 27.0 SDK's Kernel headers lost the IOPMDriverAssertion typedefs.
 DEFAULT_SDK=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
