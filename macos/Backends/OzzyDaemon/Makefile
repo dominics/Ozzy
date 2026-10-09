@@ -18,7 +18,15 @@ FAKE_HDR := SharedMemory.h ../../Shared/OzzySharedData.h ../../Devices/Dynacord/
 build/fake-daemon: $(FAKE_SRC) $(FAKE_HDR) | build
 	$(CXX) $(CXXFLAGS) -o $@ $(FAKE_SRC)
 
-all: build/fake-daemon
+CLIENT_SRC := tools/shm-client.cpp ../../Devices/Dynacord/DynacordCodec.cpp
+CLIENT_HDR := $(FAKE_HDR) ../../Devices/Dynacord/DynacordCodec.h
+build/ploytec_codec.o: $(COMMON)/ploytec_codec.c $(COMMON)/ploytec_codec.h $(COMMON)/ploytec_defs.h | build
+	$(CC) $(CFLAGS) -c $< -o $@
+
+build/shm-client: $(CLIENT_SRC) $(CLIENT_HDR) build/ploytec_codec.o | build
+	$(CXX) $(CXXFLAGS) -o $@ $(CLIENT_SRC) build/ploytec_codec.o
+
+all: build/fake-daemon build/shm-client
 
 clean:
 	rm -rf build
