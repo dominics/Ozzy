@@ -2,7 +2,7 @@
 #ifndef DYNACORD_MIDI_H
 #define DYNACORD_MIDI_H
 
-#ifdef __KERNEL__
+#if defined(__KERNEL__) && defined(__linux__)
 #include <linux/types.h>
 #else
 #include <stddef.h>

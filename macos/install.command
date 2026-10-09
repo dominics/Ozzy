@@ -189,72 +189,14 @@ echo "======================================================"
 echo ""
 echo "🔨 [1/3] Compiling Kernel Extension..."
 
-# Kext Configuration
+SYSTEM_ARCH=$(uname -m)
 KEXT_NAME="OzzyKext"
 BUILD_DIR="$DIR/Build"
-SOURCES=(
-    "Backends/OzzyKext/OzzyKext.cpp"
-    "Backends/OzzyKext/KextBus.cpp"
-    "OzzyCore/OzzyEngine.cpp"
-    "Devices/Ploytec/PloytecEngine.cpp"
-)
-
-# Detect system architecture
-SYSTEM_ARCH=$(uname -m)
-if [ "$SYSTEM_ARCH" == "arm64" ]; then
-    KEXT_ARCH="arm64e"
-    echo "   🔍 Detected Apple Silicon (ARM) - building for arm64e"
-elif [ "$SYSTEM_ARCH" == "x86_64" ]; then
-    KEXT_ARCH="x86_64"
-    echo "   🔍 Detected Intel (x86_64) - building for x86_64"
-else
-    echo "❌ Unknown architecture: $SYSTEM_ARCH"
-    exit 1
-fi
-
-SDKROOT=$(xcrun --sdk macosx --show-sdk-path)
-KERNEL_HEADERS="$SDKROOT/System/Library/Frameworks/Kernel.framework/Headers"
-
-CFLAGS="-x c++ -arch $KEXT_ARCH -std=c++11 -O2 -DKERNEL -D__KERNEL__ -mkernel \
--fno-builtin -fno-exceptions -fno-rtti -fno-common -fno-use-cxa-atexit \
--Wno-deprecated-declarations -Wno-inconsistent-missing-override \
--nostdinc -I. -I$KERNEL_HEADERS"
-
-LDFLAGS="-arch $KEXT_ARCH -Xlinker -kext -nostdlib -lkmod -lcc_kext"
-
 echo "   🧹 Cleaning build directory..."
 # Use sudo to remove if it has root permissions from previous install
 sudo rm -rf "$BUILD_DIR" 2>/dev/null || rm -rf "$BUILD_DIR"
-mkdir -p "$BUILD_DIR/$KEXT_NAME.kext/Contents/MacOS"
-
-echo "   🔨 Compiling kext sources..."
-OBJECTS=""
-for SRC in "${SOURCES[@]}"; do
-    FLAT_NAME=$(basename "${SRC%.*}")
-    OBJ="$BUILD_DIR/$FLAT_NAME.o"
-    
-    clang++ $CFLAGS -c "$SRC" -o "$OBJ" 2>&1 | grep -v "warning:" || true
-    
-    if [ $? -ne 0 ]; then
-        echo "❌ Compilation Failed: $SRC"
-        exit 1
-    fi
-    OBJECTS="$OBJECTS $OBJ"
-done
-
-echo "   🔗 Linking kext..."
-clang++ $LDFLAGS $OBJECTS -o "$BUILD_DIR/$KEXT_NAME.kext/Contents/MacOS/$KEXT_NAME"
-
-if [ $? -ne 0 ]; then
-    echo "❌ Linking Failed"
-    exit 1
-fi
-
-echo "   📦 Bundling kext..."
-if [ -f "Backends/OzzyKext/Info.plist" ]; then
-    cp "Backends/OzzyKext/Info.plist" "$BUILD_DIR/$KEXT_NAME.kext/Contents/Info.plist"
-else
-    echo "❌ Error: Backends/OzzyKext/Info.plist not found!"
+if ! "$DIR/Backends/OzzyKext/build-kext.sh" "$BUILD_DIR"; then
+    echo "❌ Kernel extension build failed (see errors above)"
     exit 1
 fi
 
@@ -270,7 +212,7 @@ xcodebuild -project "Ozzy.xcodeproj" \
            -configuration Release \
            -arch "$SYSTEM_ARCH" \
            SYMROOT="$DIR/Build" \
-           OTHER_LDFLAGS="-framework IOKit -framework CoreFoundation" \
+           OTHER_LDFLAGS="-framework IOKit -framework CoreFoundation -framework SystemConfiguration" \
            build > /dev/null
 
 HAL_PATH="$DIR/Build/Release/OzzyHAL.driver"
@@ -285,7 +227,7 @@ xcodebuild -project "Ozzy.xcodeproj" \
            -configuration Release \
            -arch "$SYSTEM_ARCH" \
            SYMROOT="$DIR/Build" \
-           OTHER_LDFLAGS="-framework IOKit -framework CoreFoundation -framework CoreMIDI" \
+           OTHER_LDFLAGS="-framework IOKit -framework CoreFoundation -framework SystemConfiguration -framework CoreMIDI" \
            build > /dev/null
 
 MIDI_PATH="$DIR/Build/Release/OzzyMIDI.plugin"

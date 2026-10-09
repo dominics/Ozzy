@@ -1,9 +1,4 @@
 /* SPDX-License-Identifier: MIT */
-#ifdef __KERNEL__
-#include <linux/kernel.h>
-#else
-#include <stdlib.h>
-#endif
 #include "dynacord_pacer.h"
 #include "ploytec_defs.h"
 
@@ -22,7 +17,9 @@ void pacer_init(struct pacer *p, unsigned rate)
 
 void pacer_feedback(struct pacer *p, int frames_per_ms)
 {
-	if (frames_per_ms < 0 || abs(frames_per_ms - p->nominal_ms) > 2) {
+	int d = frames_per_ms - p->nominal_ms;
+
+	if (frames_per_ms < 0 || d < -2 || d > 2) {
 		p->invalid++;
 		return;
 	}

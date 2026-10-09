@@ -2,7 +2,7 @@
 #ifndef DYNACORD_FEEDBACK_H
 #define DYNACORD_FEEDBACK_H
 
-#ifdef __KERNEL__
+#if defined(__KERNEL__) && defined(__linux__)
 #include <linux/types.h>
 #else
 #include <stdint.h>

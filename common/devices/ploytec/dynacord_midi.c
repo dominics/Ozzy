@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT */
-#ifdef __KERNEL__
+#if defined(__KERNEL__) && defined(__linux__)
 #include <linux/string.h>
 #else
 #include <string.h>
