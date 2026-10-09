@@ -21,6 +21,7 @@
 #include "../../../Devices/Dynacord/DynacordCodec.h"
 #include "../../../Devices/Dynacord/DynacordRing.h"
 #include "../../../Shared/OzzySharedData.h"
+#include "../RealTime.h"
 
 static const int kReadyTimeoutSeconds = 10;
 static const long kMaxSeconds = 86400;
@@ -157,6 +158,13 @@ int main(int argc, char** argv)
 		Refuse("ringFramesIn", ringIn, "1..maxInFrames");
 	if ((uint64_t)safetyOut + rate / 100 >= ringOut)
 		Refuse("safetyOffsetOut", safetyOut, "less than ringFramesOut - rate/100");
+
+	/* Stand in for coreaudiod's real-time IO thread. A normal-priority thread
+	 * can wake 20 ms late, which pushes the write position past a stretch the
+	 * daemon has not played yet, and the stale ring data there plays as a pop. */
+	char rtErr[256];
+	if (!SetRealTimePolicy(rtErr, sizeof(rtErr)))
+		fprintf(stderr, "%s; expect pops\n", rtErr);
 
 	const double tps = TicksPerSecond();
 	uint64_t written = 0;
