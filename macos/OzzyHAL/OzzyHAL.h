@@ -41,7 +41,11 @@ public:
     HRESULT GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID, Float64* outSampleTime, UInt64* outHostTime, UInt64* outSeed);
     
     Float64 GetNominalSampleRate() const;
-    AudioValueRange GetAvailableSampleRates() const;
+    bool IsRateSettable() const { return mIsDynacord; }
+    UInt32 GetAvailableSampleRateCount() const { return mNumSampleRates; }
+    const AudioValueRange* GetAvailableSampleRateList() const { return mSampleRateList; }
+    OSStatus RequestSampleRate(Float64 rate);
+    OSStatus PerformSampleRateChange(UInt64 rate);
     AudioBufferList* GetInputStreamConfiguration() const;
     AudioBufferList* GetOutputStreamConfiguration() const;
     CFStringRef GetDeviceName() const;
@@ -53,7 +57,6 @@ public:
     AudioObjectID GetInputStreamID() const;
     AudioObjectID GetOutputStreamID() const;
     AudioStreamBasicDescription GetStreamFormat() const;
-    AudioStreamRangedDescription GetStreamRangedDescription() const;
     
     UInt32 GetLatency() const { return 0; }
     UInt32 GetSafetyOffset(AudioObjectPropertyScope scope) const {
@@ -113,7 +116,8 @@ private:
     AudioStreamBasicDescription mCurrentStreamFormat;
     AudioBufferList mInputConfig;
     AudioBufferList mOutputConfig;
-    AudioValueRange mAvailableSampleRates;
+    AudioValueRange mSampleRateList[3] = {};
+    UInt32 mNumSampleRates = 1;
     
     bool mIOStarted = false;
     uint32_t mTimestampSeed = 1;
