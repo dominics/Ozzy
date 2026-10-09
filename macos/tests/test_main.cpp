@@ -27,6 +27,19 @@ int main()
 	test_engine_init_control_failure_fails();
 	test_engine_publishes_config();
 	test_engine_safety_follows_queue();
+	test_engine_start_queues_transfers();
+	test_engine_queue_depth();
+	test_engine_ready_waits_for_first_anchor();
+	test_engine_restart_zeroes_anchor();
+	test_engine_anchors_from_bus_frames();
+	test_engine_anchor_interpolates_within_ms();
+	test_engine_ignores_invalid_feedback();
+	test_engine_output_takes_ring_and_zeroes();
+	test_engine_bulk_in_slots();
+	test_engine_short_bulk_read_keeps_slots();
+	test_engine_transfer_error_fails();
+	test_engine_stop_stops_resubmitting();
+	test_engine_golden();
 	if (test_failures) {
 		std::fprintf(stderr, "%d failure(s)\n", test_failures);
 		return 1;

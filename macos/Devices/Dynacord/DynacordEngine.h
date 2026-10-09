@@ -3,6 +3,7 @@
 #include "../../OzzyCore/OzzyEngine.h"
 #include "../../Shared/OzzySharedData.h"
 #include "../../../common/devices/ploytec/dynacord_pacer.h"
+#include "../../../common/devices/ploytec/ploytec_defs.h"
 #include "DynacordRing.h"
 
 /*
@@ -13,6 +14,14 @@
 class DynacordEngine : public OzzyEngine {
 public:
 	enum : uint32_t { kMaxOutXfers = 32 };
+	enum : uint32_t {
+		kOutPktsPerXfer = 24,   /* one packet per 125 us microframe */
+		kOutXferBytes = kOutPktsPerXfer * DYNACORD_OUT_MAX_FRAMES_PER_PKT * DYNACORD_OUT_FRAME_SIZE,
+		kFbXfers = 8,
+		kFbPktsPerXfer = 5,     /* one 3-byte reading per ms */
+		kFbPktSize = 64,        /* wMaxPacketSize of 0x81 */
+		kInXfers = 8,
+	};
 
 	/* outXfers: iso OUT transfers of 3 ms kept queued, clamped to 1..kMaxOutXfers. */
 	explicit DynacordEngine(uint32_t outXfers);
@@ -36,11 +45,29 @@ public:
 	void Stop() override;
 
 	void OnPacketComplete(uint8_t pipeID, void* ctx, int status, uint32_t bytes) override;
+	void OnIsochComplete(uint8_t pipeID, void* ctx, int status, uint64_t startFrame, OzzyIsochFrame* frames,
+			     uint32_t frameCount) override;
+
+	uint64_t FramesSent() const { return mSent; }
+	uint64_t FramesConsumed() const { return mConsumed; }
+	uint64_t FramesReceived() const { return mReceived; }
+	uint64_t InShortReads() const { return mInShort; }
+	uint64_t IsoErrors() const { return mIsoErrors; }
+	bool Failed() const { return mFailed; }
 
 private:
 	bool RunInit();
 	bool Control(uint8_t type, uint8_t req, uint16_t val, uint16_t idx, uint8_t* data, uint16_t len, const char* what);
 	void PublishConfig();
+	bool StartStreaming();
+	void FillOut(uint32_t i);
+	bool SubmitOut(uint32_t i);
+	bool SubmitFeedback(uint32_t i);
+	bool SubmitIn(uint64_t seq);
+	void Consume(int frames, uint64_t busFrame);
+	uint64_t HostTimeOfBusFrame(uint64_t frame);
+	void WriteTimestamp(uint64_t sampleTime, uint64_t hostTime);
+	void PublishAnchor(uint64_t sampleTime, uint64_t hostTime);
 	volatile OzzySharedMemory* SHM() { return (volatile OzzySharedMemory*)mSharedMemory; }
 
 	enum : uint32_t { kSafetyInMs = 25 };
@@ -51,4 +78,22 @@ private:
 	uint32_t mNextRate = 0;
 	DynacordRingLayout mLayout {};
 	bool mStopping = false;
+
+	struct pacer mPacer;
+	uint8_t mOutBuf[kMaxOutXfers][kOutXferBytes];
+	OzzyIsochFrame mOutFrames[kMaxOutXfers][kOutPktsPerXfer];
+	uint8_t mFbBuf[kFbXfers][kFbPktsPerXfer * kFbPktSize];
+	OzzyIsochFrame mFbFrames[kFbXfers][kFbPktsPerXfer];
+
+	uint64_t mSent = 0;          /* frames handed to iso OUT */
+	uint64_t mConsumed = 0;      /* frames the mixer reported consuming */
+	uint64_t mReceived = 0;      /* input frames delivered (whole transfers) */
+	uint64_t mNextAnchor = 0;    /* next sample time to publish */
+	uint32_t mPeriod = 0;        /* frames between anchors, as published */
+	uint64_t mInShort = 0, mIsoErrors = 0;
+	uint64_t mTicksPerMs = 0;
+	uint64_t mRefFrame = 0, mRefHost = 0;
+	bool mHaveRef = false;
+	uint64_t mLastFbHost = 0;    /* GetTime() of the last valid feedback */
+	bool mFailed = false;
 };
