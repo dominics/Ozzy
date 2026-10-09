@@ -12,7 +12,7 @@ The installer will:
 - ✅ Compile HAL and MIDI drivers
 - ✅ Install everything to system directories
 - ✅ Configure auto-loading at boot
-- ✅ Start the drivers immediately
+- ✅ Start the drivers immediately (a first install on Apple Silicon needs approval in System Settings > Privacy & Security and a reboot first)
 
 ## 🗑️ Uninstall
 
@@ -60,6 +60,17 @@ This driver uses a **shared memory model** for zero-copy audio streaming:
 | **Allen & Heath Xone:DB2** | 8×8 | 44.1/48/96 kHz | ✅ Perfect |
 | **Allen & Heath Xone:DX** | 8×8 | 44.1/48/96 kHz | ✅ Perfect |
 | **Allen & Heath Xone:4D** | 8×8 | 44.1/48/96 kHz | ✅ Perfect |
+| **Dynacord CMS 600-3** | 4x4 | 44.1/48/96 kHz | 2 MIDI ports |
+
+### Dynacord CMS 600-3
+
+- **SIP and security**: needs SIP with the kext exception (`csrutil enable --without kext` in Recovery). On Apple Silicon it also needs Reduced Security with user-managed kernel extensions (Startup Security Utility), and approval in System Settings > Privacy & Security after the first install, followed by a reboot.
+- **Power-cycle quirk**: the mixer only enumerates if it is powered on with the USB cable already plugged in. If it does not show up, power it off, plug in the cable, then power it on.
+- **Sample rate**: 44.1, 48 or 96 kHz, changed in Audio MIDI Setup.
+- **MIDI**: two ports, "USB-MIDI" (the DIN sockets) and "SystemCtrl" (FX control). MIDI only moves while audio is streaming.
+- **Latency**: output is queued as 8 x 3 ms OUT transfers (24 ms) with a 40 ms output safety offset.
+- **Logs**: `log stream --predicate 'eventMessage CONTAINS "[OzzyKext]" OR eventMessage CONTAINS "[Dynacord]" OR eventMessage CONTAINS "[OzzyHAL]"'`
+- **Without SIP changes**: a userspace alternative is planned separately.
 
 ## 🔧 Manual Build
 

@@ -12,13 +12,14 @@ DEXT_INSTALLED=false
 DAEMON_INSTALLED=false
 LEGACY_HAL=false
 
-# Check for Kext-based installation
-if [ -d "/Library/Extensions/OzzyKext.kext" ] || [ -d "/Library/Audio/Plug-Ins/HAL/OzzyHAL.driver" ]; then
+# Check for Kext-based installation (option 1 below upgrades it in place)
+if [ -d "/Library/Extensions/OzzyKext.kext" ] || [ -d "/Library/Audio/Plug-Ins/HAL/OzzyHAL.driver" ] || [ -d "/Library/Audio/MIDI Drivers/OzzyMIDI.plugin" ]; then
     KEXT_INSTALLED=true
 fi
 
-# Check for legacy HAL + Daemon (old install-mac.command style)
-if [ -d "/Library/Audio/Plug-Ins/HAL/OzzyHAL.driver" ] || [ -f "/usr/local/bin/Ozzy" ] || [ -f "/Library/LaunchDaemons/Ozzy.plist" ]; then
+# Check for legacy HAL + Daemon (old install-mac.command style). OzzyHAL.driver
+# alone is not a sign of it: every install type uses the HAL driver.
+if [ -f "/usr/local/bin/Ozzy" ] || [ -f "/Library/LaunchDaemons/Ozzy.plist" ]; then
     LEGACY_HAL=true
 fi
 
@@ -32,8 +33,8 @@ if [ -f "/usr/local/bin/OzzyDaemon" ]; then
     DAEMON_INSTALLED=true
 fi
 
-# Show conflict warning if any installation exists
-if $KEXT_INSTALLED || $DEXT_INSTALLED || $DAEMON_INSTALLED || $LEGACY_HAL; then
+# Show conflict warning if a different driver type is installed
+if $DEXT_INSTALLED || $DAEMON_INSTALLED || $LEGACY_HAL; then
     echo "======================================================"
     echo "          ⚠️  EXISTING INSTALLATION DETECTED"
     echo "======================================================"
@@ -56,16 +57,18 @@ if $KEXT_INSTALLED || $DEXT_INSTALLED || $DAEMON_INSTALLED || $LEGACY_HAL; then
     echo "   conflicts and prevent your audio device from working!"
     echo ""
     echo "You must uninstall the existing driver first using:"
-    echo "  ./uninstall_ozzy.command"
+    echo "  ./uninstall.command"
     echo ""
     echo "Or manually remove:"
     if $KEXT_INSTALLED; then
         echo "  - /Library/Extensions/OzzyKext.kext"
         echo "  - /Library/LaunchDaemons/com.ozzy.kext.load.plist"
     fi
-    if $LEGACY_HAL; then
+    if $KEXT_INSTALLED || $LEGACY_HAL; then
         echo "  - /Library/Audio/Plug-Ins/HAL/OzzyHAL.driver"
         echo "  - /Library/Audio/MIDI Drivers/OzzyMIDI.plugin"
+    fi
+    if $LEGACY_HAL; then
         echo "  - /usr/local/bin/Ozzy"
         echo "  - /Library/LaunchDaemons/Ozzy.plist"
     fi
@@ -82,6 +85,12 @@ if $KEXT_INSTALLED || $DEXT_INSTALLED || $DAEMON_INSTALLED || $LEGACY_HAL; then
     exit 1
 fi
 
+if $KEXT_INSTALLED; then
+    echo "ℹ️  An existing Legacy Kext Driver install was found."
+    echo "   Option 1 upgrades it in place: the kext, HAL and MIDI drivers are replaced."
+    echo ""
+fi
+
 echo "======================================================"
 echo "          Ozzy Audio Engine - Full Install"
 echo "======================================================"
@@ -93,6 +102,9 @@ echo "     • Kernel Extension (requires SIP modification)"
 echo "     • HAL Audio Driver"
 echo "     • MIDI Driver"
 echo "     • Auto-loads at boot via LaunchDaemon"
+echo "     Supported devices:"
+echo "     • Allen & Heath Xone:DB4 / DB2 / DX / 4D (8x8 audio)"
+echo "     • Dynacord CMS 600-3 (4x4 audio, 2 MIDI ports)"
 echo ""
 echo "  2) Modern DriverKit Extension (macOS 11+) [Future]"
 echo "     • User-space driver (more secure)"
@@ -162,6 +174,12 @@ else
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
         exit 1
     fi
+fi
+
+if [ "$(uname -m)" = "arm64" ]; then
+    echo ""
+    echo "ℹ️  Apple Silicon also needs Reduced Security with user-managed kernel extensions (Startup Security Utility), and approval in System Settings > Privacy & Security after the first install, followed by a reboot."
+    echo ""
 fi
 
 # Detect signing identity
@@ -325,13 +343,16 @@ if kmutil showloaded 2>/dev/null | grep -q "OzzyKext"; then
     KEXT_LOADED=true
 else
     echo "⚠️  Attempting to load Kernel Extension..."
-    sudo kmutil load -p "$INSTALL_PATH"
-    sleep 1
+    # A failed load (e.g. not yet approved) must not abort the script under
+    # set -e: everything is installed, and the summary below says what to do.
+    if sudo kmutil load -p "$INSTALL_PATH"; then
+        sleep 1
+    fi
     if kmutil showloaded 2>/dev/null | grep -q "OzzyKext"; then
         echo "✅ Kernel Extension loaded successfully!"
         KEXT_LOADED=true
     else
-        echo "❌ Failed to load kext. Check logs: cat /tmp/ozzy-kext-load.err"
+        echo "❌ Kernel Extension did not load yet (see kmutil's message above)."
         KEXT_LOADED=false
     fi
 fi
@@ -355,8 +376,15 @@ if $KEXT_LOADED; then
     read -p "Press [Enter] to exit..."
 else
     echo "⚠️  Installation complete, but kext didn't load automatically."
+    echo "   All components are installed; nothing was rolled back."
     echo ""
-    echo "A reboot is required to activate the kernel extension."
+    echo "Next steps:"
+    echo "   1. Approve the extension in System Settings > Privacy & Security"
+    echo "      (needed after the first install, especially on Apple Silicon)"
+    echo "   2. Reboot"
+    echo "   3. At boot the LaunchDaemon (com.ozzy.kext.load) loads the kext;"
+    echo "      if it still fails, see /tmp/ozzy-kext-load.err"
+    echo ""
     echo "After reboot, all components will be active:"
     echo "   • Kernel Extension"
     echo "   • HAL Driver"
