@@ -68,3 +68,12 @@ void test_codec_wrap_large_sample_time()
 	CHECK_EQ(ring[0 + 5], 0x40);     /* frame 1, channel 2 */
 	CHECK_EQ(ring[12 + 8], 0x40);    /* frame 2, channel 3 */
 }
+
+void test_codec_nan_is_silence()
+{
+	uint8_t out[12];
+	const float in[4] = { __builtin_nanf(""), 0.0f, -__builtin_nanf(""), 0.5f };
+	DynacordEncodeFrame(out, in);
+	CHECK(out[0] == 0 && out[1] == 0 && out[2] == 0);
+	CHECK(out[6] == 0 && out[7] == 0 && out[8] == 0);
+}

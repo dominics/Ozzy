@@ -11,10 +11,15 @@
  * counts within 1% (minimum tolerance 8).
  */
 struct GoldenTally {
-	long ours[16] = {}, theirs[16] = {}, totOurs = 0, totTheirs = 0, drift = 0, packets = 0;
+	static constexpr int kMaxSize = 16;
+	long ours[kMaxSize] = {}, theirs[kMaxSize] = {}, totOurs = 0, totTheirs = 0, drift = 0, packets = 0;
 
 	void add(int o, int t)
 	{
+		CHECK(o >= 0 && o < kMaxSize);
+		CHECK(t >= 0 && t < kMaxSize);
+		if (o < 0 || o >= kMaxSize || t < 0 || t >= kMaxSize)
+			return;
 		ours[o]++;
 		theirs[t]++;
 		totOurs += o;
@@ -31,7 +36,7 @@ struct GoldenTally {
 			    rate, packets, totOurs, totTheirs, drift);
 		CHECK(std::labs(totOurs - totTheirs) <= (long)(rate / 1000 + 2));
 		CHECK(drift <= maxDrift);
-		for (int s = 0; s < 16; s++) {
+		for (int s = 0; s < kMaxSize; s++) {
 			long tol = theirs[s] / 100 > 8 ? theirs[s] / 100 : 8;
 			if (std::labs(ours[s] - theirs[s]) > tol)
 				std::printf("  size %d: ours %ld windows %ld\n", s, ours[s], theirs[s]);

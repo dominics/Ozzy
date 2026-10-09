@@ -9,6 +9,7 @@ DynacordRingLayout DynacordRingLayoutFor(uint32_t rate)
 	const uint64_t bufBytes = (uint64_t)kOzzyMaxPacketSize * kOzzyNumPackets;
 	l.outFrames = kDynacordOutRingFrames;
 	l.inFramesPerXfer = (rate * 3 / 1000) & ~7u;
+	if (l.inFramesPerXfer == 0) l.inFramesPerXfer = 8;   /* rates below 2667 Hz; never valid, but never divide by zero */
 	uint64_t slots = bufBytes / ((uint64_t)l.inFramesPerXfer * kDynacordInFrameBytes);
 	l.inFrames = (uint32_t)(slots * l.inFramesPerXfer);
 	return l;

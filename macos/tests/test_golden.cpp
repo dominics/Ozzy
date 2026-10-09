@@ -1,5 +1,4 @@
 /* SPDX-License-Identifier: MIT */
-#include <cstddef>
 #include "../../common/devices/ploytec/dynacord_pacer.h"
 #include "../../userspace/ploytec-play/tests/fixtures/counter_44100.h"
 #include "../../userspace/ploytec-play/tests/fixtures/counter_48000.h"

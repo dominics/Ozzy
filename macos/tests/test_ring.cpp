@@ -71,3 +71,10 @@ void test_ring_input_slot()
 	CHECK(DynacordInputSlot(ring.data(), l, (1ull << 40) * slots + 2) ==
 	      ring.data() + 2 * l.inFramesPerXfer * kDynacordInFrameBytes);
 }
+
+void test_ring_layout_tiny_rate()
+{
+	DynacordRingLayout l = DynacordRingLayoutFor(1);
+	CHECK(l.inFramesPerXfer >= 8);
+	CHECK(l.inFrames >= l.inFramesPerXfer);
+}

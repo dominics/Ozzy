@@ -12,10 +12,14 @@ int main()
 	test_ring_take_output_wraps_and_zeroes();
 	test_ring_take_output_large_position();
 	test_ring_input_slot();
+	test_ring_layout_tiny_rate();
 	test_codec_encode_walking_bits();
 	test_codec_encode_clamps();
 	test_codec_read_input_matches_shared_decoder();
 	test_codec_wrap_large_sample_time();
+	test_codec_nan_is_silence();
+	test_feedback_parse();
+	test_feedback_out_of_range_rejected_by_pacer();
 	test_bus_isoch_defaults_unsupported();
 	test_bus_profile_defaults_zero();
 	test_engine_base_defaults();

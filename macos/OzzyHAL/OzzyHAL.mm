@@ -8,6 +8,7 @@
 #include <cstring>
 #include <mach/mach_time.h>
 #include <CoreAudio/CoreAudio.h>
+#include <SystemConfiguration/SystemConfiguration.h>
 
 static CFStringRef SafeCreateString(const char* str) {
     if (!str || str[0] == 0) return nullptr;
@@ -25,6 +26,17 @@ static SHMName CopyName(const char (&src)[64]) {
     memcpy(n.s, src, len);
     n.s[len] = 0;
     return n;
+}
+
+/* The daemon's segment is world-writable by name, so any local user could
+ * create it first. Only map one owned by the console user, who runs the
+ * daemon. */
+static bool OwnedByConsoleUser(const struct stat& sb) {
+    uid_t uid = 0;
+    CFStringRef name = SCDynamicStoreCopyConsoleUser(NULL, &uid, NULL);
+    if (!name) return false;
+    CFRelease(name);
+    return sb.st_uid == uid;
 }
 
 static uint64_t MsToHostTicks(uint64_t ms) {
@@ -212,6 +224,16 @@ bool OzzyHAL::ApplyFrameLayout() {
     return true;
 }
 
+/* True if the segment still describes the frame layout the HAL is using. */
+bool OzzyHAL::FrameLayoutUnchanged() const {
+    return mSHM->audio.sampleRate.load() == mCurrentStreamFormat.mSampleRate &&
+           mSHM->audio.ringFramesOut == mRingSize &&
+           mSHM->audio.ringFramesIn == mRingSizeIn &&
+           mSHM->audio.zeroTimestampPeriod == mZeroTimestampPeriod &&
+           mSHM->audio.safetyOffsetOut == mSafetyOffsetOut &&
+           mSHM->audio.safetyOffsetIn == mSafetyOffsetIn;
+}
+
 /* Release the mapping now, or if IO may still be running, only mark it dead so the IO path stops touching it; the monitor unmaps after StopIO. */
 void OzzyHAL::DropMapping() {
     mMappingDead.store(true);   // first: StartIO and the IO path see this before they touch the segment
@@ -258,7 +280,8 @@ void OzzyHAL::MapSharedMemory() {
         mSHMFd = shm_open(kOzzySharedMemName, O_RDWR, 0666);
         if (mSHMFd != -1) {
             struct stat sb;
-            if (fstat(mSHMFd, &sb) == 0 && (size_t)sb.st_size >= sizeof(OzzySharedMemory)) {
+            bool sized = fstat(mSHMFd, &sb) == 0 && (size_t)sb.st_size >= sizeof(OzzySharedMemory);
+            if (sized && OwnedByConsoleUser(sb)) {
                 void* ptr = mmap(NULL, sizeof(OzzySharedMemory), PROT_READ | PROT_WRITE, MAP_SHARED, mSHMFd, 0);
                 if (ptr != MAP_FAILED) {
                     mSHM = (OzzySharedMemory*)ptr;
@@ -267,6 +290,12 @@ void OzzyHAL::MapSharedMemory() {
                     close(mSHMFd); mSHMFd = -1;
                 }
             } else {
+                // Logged once per owner, not on every 100 ms retry.
+                static uid_t lastRefused = (uid_t)-1;
+                if (sized && sb.st_uid != lastRefused) {
+                    LogOzzyHALError("ignoring /ozzy_shared_mem owned by uid %{public}u, not the console user", sb.st_uid);
+                    lastRefused = sb.st_uid;
+                }
                 close(mSHMFd); mSHMFd = -1;
             }
         }
@@ -463,11 +492,20 @@ void OzzyHAL::MonitorLoop() {
                             DropMapping();
                         }
                     }
-                    if (mSHM && !mMappingDead.load() && mSHM->sessionID != mLastSessionID) {
-                        LogOzzyHAL("session changed: 0x%{public}08X -> 0x%{public}08X", mLastSessionID, mSHM->sessionID);
-                        mLastSessionID = mSHM->sessionID;
-                    }
                 }
+            }
+            if (mSHM && !mMappingDead.load() && mSHM->sessionID != mLastSessionID) {
+                LogOzzyHAL("session changed: 0x%{public}08X -> 0x%{public}08X", mLastSessionID, mSHM->sessionID);
+                mLastSessionID = mSHM->sessionID;
+            }
+            // The engine publishes a restart's layout some time after its new
+            // session, and a rate change it applied late (after
+            // PerformSampleRateChange gave up) brings a new one: check every
+            // poll and reattach so the DOWN/UP path re-applies it. A read torn
+            // by a publish in progress costs one extra reattach at most.
+            if (mSHM && !mMappingDead.load() && mIsDynacord && !mRateChangeActive.load() && !FrameLayoutUnchanged()) {
+                LogOzzyHAL("layout changed; reattaching");
+                DropMapping();
             }
         }
 
@@ -485,8 +523,15 @@ void OzzyHAL::MonitorLoop() {
 
         if (currentlyConnected != mLastConnectedState) {
             if (currentlyConnected) {
-                // The engine may have restarted with new rings; re-read and re-check them.
-                if (!(mIsDynacord ? ApplyFrameLayout() : ApplyPacketLayout())) {
+                // The engine may have restarted with new rings. Re-read them, but
+                // never under running IO: a changed layout there means IO must restart.
+                bool layoutOK;
+                if (mIOClients.load() > 0)
+                    layoutOK = mIsDynacord ? FrameLayoutUnchanged() : true;
+                else
+                    layoutOK = mIsDynacord ? ApplyFrameLayout() : ApplyPacketLayout();
+                if (!layoutOK) {
+                    LogOzzyHALError("layout changed or invalid on reconnect");
                     DropMapping();
                     usleep(250000);
                     continue;
@@ -551,7 +596,7 @@ kern_return_t OzzyHAL::StartIO() {
     // Count first, then look at the mapping: the monitor marks it dead first
     // and then reads the count, so one of the two sides always sees the other.
     mIOClients.fetch_add(1);
-    if (mMappingDead.load() || !mSHM) {
+    if (mMappingDead.load() || !mSHM || !IsConnected()) {
         mIOClients.fetch_sub(1);
         return kAudioHardwareNotRunningError;
     }
@@ -564,11 +609,15 @@ kern_return_t OzzyHAL::StartIO() {
 
 kern_return_t OzzyHAL::StopIO() {
     LogOzzyHAL("stop I/O");
-    mIOStarted = false;
     mTimestampSeed++;
-    ClearOutputBuffer();
-    // Never below zero.
+    // Clear while this client is still counted: the monitor only unmaps a
+    // dropped mapping once the count reaches zero, so the buffer stays mapped.
     uint32_t n = mIOClients.load();
+    if (n <= 1) {   // this is the last client
+        mIOStarted = false;
+        ClearOutputBuffer();
+    }
+    // Never below zero.
     while (n > 0 && !mIOClients.compare_exchange_weak(n, n - 1)) {}
     return kIOReturnSuccess;
 }
@@ -586,12 +635,22 @@ OSStatus OzzyHAL::RequestSampleRate(Float64 rate) {
  * stream at that rate in a new session, then pick up the new ring and timing
  * layout. */
 OSStatus OzzyHAL::PerformSampleRateChange(UInt64 rate) {
-    if (!mIsDynacord || !mSHM) return kAudioHardwareNoError;
+    if (!mIsDynacord) return kAudioHardwareNoError;
+    // Counted as an IO client for the duration, so the monitor defers any
+    // unmap until we return; and its session check stands aside meanwhile.
+    struct Hold {
+        OzzyHAL* h;
+        ~Hold() { h->mRateChangeActive.store(false); h->mIOClients.fetch_sub(1); }
+    };
+    mIOClients.fetch_add(1);
+    mRateChangeActive.store(true);
+    Hold hold { this };
+    if (mMappingDead.load() || !mSHM) return kAudioHardwareNotRunningError;
     uint32_t oldSession = mSHM->sessionID;
     mSHM->audio.requestedRate = (uint32_t)rate;
     for (int i = 0; i < 300; i++) {
         usleep(10000);
-        if (!mSHM) return kAudioHardwareNotRunningError;
+        if (mMappingDead.load() || !mSHM) return kAudioHardwareNotRunningError;
         if (mSHM->sessionID != oldSession && mSHM->audio.sampleRate.load() == rate &&
             mSHM->audio.timestamp.hostTime.load() != 0) {
             if (!ApplyFrameLayout()) {
@@ -633,6 +692,8 @@ HRESULT OzzyHAL::GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioObje
         hTime = mLastAnchorHost;
     }
 
+    // No anchor ever published: never hand CoreAudio a (0, 0) anchor.
+    if (hTime == 0 && mLastAnchorHost == 0) return kAudioHardwareNotRunningError;
     if (hTime == 0 && mLastAnchorHost != 0) {
         // The engine is restarting and has no anchor yet: keep serving the last one.
         sTime = mLastAnchorSample;

@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: MIT
 COMMON   := ../../common/devices/ploytec
-CC       ?= clang
-CXX      ?= clang++
+ifeq ($(origin CC),default)
+CC := clang
+endif
+ifeq ($(origin CXX),default)
+CXX := clang++
+endif
 CFLAGS   := -std=c11 -O2 -g -Wall -Wextra -Werror -MMD -MP
 CXXFLAGS := -std=gnu++20 -O2 -g -Wall -Wextra -Werror -MMD -MP
 LDLIBS   :=
@@ -25,6 +29,7 @@ TEST_SRC := \
 	test_golden.cpp \
 	test_ring.cpp \
 	test_codec.cpp \
+	test_feedback.cpp \
 	test_bus.cpp \
 	test_engine_init.cpp \
 	test_engine_stream.cpp \

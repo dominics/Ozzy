@@ -97,7 +97,8 @@ private:
     // Set when the mapping must no longer be touched by the IO path but IO is
     // still running; the monitor unmaps once StopIO has been seen.
     std::atomic<bool> mMappingDead { false };
-    std::atomic<uint32_t> mIOClients { 0 };   // StartIO calls minus StopIO calls (one per client)
+    std::atomic<uint32_t> mIOClients { 0 };   // StartIO calls minus StopIO calls (one per client), plus a running rate change
+    std::atomic<bool> mRateChangeActive { false };   // PerformSampleRateChange is waiting for the engine
 
     // Daemon liveness (layout v2 only)
     uint32_t mLastHeartbeat = 0;
@@ -149,6 +150,7 @@ private:
     void RebuildStreamConfigs();
     bool ApplyPacketLayout();
     bool ApplyFrameLayout();
+    bool FrameLayoutUnchanged() const;
     void DropMapping();
 
     void ClearOutputBuffer();

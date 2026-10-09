@@ -103,6 +103,13 @@ bool DynacordEngine::Start()
 	mStopping = false;
 	if (!RunInit())
 		return false;
+	/* A new timeline: (0, 0) tells the HAL there is no anchor yet, so it keeps
+	 * serving its last one until anchor 0 of this stream arrives.
+	 * Cleared before PublishConfig() so the new sampleRate is never seen
+	 * next to the old stream's anchor; the fence keeps it ahead of the
+	 * config stores. */
+	WriteTimestamp(0, 0);
+	__atomic_thread_fence(__ATOMIC_RELEASE);
 	PublishConfig();
 	SHM()->audio.hardwarePresent = true;
 	if (!StartStreaming()) {
@@ -281,9 +288,6 @@ bool DynacordEngine::StartStreaming()
 	mTicksPerMs = HostTicksPerMs();
 	mHaveRef = mBus->GetBusFrame(&mRefFrame, &mRefHost);
 	mLastFbHost = mBus->GetTime();
-	/* A new timeline: (0, 0) tells the HAL there is no anchor yet, so it keeps
-	 * serving its last one until anchor 0 of this stream arrives. */
-	WriteTimestamp(0, 0);
 
 	for (uint32_t i = 0; i < kFbXfers; i++)
 		if (!SubmitFeedback(i))

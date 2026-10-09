@@ -5,6 +5,7 @@
 
 static int32_t ToS24(float x)
 {
+	if (!(x == x)) return 0;   /* NaN: casting it to int is undefined */
 	if (x >= 1.0f)
 		return 0x7FFFFF;
 	if (x <= -1.0f)
