@@ -22,7 +22,8 @@ LIB_SRC := \
 	../Devices/Dynacord/DynacordCodec.cpp \
 	../Devices/Dynacord/DynacordEngine.cpp \
 	../Devices/Ploytec/PloytecEngine.cpp \
-	../OzzyMIDI/MidiParser.cpp
+	../OzzyMIDI/MidiParser.cpp \
+	../Backends/OzzyDaemon/SharedMemory.cpp
 
 TEST_SRC := \
 	test_main.cpp \
@@ -37,7 +38,8 @@ TEST_SRC := \
 	test_engine_midi.cpp \
 	test_kext_status.cpp \
 	test_ploytec_engine.cpp \
-	test_midi_parser.cpp
+	test_midi_parser.cpp \
+	test_shm.cpp
 
 OBJ := $(addprefix build/,$(notdir $(C_SRC:.c=.o) $(LIB_SRC:.cpp=.o) $(TEST_SRC:.cpp=.o)))
 vpath %.c $(sort $(dir $(C_SRC)))

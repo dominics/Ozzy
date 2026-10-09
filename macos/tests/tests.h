@@ -64,3 +64,6 @@ void test_parser_stray_data_dropped();
 void test_parser_sysex_short();
 void test_parser_sysex_long_chunks();
 void test_parser_unterminated_sysex_flushed_by_status();
+void test_shm_create_sets_header_and_mode();
+void test_shm_create_refuses_live_replaces_stale();
+void test_shm_destroy_keeps_replacement();

@@ -70,6 +70,9 @@ int main()
 	test_parser_sysex_short();
 	test_parser_sysex_long_chunks();
 	test_parser_unterminated_sysex_flushed_by_status();
+	test_shm_create_sets_header_and_mode();
+	test_shm_create_refuses_live_replaces_stale();
+	test_shm_destroy_keeps_replacement();
 	if (test_failures) {
 		std::fprintf(stderr, "%d failure(s)\n", test_failures);
 		return 1;
