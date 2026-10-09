@@ -1,6 +1,7 @@
 #include "OzzyMIDI.h"
 #include "../Shared/OzzySharedData.h"
 #include "../Shared/OzzyLog.h"
+#include "MidiParser.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMIDI/CoreMIDI.h>
 #include <mach/mach_time.h>
@@ -14,9 +15,39 @@
 #include <IOKit/IOKitLib.h>
 
 static OzzySharedMemory* gSharedMem = nullptr;
-static MIDIEndpointRef gMidiSourceRef = 0;
+/* Send() runs on CoreMIDI's thread and writes through gSharedMem; it holds
+ * this lock while it does. The poll thread takes it to publish or drop the
+ * mapping, and unmaps only after dropping it, so Send never touches an
+ * unmapped segment. Only the poll thread (or Stop() after joining it) maps
+ * and unmaps, so the poll thread itself reads gSharedMem without the lock. */
+static pthread_mutex_t gShmLock = PTHREAD_MUTEX_INITIALIZER;
+static uint16_t gVendorID = 0, gProductID = 0;   // identity of the mapped device
 static MIDIDeviceRef gMidiDeviceRef = 0;
 static MIDIDriverRef gDriverRef = nullptr;
+
+static const int kMaxPorts = 2;
+static std::atomic<int> gPortCount{0};                      // entities currently on the device
+static MIDIEndpointRef gSources[kMaxPorts] = {};
+static MidiParser gParsers[kMaxPorts] = {};
+
+// The port count comes from shared memory the other side can write, so it is clamped to 1..2.
+static int WantedPorts() { return (gSharedMem && gSharedMem->midiPortCount >= 2) ? 2 : 1; }
+
+static OzzyMidiBuffer& InRing(int port) { return port == 1 ? gSharedMem->midiInPort1 : gSharedMem->midiIn; }
+static OzzyMidiBuffer& OutRing(int port) { return port == 1 ? gSharedMem->midiOutPort1 : gSharedMem->midiOut; }
+
+static void EmitToSource(const uint8_t* msg, size_t len, void* ctx)
+{
+	MIDIEndpointRef src = (MIDIEndpointRef)(uintptr_t)ctx;
+	if (!src)
+		return;
+	Byte storage[sizeof(MIDIPacketList) + MidiParser::kChunk];
+	MIDIPacketList* pl = (MIDIPacketList*)storage;
+	MIDIPacket* p = MIDIPacketListInit(pl);
+	p = MIDIPacketListAdd(pl, sizeof(storage), p, mach_absolute_time(), len, msg);
+	if (p)
+		MIDIReceived(src, pl);
+}
 
 static std::atomic<bool> gThreadShouldRun{false};
 static pthread_t gPollThread = nullptr;
@@ -51,6 +82,33 @@ static void SetDeviceOnline(bool online) {
 	}
 }
 
+/* Give the device one entity per port: "MIDI" for one, "USB-MIDI" and
+ * "SystemCtrl" for the CMS 600-3. Destinations carry their port number. */
+static void ConfigureEntities() {
+	int want = WantedPorts();
+	if (want == gPortCount.load())
+		return;
+	gPortCount.store(0);
+	for (ItemCount i = MIDIDeviceGetNumberOfEntities(gMidiDeviceRef); i-- > 0;)
+		MIDIDeviceRemoveEntity(gMidiDeviceRef, MIDIDeviceGetEntity(gMidiDeviceRef, i));
+	static const CFStringRef one[] = { CFSTR("MIDI") };
+	static const CFStringRef two[] = { CFSTR("USB-MIDI"), CFSTR("SystemCtrl") };
+	for (int port = 0; port < want; port++) {
+		MIDIEntityRef ent;
+		OSStatus err = MIDIDeviceAddEntity(gMidiDeviceRef, want == 2 ? two[port] : one[port], false, 1, 1, &ent);
+		if (err != noErr) {
+			LogOzzyMIDIError("failed to add MIDI entity %{public}d: %{public}d", port, (int)err);
+			gPortCount.store(port);
+			return;
+		}
+		gSources[port] = MIDIEntityGetSource(ent, 0);
+		MIDIEndpointSetRefCons(MIDIEntityGetDestination(ent, 0), (void*)(intptr_t)port, nullptr);
+		gParsers[port] = MidiParser();
+	}
+	gPortCount.store(want);
+	LogOzzyMIDI("%{public}d MIDI port(s)", want);
+}
+
 static void EnsureMIDIDeviceCreated() {
 	char nameBuf[64] = "Ozzy MIDI";
 	char mfgBuf[64] = "Ozzy";
@@ -66,15 +124,16 @@ static void EnsureMIDIDeviceCreated() {
 	if (gMidiDeviceRef != 0) {
 		if (deviceName) MIDIObjectSetStringProperty(gMidiDeviceRef, kMIDIPropertyName, deviceName);
 		if (vendorName) MIDIObjectSetStringProperty(gMidiDeviceRef, kMIDIPropertyManufacturer, vendorName);
+		for (int i = 0; i < kMaxPorts; i++) gParsers[i] = MidiParser();
+		ConfigureEntities();
 		SetDeviceOnline(true);
 	} else {
 			LogOzzyMIDI("creating device: '%{public}s'", nameBuf);
 		OSStatus err = MIDIDeviceCreate(gDriverRef, deviceName, vendorName, deviceName, &gMidiDeviceRef);
 		
 		if (err == noErr) {
-			MIDIEntityRef ent;
-			MIDIDeviceAddEntity(gMidiDeviceRef, CFSTR("MIDI"), false, 1, 1, &ent);
-			gMidiSourceRef = MIDIEntityGetSource(ent, 0);
+			gPortCount.store(0);
+			ConfigureEntities();
 			SInt32 val = 1;
 			MIDIObjectSetIntegerProperty(gMidiDeviceRef, kMIDIPropertyDriverOwner, val);
 			SetDeviceOnline(true);
@@ -87,8 +146,16 @@ static void EnsureMIDIDeviceCreated() {
 	if (vendorName) CFRelease(vendorName);
 }
 
+static void PublishMapping(OzzySharedMemory* mem) {
+	pthread_mutex_lock(&gShmLock);
+	gSharedMem = mem;
+	pthread_mutex_unlock(&gShmLock);
+}
+
 static void DisconnectSharedMemory() {
-	if (gSharedMem) {
+	OzzySharedMemory* mem = gSharedMem;
+	if (mem) {
+		PublishMapping(nullptr);   // from here on Send() can't be using the segment
 		if (gIsKextMapping) {
 			IOConnectUnmapMemory(gKextConnect, 0, mach_task_self(), gKextMapAddress);
 			IOServiceClose(gKextConnect);
@@ -97,16 +164,40 @@ static void DisconnectSharedMemory() {
 			gKextMapSize = 0;
 			gIsKextMapping = false;
 		} else {
-			munmap(gSharedMem, sizeof(OzzySharedMemory));
+			munmap(mem, sizeof(OzzySharedMemory));
 			if (gSHMFd != -1) {
 				close(gSHMFd);
 				gSHMFd = -1;
 			}
 		}
-		gSharedMem = nullptr;
 		LogOzzyMIDI("disconnected");
 		SetDeviceOnline(false);
 	}
+}
+
+/* The engine restarted (a rate change or a halted stream) and published a
+ * new session in the same segment. The mapping stays valid, so keep it:
+ * reset the parsers and follow a change in the port count. A different
+ * device behind the same segment counts as the device going away. */
+static bool OnSessionChange() {
+	if (gSharedMem->vendorID != gVendorID || gSharedMem->productID != gProductID) {
+		LogOzzyMIDIError("device changed, reconnecting");
+		DisconnectSharedMemory();
+		return false;
+	}
+	gLastSessionID = gSharedMem->sessionID;
+	LogOzzyMIDI("session changed (0x%{public}08X)", gLastSessionID);
+	for (int i = 0; i < kMaxPorts; i++) gParsers[i] = MidiParser();
+	ConfigureEntities();
+	return true;
+}
+
+/* A segment was mapped: publish it to Send() and remember whose it is. */
+static void Connected(OzzySharedMemory* mem) {
+	PublishMapping(mem);
+	gLastSessionID = mem->sessionID;
+	gVendorID = mem->vendorID;
+	gProductID = mem->productID;
 }
 
 static bool UpdateConnectionState() {
@@ -116,11 +207,7 @@ static bool UpdateConnectionState() {
 			DisconnectSharedMemory();
 			return false;
 		}
-		if (gSharedMem->sessionID != gLastSessionID) {
-				LogOzzyMIDI("session changed, reconnecting");
-			DisconnectSharedMemory();
-			return false;
-		}
+		if (gSharedMem->sessionID != gLastSessionID) return OnSessionChange();
 		return true;
 	}
 
@@ -136,9 +223,8 @@ static bool UpdateConnectionState() {
 		if (kr == KERN_SUCCESS) {
 			kr = IOConnectMapMemory(gKextConnect, 0, mach_task_self(), &gKextMapAddress, &gKextMapSize, kIOMapAnywhere);
 			if (kr == KERN_SUCCESS) {
-				gSharedMem = (OzzySharedMemory*)gKextMapAddress;
 				gIsKextMapping = true;
-				gLastSessionID = gSharedMem->sessionID;
+				Connected((OzzySharedMemory*)gKextMapAddress);
 					LogOzzyMIDI("connected to kext (session: 0x%{public}08X)", gLastSessionID);
 				EnsureMIDIDeviceCreated();
 				return true;
@@ -168,39 +254,20 @@ static bool UpdateConnectionState() {
 	}
 
 	gSHMFd = fd;
-	gSharedMem = (OzzySharedMemory*)ptr;
+	Connected((OzzySharedMemory*)ptr);
 	
 	if (gSharedMem->magic != kOzzyMagic) {
 		DisconnectSharedMemory();
 		return false;
 	}
-
-	gLastSessionID = gSharedMem->sessionID;
 	
 	LogOzzyMIDI("connected via shm_open (session: 0x%{public}08X)", gLastSessionID);
 	EnsureMIDIDeviceCreated();
 	return true;
 }
 
-static int GetExpectedDataLength(uint8_t status) {
-	if (status >= 0xF0) {
-		switch (status) {
-			case 0xF1: return 1;
-			case 0xF2: return 2;
-			case 0xF3: return 1;
-			default: return 0;
-		}
-	}
-	uint8_t high = status & 0xF0;
-	return (high == 0xC0 || high == 0xD0) ? 1 : 2;
-}
-
 static void* MidiInputPollThread(void* arg) {
 	LogOzzyMIDI("poll thread started");
-	Byte msgBuffer[16];
-	int msgIndex = 0;
-	int msgExpected = 0;
-
 	int checkCounter = 0;
 	
 	while (gThreadShouldRun.load()) {
@@ -217,12 +284,14 @@ static void* MidiInputPollThread(void* arg) {
 				bool sessionValid = (gSharedMem->sessionID == gLastSessionID);
 				bool hwPresent = gSharedMem->audio.hardwarePresent.load(std::memory_order_relaxed);
 				
-				if (!magicValid || !sessionValid || !hwPresent) {
-						LogOzzyMIDIError("connection lost (magic:%{public}d session:%{public}d hw:%{public}d), reconnecting",
-						magicValid, sessionValid, hwPresent);
+				if (!magicValid || !hwPresent) {
+						LogOzzyMIDIError("connection lost (magic:%{public}d hw:%{public}d), reconnecting",
+						magicValid, hwPresent);
 					DisconnectSharedMemory();
 					continue;
 				}
+				if (!sessionValid && !OnSessionChange()) continue;
+				if (WantedPorts() != gPortCount.load()) ConfigureEntities();
 			}
 			
 			// Also check hardware presence on every iteration (fast check)
@@ -235,64 +304,25 @@ static void* MidiInputPollThread(void* arg) {
 
 		if (!gSharedMem) continue;
 
-		uint32_t r = std::atomic_load_explicit(&gSharedMem->midiIn.readIndex, std::memory_order_relaxed);
-		uint32_t w = std::atomic_load_explicit(&gSharedMem->midiIn.writeIndex, std::memory_order_acquire);
 		bool didWork = false;
-		
-		while (r != w) {
+		for (int port = 0; port < gPortCount.load(); port++) {
+			OzzyMidiBuffer& ring = InRing(port);
+			// Indices come from memory the other side can write: mask before indexing.
+			uint32_t r = std::atomic_load_explicit(&ring.readIndex, std::memory_order_relaxed) & kOzzyMidiRingMask;
+			uint32_t w = std::atomic_load_explicit(&ring.writeIndex, std::memory_order_acquire) & kOzzyMidiRingMask;
+			if (r == w)
+				continue;
 			didWork = true;
-			uint8_t byte = gSharedMem->midiIn.buffer[r];
-			r = (r + 1) & kOzzyMidiRingMask;
-			
-			if (byte >= 0xF8) {
-				Byte rtBuf[1] = { byte };
-				if (gMidiSourceRef) {
-					MIDIPacketList packetList;
-					MIDIPacket *curPacket = MIDIPacketListInit(&packetList);
-					curPacket = MIDIPacketListAdd(&packetList, sizeof(packetList), curPacket, mach_absolute_time(), 1, rtBuf);
-					if (curPacket) MIDIReceived(gMidiSourceRef, &packetList);
-				}
-				continue;
+			while (r != w) {
+				MidiParserFeed(&gParsers[port], ring.buffer[r], EmitToSource, (void*)(uintptr_t)gSources[port]);
+				r = (r + 1) & kOzzyMidiRingMask;
 			}
-			
-			if (byte >= 0x80) {
-				msgBuffer[0] = byte;
-				msgIndex = 1;
-				msgExpected = 1 + GetExpectedDataLength(byte);
-				
-				if (byte == 0xF6 || byte == 0xF7 || msgExpected == 1) {
-					if (gMidiSourceRef) {
-						MIDIPacketList packetList;
-						MIDIPacket *curPacket = MIDIPacketListInit(&packetList);
-						curPacket = MIDIPacketListAdd(&packetList, sizeof(packetList), curPacket, mach_absolute_time(), 1, msgBuffer);
-						if (curPacket) MIDIReceived(gMidiSourceRef, &packetList);
-					}
-					msgIndex = 0; msgExpected = 0;
-				}
-				continue;
-			}
-			
-			if (msgIndex > 0 && msgIndex < 16) {
-				msgBuffer[msgIndex++] = byte;
-				if (msgIndex == msgExpected) {
-					if (gMidiSourceRef) {
-						MIDIPacketList packetList;
-						MIDIPacket *curPacket = MIDIPacketListInit(&packetList);
-						curPacket = MIDIPacketListAdd(&packetList, sizeof(packetList), curPacket, mach_absolute_time(), msgIndex, msgBuffer);
-						if (curPacket) MIDIReceived(gMidiSourceRef, &packetList);
-					}
-					msgIndex = 0; msgExpected = 0;
-				}
-			}
+			std::atomic_store_explicit(&ring.readIndex, r, std::memory_order_release);
 		}
-		
-		if (didWork) {
-			std::atomic_store_explicit(&gSharedMem->midiIn.readIndex, r, std::memory_order_release);
-		} else {
+		if (!didWork)
 			usleep(500);
-		}
 	}
-	
+
 	DisconnectSharedMemory();
 	if (gMidiDeviceRef) { MIDIDeviceDispose(gMidiDeviceRef); gMidiDeviceRef = 0; }
 	return NULL;
@@ -328,23 +358,37 @@ static OSStatus Stop(MIDIDriverRef self) {
 	return noErr;
 }
 
+/* Called on CoreMIDI's thread. Holds gShmLock while it writes to the
+ * segment so the poll thread can't unmap it underneath; the poll thread
+ * alone connects, so a send before it has is refused. */
 static OSStatus Send(MIDIDriverRef self, const MIDIPacketList *pktlist, void *destRefCon1, void *destRefCon2) {
-	if (!gSharedMem) UpdateConnectionState();
-	if (!gSharedMem) return kMIDINoConnection;
+	pthread_mutex_lock(&gShmLock);
+	if (!gSharedMem) {
+		pthread_mutex_unlock(&gShmLock);
+		return kMIDINoConnection;
+	}
 	
+	int port = (int)(intptr_t)destRefCon1;
+	if (port < 0 || port >= gPortCount.load() || port >= WantedPorts()) {
+		pthread_mutex_unlock(&gShmLock);
+		return kMIDIUnknownEndpoint;
+	}
+	OzzyMidiBuffer& ring = OutRing(port);
+
 	const MIDIPacket *packet = &pktlist->packet[0];
 	for (unsigned int i = 0; i < pktlist->numPackets; ++i) {
 		for (unsigned int j = 0; j < packet->length; ++j) {
-			uint32_t w = std::atomic_load_explicit(&gSharedMem->midiOut.writeIndex, std::memory_order_relaxed);
-			uint32_t r = std::atomic_load_explicit(&gSharedMem->midiOut.readIndex, std::memory_order_acquire);
+			uint32_t w = std::atomic_load_explicit(&ring.writeIndex, std::memory_order_relaxed) & kOzzyMidiRingMask;
+			uint32_t r = std::atomic_load_explicit(&ring.readIndex, std::memory_order_acquire) & kOzzyMidiRingMask;
 			uint32_t nextW = (w + 1) & kOzzyMidiRingMask;
 			if (nextW != r) {
-				gSharedMem->midiOut.buffer[w] = packet->data[j];
-				std::atomic_store_explicit(&gSharedMem->midiOut.writeIndex, nextW, std::memory_order_release);
+				ring.buffer[w] = packet->data[j];
+				std::atomic_store_explicit(&ring.writeIndex, nextW, std::memory_order_release);
 			}
 		}
 		packet = MIDIPacketNext(packet);
 	}
+	pthread_mutex_unlock(&gShmLock);
 	return noErr;
 }
 

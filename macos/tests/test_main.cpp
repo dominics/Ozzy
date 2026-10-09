@@ -58,6 +58,14 @@ int main()
 	test_kext_status_underrun_is_success();
 	test_ploytec_stop_stops_resubmitting();
 	test_ploytec_only_aborted_transfer_not_resubmitted();
+	test_parser_channel_messages();
+	test_parser_running_status();
+	test_parser_realtime_inside_message();
+	test_parser_system_common_clears_running_status();
+	test_parser_stray_data_dropped();
+	test_parser_sysex_short();
+	test_parser_sysex_long_chunks();
+	test_parser_unterminated_sysex_flushed_by_status();
 	if (test_failures) {
 		std::fprintf(stderr, "%d failure(s)\n", test_failures);
 		return 1;
