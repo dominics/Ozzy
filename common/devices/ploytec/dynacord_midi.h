@@ -9,6 +9,10 @@
 #include <stdint.h>
 #endif
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /*
  * CMS 600-3 MIDI on bulk 0x04 (out) and 0x83 (in). Every transfer is one
  * 9-byte packet: a 4-byte slot per port, then a trailer byte. Each slot
@@ -39,7 +43,7 @@ void dynacord_midi_out_init(uint8_t *pkt);
 /* Start of @port's slot in a packet. */
 static inline uint8_t *dynacord_midi_slot(uint8_t *pkt, enum dynacord_midi_port port)
 {
-	return pkt + port * DYNACORD_MIDI_SLOT_LEN;
+	return pkt + (int)port * (int)DYNACORD_MIDI_SLOT_LEN;
 }
 
 /*
@@ -51,4 +55,7 @@ unsigned int dynacord_midi_in_slot(const uint8_t *pkt, size_t len,
 				   enum dynacord_midi_port port,
 				   const uint8_t **data);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

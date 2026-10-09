@@ -59,9 +59,14 @@ void test_engine_start_queues_transfers()
 	}
 	CHECK_EQ(out, f.engine.OutXfers());
 	CHECK_EQ(fb, DynacordEngine::kFbXfers);
-	CHECK_EQ(f.bus.bulk.size(), DynacordEngine::kInXfers);
-	for (const auto& b : f.bus.bulk)
+	size_t pcmIn = 0;
+	for (const auto& b : f.bus.bulk) {
+		if (b.pipe != DYNACORD_EP_PCM_IN)
+			continue;
+		pcmIn++;
 		CHECK_EQ(b.size, 144 * kDynacordInFrameBytes);
+	}
+	CHECK_EQ(pcmIn, DynacordEngine::kInXfers);
 }
 
 void test_engine_queue_depth()

@@ -9,6 +9,7 @@ LDLIBS   :=
 C_SRC := \
 	$(COMMON)/dynacord_pacer.c \
 	$(COMMON)/dynacord_feedback.c \
+	$(COMMON)/dynacord_midi.c \
 	$(COMMON)/ploytec_codec.c
 
 LIB_SRC := \
@@ -26,7 +27,8 @@ TEST_SRC := \
 	test_bus.cpp \
 	test_engine_init.cpp \
 	test_engine_stream.cpp \
-	test_engine_poll.cpp
+	test_engine_poll.cpp \
+	test_engine_midi.cpp
 
 OBJ := $(addprefix build/,$(notdir $(C_SRC:.c=.o) $(LIB_SRC:.cpp=.o) $(TEST_SRC:.cpp=.o)))
 vpath %.c $(sort $(dir $(C_SRC)))

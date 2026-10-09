@@ -17,6 +17,7 @@ CXX_SOURCES=(
 C_SOURCES=(
 	../common/devices/ploytec/dynacord_pacer.c
 	../common/devices/ploytec/dynacord_feedback.c
+	../common/devices/ploytec/dynacord_midi.c
 )
 
 # The Xcode 27.0 SDK's Kernel headers lost the IOPMDriverAssertion typedefs.

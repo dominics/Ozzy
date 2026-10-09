@@ -49,6 +49,12 @@ int main()
 	test_poll_refreshes_bus_frame_reference();
 	test_poll_keeps_earliest_bus_frame_reference();
 	test_poll_bus_frame_reference_follows_drift();
+	test_engine_midi_publishes_ports_and_queues_reads();
+	test_engine_midi_out_packs_both_ports();
+	test_engine_midi_in_routes_ports();
+	test_engine_midi_in_overflow_counts_drops();
+	test_engine_midi_stopped_does_not_resubmit();
+	test_engine_midi_masks_shm_indices();
 	if (test_failures) {
 		std::fprintf(stderr, "%d failure(s)\n", test_failures);
 		return 1;

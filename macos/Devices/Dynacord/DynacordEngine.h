@@ -2,6 +2,7 @@
 #pragma once
 #include "../../OzzyCore/OzzyEngine.h"
 #include "../../Shared/OzzySharedData.h"
+#include "../../../common/devices/ploytec/dynacord_midi.h"
 #include "../../../common/devices/ploytec/dynacord_pacer.h"
 #include "../../../common/devices/ploytec/ploytec_defs.h"
 #include "DynacordRing.h"
@@ -21,6 +22,8 @@ public:
 		kFbPktsPerXfer = 5,     /* one 3-byte reading per ms */
 		kFbPktSize = 64,        /* wMaxPacketSize of 0x81 */
 		kInXfers = 8,
+		kMidiInXfers = 4,
+		kMidiInXferBytes = 512,
 	};
 
 	/* outXfers: iso OUT transfers of 3 ms kept queued, clamped to 1..kMaxOutXfers. */
@@ -70,6 +73,8 @@ public:
 	uint64_t InShortReads() const { return mInShort; }
 	uint64_t IsoErrors() const { return mIsoErrors; }
 	bool Failed() const { return mFailed; }
+	uint64_t MidiInDropped() const { return mMidiInDropped; }
+	uint64_t MidiOutPackets() const { return mMidiOutPackets; }
 
 private:
 	bool RunInit();
@@ -80,6 +85,11 @@ private:
 	bool SubmitOut(uint32_t i);
 	bool SubmitFeedback(uint32_t i);
 	bool SubmitIn(uint64_t seq);
+	volatile OzzyMidiBuffer* MidiOutRing(int port);
+	volatile OzzyMidiBuffer* MidiInRing(int port);
+	void PumpMidiOut();
+	bool SubmitMidiIn(uint32_t i);
+	void ReceiveMidi(const uint8_t* buf, uint32_t bytes);
 	void Consume(int frames, uint64_t busFrame);
 	void OfferBusReference(uint64_t frame, uint64_t host);
 	uint64_t HostTimeOfBusFrame(uint64_t frame);
@@ -113,4 +123,9 @@ private:
 	bool mHaveRef = false;
 	uint64_t mLastFbHost = 0;    /* GetTime() of the last valid feedback */
 	bool mFailed = false;
+
+	uint8_t mMidiOutPkt[DYNACORD_MIDI_PKT_LEN];
+	uint8_t mMidiInBuf[kMidiInXfers][kMidiInXferBytes];
+	bool mMidiOutBusy = false;
+	uint64_t mMidiInDropped = 0, mMidiOutPackets = 0;
 };

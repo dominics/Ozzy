@@ -93,6 +93,7 @@ void DynacordEngine::PublishConfig()
 	a.safetyOffsetIn = mRate * kSafetyInMs / 1000;
 	a.sampleRate = mRate;
 	a.requestedRate = 0;
+	SHM()->midiPortCount = DYNACORD_MIDI_PORTS;
 }
 
 bool DynacordEngine::Start()
@@ -174,6 +175,97 @@ bool DynacordEngine::SubmitIn(uint64_t seq)
 				     (void*)(uintptr_t)seq);
 }
 
+/* The rings are shared with OzzyMIDI in another address space: order the
+ * data against the index that publishes it. */
+static inline void AcquireFence() { __atomic_thread_fence(__ATOMIC_ACQUIRE); }
+static inline void ReleaseFence() { __atomic_thread_fence(__ATOMIC_RELEASE); }
+
+volatile OzzyMidiBuffer* DynacordEngine::MidiOutRing(int port)
+{
+	return port == DYNACORD_MIDI_PORT_USB ? &SHM()->midiOut : &SHM()->midiOutPort1;
+}
+
+volatile OzzyMidiBuffer* DynacordEngine::MidiInRing(int port)
+{
+	return port == DYNACORD_MIDI_PORT_USB ? &SHM()->midiIn : &SHM()->midiInPort1;
+}
+
+/* Send one 9-byte packet carrying up to 4 pending bytes per port, unless a
+ * packet is already in flight. Runs after each iso OUT transfer (every
+ * 3 ms) and whenever a MIDI packet completes. The segment is writable by
+ * clients, so every index loaded from a ring is masked before use. */
+void DynacordEngine::PumpMidiOut()
+{
+	uint32_t next[DYNACORD_MIDI_PORTS];
+	bool any = false;
+
+	if (mMidiOutBusy)
+		return;
+	dynacord_midi_out_init(mMidiOutPkt);
+	for (int port = 0; port < DYNACORD_MIDI_PORTS; port++) {
+		volatile OzzyMidiBuffer* ring = MidiOutRing(port);
+		uint32_t r = ring->readIndex & kOzzyMidiRingMask;
+		uint32_t w = ring->writeIndex & kOzzyMidiRingMask;
+		uint32_t n = 0;
+		uint8_t* slot = dynacord_midi_slot(mMidiOutPkt, (enum dynacord_midi_port)port);
+
+		AcquireFence();
+		while (r != w && n < DYNACORD_MIDI_SLOT_LEN) {
+			slot[n++] = ring->buffer[r];
+			r = (r + 1) & kOzzyMidiRingMask;
+		}
+		next[port] = r;
+		any |= n > 0;
+	}
+	if (!any)
+		return;
+	if (!mBus->SubmitUSBPacket(DYNACORD_EP_MIDI_OUT, mMidiOutPkt, DYNACORD_MIDI_PKT_LEN, nullptr)) {
+		LogDynacordError("MIDI out submit failed");
+		mFailed = true;
+		return;
+	}
+	ReleaseFence();
+	for (int port = 0; port < DYNACORD_MIDI_PORTS; port++)
+		MidiOutRing(port)->readIndex = next[port];
+	mMidiOutBusy = true;
+	mMidiOutPackets++;
+}
+
+bool DynacordEngine::SubmitMidiIn(uint32_t i)
+{
+	return mBus->SubmitUSBPacket(DYNACORD_EP_MIDI_IN, mMidiInBuf[i], kMidiInXferBytes, (void*)(uintptr_t)i);
+}
+
+/* Split each 9-byte packet into its ports' rings. Bytes that don't fit
+ * are dropped and counted; the HAL-side reader is far faster than MIDI.
+ * Indices loaded from the segment are masked before use. */
+void DynacordEngine::ReceiveMidi(const uint8_t* buf, uint32_t bytes)
+{
+	for (uint32_t off = 0; off + DYNACORD_MIDI_PKT_LEN <= bytes; off += DYNACORD_MIDI_PKT_LEN) {
+		for (int port = 0; port < DYNACORD_MIDI_PORTS; port++) {
+			const uint8_t* data;
+			unsigned n = dynacord_midi_in_slot(buf + off, DYNACORD_MIDI_PKT_LEN,
+							   (enum dynacord_midi_port)port, &data);
+			volatile OzzyMidiBuffer* ring = MidiInRing(port);
+			uint32_t w = ring->writeIndex & kOzzyMidiRingMask;
+			uint32_t r = ring->readIndex & kOzzyMidiRingMask;
+
+			AcquireFence();
+			for (unsigned k = 0; k < n; k++) {
+				uint32_t nw = (w + 1) & kOzzyMidiRingMask;
+				if (nw == r) {
+					mMidiInDropped += n - k;
+					break;
+				}
+				ring->buffer[w] = data[k];
+				w = nw;
+			}
+			ReleaseFence();
+			ring->writeIndex = w;
+		}
+	}
+}
+
 /* Reset the counters and the published anchor, then queue every feedback,
  * bulk IN and OUT transfer. */
 bool DynacordEngine::StartStreaming()
@@ -184,6 +276,8 @@ bool DynacordEngine::StartStreaming()
 	memset((void*)a.inputBuffer, 0, sizeof(a.inputBuffer));
 	mSent = mConsumed = mReceived = mNextAnchor = mInShort = mIsoErrors = 0;
 	mFailed = false;
+	mMidiOutBusy = false;
+	mMidiInDropped = mMidiOutPackets = 0;
 	mTicksPerMs = HostTicksPerMs();
 	mHaveRef = mBus->GetBusFrame(&mRefFrame, &mRefHost);
 	mLastFbHost = mBus->GetTime();
@@ -202,6 +296,9 @@ bool DynacordEngine::StartStreaming()
 		if (!SubmitOut(i))
 			return false;
 	}
+	for (uint32_t i = 0; i < kMidiInXfers; i++)
+		if (!SubmitMidiIn(i))
+			return false;
 	return true;
 }
 
@@ -332,21 +429,43 @@ void DynacordEngine::OnIsochComplete(uint8_t pipeID, void* ctx, int status, uint
 		FillOut(i);
 		if (!SubmitOut(i))
 			mFailed = true;
+		PumpMidiOut();
 	}
 }
 
-/* A bulk IN read landed in its ring slot. A short read zero-fills the rest
- * of the slot so slot positions stay fixed, then the slot kInXfers ahead is
- * queued. */
+/* PCM bulk IN: a read landed in its ring slot. A short read zero-fills the
+ * rest of the slot so slot positions stay fixed, then the slot kInXfers
+ * ahead is queued. MIDI packets are handed to the MIDI paths. */
 void DynacordEngine::OnPacketComplete(uint8_t pipeID, void* ctx, int status, uint32_t bytes)
 {
-	if (mStopping || mFailed || pipeID != DYNACORD_EP_PCM_IN)
+	if (pipeID == DYNACORD_EP_MIDI_OUT)
+		mMidiOutBusy = false;   /* even when stopping, so a restart can send */
+	if (mStopping || mFailed)
 		return;
 	if (status != 0) {
-		LogDynacordError("bulk in failed: 0x%x", status);
+		LogDynacordError("bulk pipe %02x failed: 0x%x", pipeID, status);
 		mFailed = true;
 		return;
 	}
+	if (pipeID == DYNACORD_EP_MIDI_OUT) {
+		PumpMidiOut();
+		return;
+	}
+	if (pipeID == DYNACORD_EP_MIDI_IN) {
+		uint32_t i = (uint32_t)(uintptr_t)ctx;
+		if (i >= kMidiInXfers) {
+			mFailed = true;
+			return;
+		}
+		if (bytes > kMidiInXferBytes)
+			bytes = kMidiInXferBytes;
+		ReceiveMidi(mMidiInBuf[i], bytes);
+		if (!SubmitMidiIn(i))
+			mFailed = true;
+		return;
+	}
+	if (pipeID != DYNACORD_EP_PCM_IN)
+		return;
 	uint64_t seq = (uint64_t)(uintptr_t)ctx;
 	uint32_t want = mLayout.inFramesPerXfer * kDynacordInFrameBytes;
 	if (bytes < want) {

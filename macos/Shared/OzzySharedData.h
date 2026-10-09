@@ -1,6 +1,7 @@
 #ifndef OzzySharedData_h
 #define OzzySharedData_h
 
+#include <stddef.h>
 #include <stdint.h>
 
 // --- KERNEL vs USER SPACE SHIM ---
@@ -112,6 +113,27 @@ struct OzzySharedMemory {
     uint8_t midiInUSBBuffer[512];
     
     CACHE_ALIGN OzzyAudioBuffer audio;
+
+    // A second MIDI port for devices that have one (the CMS 600-3's
+    // "SystemCtrl"; midiOut/midiIn above are port 0). The engine sets
+    // midiPortCount; 0 or 1 means midiOut/midiIn only.
+    uint32_t midiPortCount;
+    CACHE_ALIGN OzzyMidiBuffer midiOutPort1;
+    CACHE_ALIGN OzzyMidiBuffer midiInPort1;
 };
+
+// The kext (volatile fields, C++11) and its clients (std::atomic, C++20)
+// compile this struct separately but share one mapping, so both builds must
+// agree on its layout. Changing the layout means updating these constants.
+static_assert(offsetof(OzzySharedMemory, midiOut) == 256, "OzzySharedMemory layout");
+static_assert(offsetof(OzzySharedMemory, midiIn) == 1536, "OzzySharedMemory layout");
+static_assert(offsetof(OzzySharedMemory, audio) == 3328, "OzzySharedMemory layout");
+static_assert(offsetof(OzzyAudioBuffer, timestamp) == 56, "OzzyAudioBuffer layout");
+static_assert(offsetof(OzzyAudioBuffer, halWritePosition) == 192, "OzzyAudioBuffer layout");
+static_assert(offsetof(OzzyAudioBuffer, inputBuffer) == 264, "OzzyAudioBuffer layout");
+static_assert(offsetof(OzzySharedMemory, midiPortCount) == 2100800, "OzzySharedMemory layout");
+static_assert(offsetof(OzzySharedMemory, midiOutPort1) == 2100864, "OzzySharedMemory layout");
+static_assert(offsetof(OzzySharedMemory, midiInPort1) == 2102144, "OzzySharedMemory layout");
+static_assert(sizeof(OzzySharedMemory) == 2103424, "OzzySharedMemory layout");
 
 #endif
