@@ -2,7 +2,7 @@
 
 A userspace test player for the **Dynacord CMS 600-3** (the old hardware revision with a Ploytec USB card, `0562:03eb`). It plays a sine tone or a WAV file to the mixer's 4 USB outputs using libusb, without any kernel driver, so on macOS it works with SIP enabled.
 
-This is a protocol prototype, not a sound-card driver: the mixer does not appear as an audio device. Protocol notes and the captures behind them are in [dominics/dynacord-cms-pcap](https://github.com/dominics/dynacord-cms-pcap) (`FINDINGS.md`).
+This is a protocol prototype, not a sound-card driver: the mixer does not appear as an audio device.
 
 ## Build
 

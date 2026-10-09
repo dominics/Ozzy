@@ -1,6 +1,5 @@
 /*
- * CMS 600-3 MIDI packet layout against USB captures of the Windows driver
- * (see dynacord-cms-pcap/FINDINGS.md, "MIDI: bulk 0x83 / 0x04").
+ * CMS 600-3 MIDI packet layout against USB captures of the Windows driver.
  */
 #include <string.h>
 
