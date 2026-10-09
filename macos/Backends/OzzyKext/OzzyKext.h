@@ -13,7 +13,7 @@ class OzzyEngine;
 struct OzzySharedMemory;
 
 #define kMaxInterfaces 4
-#define kMaxPipes      16
+enum { kMaxPipes = 16 };
 
 class OzzyKext : public IOService {
     OSDeclareDefaultStructors(OzzyKext)

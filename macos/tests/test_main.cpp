@@ -55,6 +55,7 @@ int main()
 	test_engine_midi_in_overflow_counts_drops();
 	test_engine_midi_stopped_does_not_resubmit();
 	test_engine_midi_masks_shm_indices();
+	test_kext_status_underrun_is_success();
 	if (test_failures) {
 		std::fprintf(stderr, "%d failure(s)\n", test_failures);
 		return 1;

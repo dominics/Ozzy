@@ -49,3 +49,4 @@ void test_engine_midi_in_routes_ports();
 void test_engine_midi_in_overflow_counts_drops();
 void test_engine_midi_stopped_does_not_resubmit();
 void test_engine_midi_masks_shm_indices();
+void test_kext_status_underrun_is_success();

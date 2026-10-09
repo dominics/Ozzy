@@ -173,8 +173,6 @@ bool OzzyKext::start(IOService* provider) {
         return false;
     }
 
-    mBus->SetPipePool(mPipes, kMaxPipes);
-
     LogOzzyKext("initializing engine...");
     mEngine->Init(mBus, mSHM);
     
@@ -257,7 +255,8 @@ void OzzyKext::stop(IOService* provider) {
         }
     }
     
-    // 6. Clean up engine and bus
+    // 6. Clean up engine and bus (cached descriptors wire engine memory: drop them first)
+    if (mBus) mBus->ClearPipes();
     if (mEngine) { 
         SafeKernelDelete(mEngine); 
         mEngine = nullptr; 
@@ -374,6 +373,7 @@ bool OzzyKext::ConfigureHardware() {
             if (p) {
                 if (pipeCounter < kMaxPipes) {
                     mPipes[pipeCounter++] = p;
+                    mBus->AddPipe(cfg->address, p);
                     LogOzzyKext("  pipe 0x%02x opened", cfg->address);
 
                     // Detect bulk vs interrupt from the output endpoint descriptor
