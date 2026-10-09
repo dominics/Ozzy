@@ -70,7 +70,40 @@ This driver uses a **shared memory model** for zero-copy audio streaming:
 - **MIDI**: two ports, "USB-MIDI" (the DIN sockets) and "SystemCtrl" (FX control). MIDI only moves while audio is streaming.
 - **Latency**: output is queued as 8 x 3 ms OUT transfers (24 ms) with a 40 ms output safety offset.
 - **Logs**: `log stream --predicate 'eventMessage CONTAINS "[OzzyKext]" OR eventMessage CONTAINS "[Dynacord]" OR eventMessage CONTAINS "[OzzyHAL]"'`
-- **Without SIP changes**: a userspace alternative is planned separately.
+- **Without SIP changes**: see [Userspace driver](#userspace-driver-dynacord-cms-600-3-sip-enabled) below.
+
+## Userspace driver (Dynacord CMS 600-3, SIP enabled)
+
+For the Dynacord CMS 600-3 there is a driver that needs no kernel extension and no SIP change. It is the same OzzyHAL and OzzyMIDI plug-ins, fed by `OzzyDaemon`, a userspace program that talks to the mixer through IOUSBLib and shares the audio and MIDI buffers with them over the `/ozzy_shared_mem` segment. The daemon runs as a LaunchAgent (`com.ozzy.daemon`) for the logged-in user and is installed as `/usr/local/bin/OzzyDaemon`.
+
+Install (from `macos/`; it asks for `sudo`, builds and signs everything, installs OzzyHAL, OzzyMIDI and the daemon, and restarts `coreaudiod` and `MIDIServer`):
+
+```bash
+./install-userspace.command      # or option 3 of ./install.command on a fresh install
+```
+
+Uninstall:
+
+```bash
+./uninstall-userspace.command
+```
+
+Notes:
+
+- **Power-cycle quirk**: the mixer only enumerates if it is powered on with the USB cable already plugged in. If it does not show up, power it off, plug in the cable, then power it on.
+- **Logged-in user only**: the daemon runs only while you are logged in. If a second logged-in user's agent already holds the device, this one stays idle until the mixer is re-attached (known v1 limit: it does not retry while the device stays plugged in). Anything else that opens the mixer (for example `ploytec-play`) while the daemon is retrying also makes it wait for a replug, and while the daemon streams it holds the device, so other tools cannot open it.
+- **Sleep**: the daemon holds no sleep assertion. When the Mac sleeps the USB session stops, and the daemon restarts it on wake (about half a second, with a logged error). For long recordings on battery use `caffeinate -i` or a power assertion from the recording app.
+- **Logs**: `log stream --predicate 'subsystem == "OzzyDaemon" OR eventMessage CONTAINS "[OzzyHAL]"'` and `~/Library/Logs/OzzyDaemon.log`.
+- **Latency**: output is queued as 8 x 3 ms OUT transfers (24 ms) with a 40 ms output safety offset. The measured output lead is 1152-1294 frames (24-27 ms) at 48 kHz and 2112-2684 frames (22-28 ms) at 96 kHz. Input has a 25 ms safety offset. Through the mixer's loopback, the part of the round trip that CoreAudio's timestamps do not cover is 86 frames at 44.1 and 48 kHz and 94-102 frames at 96 kHz (1-2 ms); the device reports a latency of 0 for now. With a 512-frame IO buffer an app hears its own output back about 88 ms later at 48 kHz.
+- **Input sign-bit glitches (open)**: in some sessions after a sample rate change, the mixer sends the first byte of each 64-byte input frame one frame late in about 8% of frames. That byte holds the sign bits of inputs 1 and 3, so quiet signals on them get full-scale clicks for the rest of the session. A later rate change has cleared it. Details in `.claude/re/open_questions.md`.
+- **MIDI**: OzzyMIDI is installed under `/Library/Audio/MIDI Drivers` and reads MIDI from the same shared memory as the HAL; it needs no SIP change either.
+
+### Security
+
+Accepted risks of the shared memory model:
+
+- The segment `/ozzy_shared_mem` is created with mode 0666. The daemon runs as the logged-in user while `coreaudiod` runs as `_coreaudiod`, and a non-root process cannot chown the segment, so any local user can read or write the audio buffers.
+- Another local user can create the segment first (squatting the name) and so stop the driver from starting. OzzyHAL refuses to map a segment that is not owned by the console user, so this is denial of service, not injection.
 
 ## 🔧 Manual Build
 

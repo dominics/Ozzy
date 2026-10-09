@@ -31,6 +31,11 @@ fi
 # Check for Userspace Daemon installation (future)
 if [ -f "/usr/local/bin/OzzyDaemon" ]; then
     DAEMON_INSTALLED=true
+    # The userspace install ships the HAL and MIDI drivers too; without the
+    # kext itself they are part of this install, not a kext one.
+    if [ ! -d "/Library/Extensions/OzzyKext.kext" ]; then
+        KEXT_INSTALLED=false
+    fi
 fi
 
 # Show conflict warning if a different driver type is installed
@@ -57,7 +62,11 @@ if $DEXT_INSTALLED || $DAEMON_INSTALLED || $LEGACY_HAL; then
     echo "   conflicts and prevent your audio device from working!"
     echo ""
     echo "You must uninstall the existing driver first using:"
-    echo "  ./uninstall.command"
+    if $DAEMON_INSTALLED; then
+        echo "  ./uninstall-userspace.command"
+    else
+        echo "  ./uninstall.command"
+    fi
     echo ""
     echo "Or manually remove:"
     if $KEXT_INSTALLED; then
@@ -112,11 +121,9 @@ echo "     • No SIP modification needed"
 echo "     • System Extension approval required"
 echo "     • NOT YET IMPLEMENTED"
 echo ""
-echo "  3) Userspace Daemon Driver (All macOS) [Future]"
-echo "     • Pure userspace implementation"
-echo "     • Shared memory model"
-echo "     • No kernel extensions required"
-echo "     • NOT YET IMPLEMENTED"
+echo "  3) Userspace Daemon Driver (Dynacord CMS 600-3, SIP on)"
+echo "     • No kernel extensions, no SIP changes"
+echo "     • Runs as a LaunchAgent for the logged-in user"
 echo ""
 read -p "Select option (1, 2, or 3): " -n 1 -r INSTALL_CHOICE
 echo
@@ -129,12 +136,7 @@ if [[ $INSTALL_CHOICE == "2" ]]; then
     read -p "Press [Enter] to exit..."
     exit 0
 elif [[ $INSTALL_CHOICE == "3" ]]; then
-    echo "⚠️  Userspace Daemon installation not yet implemented."
-    echo "   This option will install the userspace daemon driver"
-    echo "   using the shared memory model in the future."
-    echo ""
-    read -p "Press [Enter] to exit..."
-    exit 0
+    exec "$DIR/install-userspace.command"
 elif [[ $INSTALL_CHOICE != "1" ]]; then
     echo "Invalid choice. Exiting."
     exit 1

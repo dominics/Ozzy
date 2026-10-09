@@ -61,11 +61,11 @@ Flexible architecture supporting three backend implementations:
 * Same performance as kext, future-proof architecture
 * **Status:** 🚧 In development (legacy prototype in `legacy/mac-coreaudio/`)
 
-**Planned: Userspace Daemon**
+**Userspace Daemon**
 * No kernel extension required
 * Works with full SIP enabled
 * Slightly higher latency but maximum compatibility
-* **Status:** 🚧 Planned
+* **Status:** ✅ Implemented for the Dynacord CMS 600-3 - see [Userspace driver](macos/README.md#userspace-driver-dynacord-cms-600-3-sip-enabled)
 
 All backends share the same CoreAudio HAL and CoreMIDI drivers—only the USB communication layer changes. Choose the backend that fits your security and performance requirements.
 
