@@ -10,3 +10,6 @@ void test_codec_encode_walking_bits();
 void test_codec_encode_clamps();
 void test_codec_read_input_matches_shared_decoder();
 void test_codec_wrap_large_sample_time();
+void test_bus_isoch_defaults_unsupported();
+void test_bus_profile_defaults_zero();
+void test_engine_base_defaults();

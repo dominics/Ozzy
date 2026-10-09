@@ -16,6 +16,9 @@ int main()
 	test_codec_encode_clamps();
 	test_codec_read_input_matches_shared_decoder();
 	test_codec_wrap_large_sample_time();
+	test_bus_isoch_defaults_unsupported();
+	test_bus_profile_defaults_zero();
+	test_engine_base_defaults();
 	if (test_failures) {
 		std::fprintf(stderr, "%d failure(s)\n", test_failures);
 		return 1;

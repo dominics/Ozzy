@@ -12,6 +12,7 @@ C_SRC := \
 	$(COMMON)/ploytec_codec.c
 
 LIB_SRC := \
+	../OzzyCore/OzzyEngine.cpp \
 	../Devices/Dynacord/DynacordRing.cpp \
 	../Devices/Dynacord/DynacordCodec.cpp
 
@@ -19,7 +20,8 @@ TEST_SRC := \
 	test_main.cpp \
 	test_golden.cpp \
 	test_ring.cpp \
-	test_codec.cpp
+	test_codec.cpp \
+	test_bus.cpp
 
 OBJ := $(addprefix build/,$(notdir $(C_SRC:.c=.o) $(LIB_SRC:.cpp=.o) $(TEST_SRC:.cpp=.o)))
 vpath %.c $(sort $(dir $(C_SRC)))
