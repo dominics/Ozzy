@@ -56,6 +56,8 @@ int main()
 	test_engine_midi_stopped_does_not_resubmit();
 	test_engine_midi_masks_shm_indices();
 	test_kext_status_underrun_is_success();
+	test_ploytec_stop_stops_resubmitting();
+	test_ploytec_only_aborted_transfer_not_resubmitted();
 	if (test_failures) {
 		std::fprintf(stderr, "%d failure(s)\n", test_failures);
 		return 1;

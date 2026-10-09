@@ -1,6 +1,7 @@
 #include "PloytecEngine.h"
 #include "PloytecProtocol.h"
 #include "../../Shared/OzzyLog.h"
+#include <IOKit/IOReturn.h>
 
 // --- CONSTANTS ---
 // Endpoints (direction bit OR'd with base address from ploytec_defs.h)
@@ -43,6 +44,7 @@ void PloytecEngine::SetBulk(bool isBulk) {
 bool PloytecEngine::Start() {
     auto* shm = GetSHM();
     if(!shm) return false;
+    mStopping = false;
     
     LogPloytec("--- begin handshake sequence ---");
 
@@ -117,6 +119,7 @@ bool PloytecEngine::Start() {
 }
 
 void PloytecEngine::Stop() {
+    mStopping = true;
     auto* shm = GetSHM();
     if (!shm) return;
     
@@ -176,8 +179,15 @@ void PloytecEngine::ProcessMIDIInput(uint32_t bytesReceived) {
     }
 }
 
+/*
+ * Resubmit the finished transfer's successor. Nothing is resubmitted after
+ * Stop() or for an aborted transfer: the kext aborts every transfer and
+ * waits for the bus to drain, and an aborted transfer that resubmitted would
+ * keep it from ever draining. Any other error resubmits as before, since the
+ * Xone has no restart path.
+ */
 void PloytecEngine::OnPacketComplete(uint8_t pipeID, void* ctx, int status, uint32_t bytes) {
-    if (!mBus) return;
+    if (!mBus || mStopping || status == kIOReturnAborted) return;
 
     uint32_t finishedIdx = (uint32_t)(uintptr_t)ctx;
     uint32_t nextIdx = finishedIdx + 2;

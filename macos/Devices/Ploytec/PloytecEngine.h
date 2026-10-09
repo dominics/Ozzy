@@ -7,6 +7,7 @@
 class PloytecEngine : public OzzyEngine {
     uint64_t mHwSampleTime = 0;
     bool mIsBulk = false;
+    bool mStopping = false;   // set by Stop(): completions no longer resubmit
     uint32_t mPacketSizeOut = 0;
     
     // Storage for the profile
