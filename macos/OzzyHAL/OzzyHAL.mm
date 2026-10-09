@@ -255,7 +255,6 @@ void OzzyHAL::MapSharedMemory() {
         if (mSHMFd != -1) {
             struct stat sb;
             if (fstat(mSHMFd, &sb) == 0 && (size_t)sb.st_size >= sizeof(OzzySharedMemory)) {
-                mSHMInode = sb.st_ino;
                 void* ptr = mmap(NULL, sizeof(OzzySharedMemory), PROT_READ | PROT_WRITE, MAP_SHARED, mSHMFd, 0);
                 if (ptr != MAP_FAILED) {
                     mSHM = (OzzySharedMemory*)ptr;
@@ -351,7 +350,6 @@ void OzzyHAL::UnmapSharedMemory() {
         mSHMFd = -1;
         munmap(shm, sizeof(OzzySharedMemory));
         if (fd != -1) close(fd);
-        mSHMInode = 0;
     }
 
     mIsKextMapping = false;
@@ -432,10 +430,12 @@ void OzzyHAL::MonitorLoop() {
                      // Don't continue - let state update happen below
                 }
             } else {
-                // If using Daemon, check inode and hardware presence
+                // If using Daemon, check the fd and hardware presence. macOS reports
+                // st_nlink and st_ino as 0 for POSIX shm, so a daemon exit is seen
+                // through magic and the heartbeat watchdog.
                 struct stat sb;
-                if (fstat(mSHMFd, &sb) != 0 || sb.st_nlink == 0 || sb.st_ino != mSHMInode) {
-                    LogOzzyHALError("shared memory unlinked (daemon died)");
+                if (fstat(mSHMFd, &sb) != 0) {
+                    LogOzzyHALError("shared memory fd no longer valid");
                     DropMapping();
                     // Don't continue - let state update happen below
                 } else {

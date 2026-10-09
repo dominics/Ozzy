@@ -129,7 +129,6 @@ private:
 
     // --- Legacy Daemon Support ---
     int mSHMFd = -1;
-    ino_t mSHMInode = 0;
 
     uint32_t mLastSessionID = 0;
 
