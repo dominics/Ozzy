@@ -25,7 +25,8 @@ TEST_SRC := \
 	test_codec.cpp \
 	test_bus.cpp \
 	test_engine_init.cpp \
-	test_engine_stream.cpp
+	test_engine_stream.cpp \
+	test_engine_poll.cpp
 
 OBJ := $(addprefix build/,$(notdir $(C_SRC:.c=.o) $(LIB_SRC:.cpp=.o) $(TEST_SRC:.cpp=.o)))
 vpath %.c $(sort $(dir $(C_SRC)))

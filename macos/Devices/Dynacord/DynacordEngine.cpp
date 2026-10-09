@@ -205,8 +205,55 @@ bool DynacordEngine::StartStreaming()
 	return true;
 }
 
-/* Host time at which bus frame `frame` started, from the latest reference
- * pair; falls back to now when the bus can't report frames. */
+/* Adopt a (frame, host time) sample as the bus reference if it lies nearer
+ * the start of its frame than the current one. GetBusFrame reads the time
+ * 0-1 ms after the frame started, so the sample with the smallest
+ * host - frame * ticks-per-ms is the most accurate. The current reference's
+ * lead shrinks by 500 ppm (the USB 2.0 high-speed frame tolerance) of the
+ * frames elapsed since it was taken, so the reference still follows drift
+ * between the bus and host clocks. StartStreaming() resets it. */
+void DynacordEngine::OfferBusReference(uint64_t frame, uint64_t host)
+{
+	if (mHaveRef) {
+		int64_t df = (int64_t)(frame - mRefFrame);
+		int64_t later = (int64_t)(host - mRefHost) - df * (int64_t)mTicksPerMs;
+		int64_t allowance = (df < 0 ? -df : df) * (int64_t)mTicksPerMs / 2000;
+		if (later > allowance)
+			return;
+	}
+	mRefFrame = frame;
+	mRefHost = host;
+	mHaveRef = true;
+}
+
+DynacordEngine::PollResult DynacordEngine::Poll()
+{
+	uint64_t frame, host;
+	if (mBus->GetBusFrame(&frame, &host))
+		OfferBusReference(frame, host);
+	if (mFailed)
+		return PollResult::kRestart;
+	if (mBus->GetTime() - mLastFbHost > 1000 * mTicksPerMs) {
+		LogDynacordError("feedback silent for 1 s: the mixer stopped streaming");
+		return PollResult::kRestart;
+	}
+	/* The segment is writable by clients: read once, validate before use. */
+	uint32_t req = SHM()->audio.requestedRate;
+	if (req != 0) {
+		if (req != mRate && IsSupportedRate(req)) {
+			LogDynacord("rate change %u -> %u Hz requested", mRate, req);
+			mNextRate = req;
+			return PollResult::kRestart;
+		}
+		if (req != mRate)
+			LogDynacordError("ignoring unsupported rate %u Hz", req);
+		SHM()->audio.requestedRate = 0;
+	}
+	return PollResult::kRunning;
+}
+
+/* Host time at which bus frame `frame` started, from the reference pair;
+ * falls back to now when the bus can't report frames. */
 uint64_t DynacordEngine::HostTimeOfBusFrame(uint64_t frame)
 {
 	if (!mHaveRef)

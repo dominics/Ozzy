@@ -28,9 +28,12 @@ public:
 	uint32_t OutXfers() const { return mOutXfers; }
 
 	/* Rate for the next Start(): 44100, 48000 or 96000. */
-	void SetRate(uint32_t rate) override { mRate = rate; }
+	void SetRate(uint32_t rate) override
+	{
+		mRate = rate;
+		mNextRate = rate;
+	}
 	uint32_t Rate() const { return mRate; }
-	uint32_t NextRate() const override { return mNextRate; }
 	static bool IsSupportedRate(uint32_t rate) { return rate == 44100 || rate == 48000 || rate == 96000; }
 
 	uint32_t LayoutVersion() const override { return kOzzyLayoutFrames; }
@@ -43,6 +46,19 @@ public:
 
 	/* Stop resubmitting; completions after this are ignored. */
 	void Stop() override;
+
+	/*
+	 * Called every 100 ms by the host with the engine lock held. Offers
+	 * the bus frame reference a new sample and decides whether the stream
+	 * must be restarted: after a transfer failure, 1 s without valid
+	 * feedback (the firmware halts for good when its OUT buffer runs dry;
+	 * re-running init recovers it), or a supported rate requested through
+	 * the segment.
+	 */
+	PollResult Poll() override;
+
+	/* Rate to Start() at after a kRestart. */
+	uint32_t NextRate() const override { return mNextRate; }
 
 	void OnPacketComplete(uint8_t pipeID, void* ctx, int status, uint32_t bytes) override;
 	void OnIsochComplete(uint8_t pipeID, void* ctx, int status, uint64_t startFrame, OzzyIsochFrame* frames,
@@ -65,6 +81,7 @@ private:
 	bool SubmitFeedback(uint32_t i);
 	bool SubmitIn(uint64_t seq);
 	void Consume(int frames, uint64_t busFrame);
+	void OfferBusReference(uint64_t frame, uint64_t host);
 	uint64_t HostTimeOfBusFrame(uint64_t frame);
 	void WriteTimestamp(uint64_t sampleTime, uint64_t hostTime);
 	void PublishAnchor(uint64_t sampleTime, uint64_t hostTime);
@@ -75,7 +92,7 @@ private:
 	OzzyDeviceProfile mProfile;
 	uint32_t mOutXfers;
 	uint32_t mRate = 48000;
-	uint32_t mNextRate = 0;
+	uint32_t mNextRate = 48000;
 	DynacordRingLayout mLayout {};
 	bool mStopping = false;
 

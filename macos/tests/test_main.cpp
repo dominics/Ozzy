@@ -40,6 +40,15 @@ int main()
 	test_engine_transfer_error_fails();
 	test_engine_stop_stops_resubmitting();
 	test_engine_golden();
+	test_engine_ignores_shm_period();
+	test_poll_running_while_feedback_flows();
+	test_poll_restarts_after_feedback_silence();
+	test_poll_restarts_after_failure();
+	test_poll_rate_request();
+	test_poll_same_or_unsupported_rate_ignored();
+	test_poll_refreshes_bus_frame_reference();
+	test_poll_keeps_earliest_bus_frame_reference();
+	test_poll_bus_frame_reference_follows_drift();
 	if (test_failures) {
 		std::fprintf(stderr, "%d failure(s)\n", test_failures);
 		return 1;

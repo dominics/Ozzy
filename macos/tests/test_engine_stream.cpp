@@ -273,3 +273,20 @@ void test_engine_golden()
 	GoldenThroughEngine(48000, fb_48000, sizeof(fb_48000), out_48000, sizeof(out_48000));
 	GoldenThroughEngine(96000, fb_96000, sizeof(fb_96000), out_96000, sizeof(out_96000));
 }
+
+/* The segment is client-writable: a zero zeroTimestampPeriod must not
+ * affect the engine, which paces anchors by its own period. */
+void test_engine_ignores_shm_period()
+{
+	EngineFixture f;
+	f.bus.refFrame = 0;
+	f.bus.refHost = 0;
+	CHECK(f.engine.Start());
+	f.shm->audio.zeroTimestampPeriod = 0;
+	for (uint64_t frame = 0; frame < 150; frame += 5) {
+		int v[5] = { 48, 48, 48, 48, 48 };
+		CompleteFeedback(f, frame, v, 5);
+	}
+	CHECK_EQ(f.shm->audio.timestamp.sampleTime, 4800);
+	CHECK_EQ(f.engine.FramesConsumed(), 7200);
+}
