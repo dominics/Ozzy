@@ -1,0 +1,11 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+LABEL=com.ozzy.daemon
+# One loginwindow process runs per logged-in GUI user; uid 0 is the login window itself.
+for uid in $(ps -axo uid=,comm= | awk '$1 != 0 && $2 ~ /\/loginwindow$/ {print $1}' | sort -u); do
+	launchctl bootstrap "gui/$uid" "/Library/LaunchAgents/$LABEL.plist" \
+		|| echo "Could not start $LABEL for uid $uid; it starts at the next login."
+done
+killall -9 coreaudiod 2>/dev/null || true
+killall MIDIServer 2>/dev/null || true

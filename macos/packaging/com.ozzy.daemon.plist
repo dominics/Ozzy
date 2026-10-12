@@ -6,15 +6,16 @@
 	<string>com.ozzy.daemon</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/local/bin/OzzyDaemon</string>
+		<string>/Library/Application Support/Ozzy/OzzyDaemon</string>
+		<string>--log-file</string>
 	</array>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
 	<key>ProcessType</key>
 	<string>Interactive</string>
-	<key>StandardErrorPath</key>
-	<string>@HOME@/Library/Logs/OzzyDaemon.log</string>
 </dict>
 </plist>

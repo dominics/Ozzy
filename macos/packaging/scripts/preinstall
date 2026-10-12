@@ -1,0 +1,12 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+if [ -d /Library/Extensions/OzzyKext.kext ] || [ -f /Library/LaunchDaemons/com.ozzy.kext.load.plist ]; then
+	echo "The Ozzy kext driver is installed. Run its uninstall.command and reboot first." >&2
+	exit 1
+fi
+if [ -f /usr/local/bin/Ozzy ] || [ -f /Library/LaunchDaemons/Ozzy.plist ]; then
+	echo "A legacy Ozzy daemon install is present. Run uninstall.command and reboot first." >&2
+	exit 1
+fi
+"$(dirname "$0")/uninstall.sh" --for-upgrade
