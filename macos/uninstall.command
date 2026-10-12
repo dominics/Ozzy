@@ -1,6 +1,34 @@
 #!/bin/bash
 
-clear
+usage() {
+    echo "usage: $0 [--yes] [--reboot | --no-reboot]"
+    echo "  --yes        don't ask for confirmation"
+    echo "  --reboot     reboot when done without asking"
+    echo "  --no-reboot  don't reboot and don't ask"
+}
+
+ASSUME_YES=false
+REBOOT=ask
+for arg in "$@"; do
+    case "$arg" in
+        -y|--yes) ASSUME_YES=true ;;
+        --reboot) REBOOT=yes ;;
+        --no-reboot) REBOOT=no ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+done
+
+# Without a terminal a prompt reads nothing, which would quietly mean "no".
+if [ ! -t 0 ]; then
+    if ! $ASSUME_YES; then
+        echo "No terminal to confirm on; pass --yes to uninstall unattended." >&2
+        exit 1
+    fi
+    [ "$REBOOT" = ask ] && REBOOT=no
+fi
+
+[ -t 1 ] && clear
 echo "======================================================"
 echo "        Ozzy Audio Engine - Uninstaller"
 echo "======================================================"
@@ -13,17 +41,19 @@ echo "  • MIDI Driver (if installed)"
 echo "  • All LaunchDaemons (if installed)"
 echo "  • All binaries and daemons (if installed)"
 echo ""
-read -p "Are you sure? (y/N): " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    exit 0
-fi
+
+echo "🔑 Administrator privileges required..."
+sudo -v || exit 1
 echo ""
 
-echo ""
-echo "🔑 Administrator privileges required..."
-sudo -v
-echo ""
+if ! $ASSUME_YES; then
+    read -p "Are you sure? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 0
+    fi
+    echo ""
+fi
 
 # Unload and remove new Kext LaunchDaemon
 if [ -f "/Library/LaunchDaemons/com.ozzy.kext.load.plist" ]; then
@@ -109,9 +139,12 @@ echo "Note: You may want to reboot to ensure all services are"
 echo "fully cleaned up."
 echo ""
 
-read -p "Reboot now? (y/N): " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
+if [ "$REBOOT" = ask ]; then
+    read -p "Reboot now? (y/N): " -n 1 -r
+    echo
+    [[ $REPLY =~ ^[Yy]$ ]] && REBOOT=yes
+fi
+if [ "$REBOOT" = yes ]; then
     echo "🔄 Rebooting in 5 seconds... (Ctrl+C to cancel)"
     sleep 5
     sudo reboot
