@@ -2,6 +2,24 @@
 
 Clean, modern kernel extension (kext) driver for Ploytec-based USB audio interfaces on macOS.
 
+## Install (Dynacord CMS 600-3)
+
+Needs an Apple Silicon Mac on macOS 26.1 or later. No SIP changes.
+
+```bash
+brew install --cask dominics/tap/ozzy-cms600
+```
+
+Or download `Ozzy-CMS600-<version>.pkg` from [Releases](https://github.com/dominics/Ozzy/releases). The package is not signed with an Apple Developer ID, so Gatekeeper blocks a double-click: right-click it and choose Open, or run `xattr -d com.apple.quarantine Ozzy-CMS600-*.pkg` first.
+
+From source: `./install-userspace.command` builds the same package and installs it.
+
+Uninstall: `brew uninstall --cask ozzy-cms600`, or `sudo "/Library/Application Support/Ozzy/uninstall.sh"`.
+
+If several people are logged in at once, the CMS 600-3 follows whoever is in front: switching users hands it over within a few seconds.
+
+See [Userspace driver](#userspace-driver-dynacord-cms-600-3-sip-enabled) for details. The Allen & Heath Xone devices use the kext driver below.
+
 ## 🚀 Quick Start
 
 **Double-click** [install.command](install.command) to install everything.
@@ -76,15 +94,15 @@ This driver uses a **shared memory model** for zero-copy audio streaming:
 
 ## Userspace driver (Dynacord CMS 600-3, SIP enabled)
 
-For the Dynacord CMS 600-3 there is a driver that needs no kernel extension and no SIP change. It is the same OzzyHAL and OzzyMIDI plug-ins, fed by `OzzyDaemon`, a userspace program that talks to the mixer through IOUSBLib and shares the audio and MIDI buffers with them over the `/ozzy_shared_mem` segment. The daemon runs as a LaunchAgent (`com.ozzy.daemon`) for the logged-in user and is installed as `/usr/local/bin/OzzyDaemon`.
+For the Dynacord CMS 600-3 there is a driver that needs no kernel extension and no SIP change. It is the same OzzyHAL and OzzyMIDI plug-ins, fed by `OzzyDaemon`, a userspace program that talks to the mixer through IOUSBLib and shares the audio and MIDI buffers with them over the `/ozzy_shared_mem` segment. It is installed as a package (`com.ozzy.userspace`): `/Library/LaunchAgents/com.ozzy.daemon.plist` starts `/Library/Application Support/Ozzy/OzzyDaemon` in every GUI session, and only the daemon of the user in front drives the mixer.
 
-Install (from `macos/`; it asks for `sudo`, builds and signs everything, installs OzzyHAL, OzzyMIDI and the daemon, and restarts `coreaudiod` and `MIDIServer`):
+Install from source (from `macos/`; it builds the package with `packaging/build-pkg.sh`, ad-hoc signed, then asks for `sudo` to install it, which restarts `coreaudiod` and `MIDIServer`). Homebrew and the release `.pkg` are described under [Install](#install-dynacord-cms-600-3).
 
 ```bash
 ./install-userspace.command      # or option 3 of ./install.command on a fresh install
 ```
 
-Uninstall:
+Uninstall (all routes run the same `/Library/Application Support/Ozzy/uninstall.sh`):
 
 ```bash
 ./uninstall-userspace.command
@@ -93,7 +111,9 @@ Uninstall:
 Notes:
 
 - **Power-cycle quirk**: the mixer only enumerates if it is powered on with the USB cable already plugged in. If it does not show up, power it off, plug in the cable, then power it on.
-- **Logged-in user only**: the daemon runs only while you are logged in. If a second logged-in user's agent already holds the device, this one stays idle until the mixer is re-attached (known v1 limit: it does not retry while the device stays plugged in). Anything else that opens the mixer (for example `ploytec-play`) while the daemon is retrying also makes it wait for a replug, and while the daemon streams it holds the device, so other tools cannot open it.
+- **Several logged-in users**: every GUI session runs its own daemon, and only the console user's (the one in front) drives the mixer. On a user switch the old daemon releases the mixer and its segment, and the new one takes over, retrying every 100 ms for up to 5 s while the old one lets go. If it still cannot, it waits for a replug or the next user switch. Anything else that holds the mixer (for example `ploytec-play`) also makes it wait, and while the daemon streams it holds the device, so other tools cannot open it.
+- **Supported Macs**: arm64 and macOS 26.1 or later only; the package refuses anything else.
+- **CMS 600-3 only**: the Xone devices still need the kext driver.
 - **Sleep**: the daemon holds no sleep assertion. When the Mac sleeps the USB session stops, and the daemon restarts it on wake (about half a second, with a logged error). For long recordings on battery use `caffeinate -i` or a power assertion from the recording app.
 - **Logs**: `log stream --predicate 'subsystem == "OzzyDaemon" OR eventMessage CONTAINS "[OzzyHAL]"'` and `~/Library/Logs/OzzyDaemon.log`.
 - **Latency**: output is queued as 8 x 3 ms OUT transfers (24 ms) with a 40 ms output safety offset. The measured output lead is 1152-1294 frames (24-27 ms) at 48 kHz and 2112-2684 frames (22-28 ms) at 96 kHz. Input has a 25 ms safety offset. Through the mixer's loopback, the part of the round trip that CoreAudio's timestamps do not cover is 86 frames at 44.1 and 48 kHz and 94-102 frames at 96 kHz (1-2 ms); the device reports a latency of 0 for now. With a 512-frame IO buffer an app hears its own output back about 88 ms later at 48 kHz.
@@ -101,6 +121,8 @@ Notes:
 - **MIDI**: OzzyMIDI is installed under `/Library/Audio/MIDI Drivers` and reads MIDI from the same shared memory as the HAL; it needs no SIP change either.
 
 ### Security
+
+The LaunchAgent runs for every user who logs in, so `OzzyDaemon` lives in `/Library/Application Support/Ozzy`, which only root can write.
 
 Accepted risks of the shared memory model:
 
