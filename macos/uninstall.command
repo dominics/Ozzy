@@ -9,6 +9,9 @@ usage() {
 
 ASSUME_YES=false
 REBOOT=ask
+NEED_REBOOT=false
+AUXKC_PENDING=false
+BUILD_VERSION=$(sw_vers -buildVersion)
 for arg in "$@"; do
     case "$arg" in
         -y|--yes) ASSUME_YES=true ;;
@@ -84,7 +87,12 @@ if kmutil showloaded 2>/dev/null | grep -q "OzzyKext"; then
     sleep 1
     sudo kextunload -b "com.ozzy.kext.OzzyKext" 2>/dev/null || true
     sleep 1
-    echo "✅ Kext unloaded"
+    if kmutil showloaded 2>/dev/null | grep -q "OzzyKext"; then
+        echo "⚠️  Kext is still loaded (in use); it stays loaded until a reboot"
+        NEED_REBOOT=true
+    else
+        echo "✅ Kext unloaded"
+    fi
 fi
 
 if [ -d "/Library/Extensions/OzzyKext.kext" ]; then
@@ -92,6 +100,26 @@ if [ -d "/Library/Extensions/OzzyKext.kext" ]; then
     sudo rm -rf /Library/Extensions/OzzyKext.kext
     sudo touch /Library/Extensions
     echo "✅ Kext removed"
+fi
+
+# Deleting the bundle doesn't take the kext out of the auxiliary kernel
+# collection, which macOS loads at boot, so it keeps loading until that
+# collection is rebuilt. kmutil rebuild drops kexts whose bundles are gone,
+# but needs a Kernel Debug Kit for the running build and a GUI approval.
+if kmutil inspect -V release --no-header 2>/dev/null | grep -q 'com\.ozzy\.kext\.OzzyKext'; then
+    NEED_REBOOT=true
+    AUXKC_PENDING=true
+    KDK_DIR=$(ls -d /Library/Developer/KDKs/KDK_*_"$BUILD_VERSION".kdk 2>/dev/null | head -n 1)
+    if [ -n "$KDK_DIR" ] && [ -t 0 ]; then
+        echo "🔄 Rebuilding the kernel extension collection without the kext..."
+        echo "   Approve the dialog that follows; it times out in 60 seconds."
+        if sudo kmutil rebuild; then
+            echo "✅ Collection rebuilt; the kext is gone after a reboot"
+            AUXKC_PENDING=false
+        else
+            echo "❌ kmutil rebuild failed (see its message above)"
+        fi
+    fi
 fi
 
 # Remove HAL Driver
@@ -135,14 +163,33 @@ echo "======================================================"
 echo ""
 echo "All Ozzy components have been removed from your system."
 echo ""
-echo "Note: You may want to reboot to ensure all services are"
-echo "fully cleaned up."
-echo ""
+if $AUXKC_PENDING; then
+    echo "⚠️  The kext is still in the kernel extension collection, so it"
+    echo "   loads again at every boot until that collection is rebuilt:"
+    echo "   1. Install the Kernel Debug Kit for build $BUILD_VERSION"
+    echo "      (https://developer.apple.com/download/all)"
+    echo "   2. Run: sudo kmutil rebuild   and approve the dialog"
+    echo "   3. Reboot"
+    echo ""
+elif $NEED_REBOOT; then
+    echo "⚠️  The kext stays loaded until you reboot."
+    echo ""
+else
+    echo "Note: You may want to reboot to ensure all services are"
+    echo "fully cleaned up."
+    echo ""
+fi
 
 if [ "$REBOOT" = ask ]; then
-    read -p "Reboot now? (y/N): " -n 1 -r
-    echo
-    [[ $REPLY =~ ^[Yy]$ ]] && REBOOT=yes
+    if $NEED_REBOOT && ! $AUXKC_PENDING; then
+        read -p "Reboot now? (Y/n): " -n 1 -r
+        echo
+        [[ ! $REPLY =~ ^[Nn]$ ]] && REBOOT=yes
+    else
+        read -p "Reboot now? (y/N): " -n 1 -r
+        echo
+        [[ $REPLY =~ ^[Yy]$ ]] && REBOOT=yes
+    fi
 fi
 if [ "$REBOOT" = yes ]; then
     echo "🔄 Rebooting in 5 seconds... (Ctrl+C to cancel)"

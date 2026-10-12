@@ -18,6 +18,8 @@ The installer will:
 
 **Double-click** [uninstall.command](uninstall.command) to remove all components.
 
+Deleting the kext does not stop it loading: macOS keeps a copy in its auxiliary kernel collection and loads that at every boot. The uninstaller rebuilds the collection with `sudo kmutil rebuild` when a Kernel Debug Kit for the running macOS build is installed (from [Apple's downloads](https://developer.apple.com/download/all)), which asks for approval in a dialog and takes effect after a reboot. Without the Kernel Debug Kit it prints those steps for you to finish by hand.
+
 ## 📋 Requirements
 
 - **macOS 11+** (Big Sur or later)
