@@ -73,6 +73,13 @@ int main()
 	test_shm_create_sets_header_and_mode();
 	test_shm_create_refuses_live_replaces_stale();
 	test_shm_destroy_keeps_replacement();
+	test_handover_starts_only_when_front_and_present();
+	test_handover_yields_on_switch_and_login_window();
+	test_handover_unplug_and_replug();
+	test_handover_busy_falls_back_to_slow_retries();
+	test_handover_slow_retry_stops_when_front_lost();
+	test_handover_retry_timer_after_losing_front_does_nothing();
+	test_handover_failed_start_and_session_gone();
 	if (test_failures) {
 		std::fprintf(stderr, "%d failure(s)\n", test_failures);
 		return 1;
