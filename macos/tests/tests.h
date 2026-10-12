@@ -67,6 +67,7 @@ void test_parser_unterminated_sysex_flushed_by_status();
 void test_shm_create_sets_header_and_mode();
 void test_shm_create_refuses_live_replaces_stale();
 void test_shm_destroy_keeps_replacement();
+void test_shm_clear_stale_removes_only_dead_own_segment();
 void test_handover_starts_only_when_front_and_present();
 void test_handover_yields_on_switch_and_login_window();
 void test_handover_unplug_and_replug();

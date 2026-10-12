@@ -4,7 +4,7 @@ CXX      ?= clang++
 CC       ?= clang
 CXXFLAGS := -std=gnu++20 -O2 -g -Wall -Wextra -Werror -MMD -MP
 CFLAGS   := -std=c11 -O2 -g -Wall -Wextra -Werror -MMD -MP
-FRAMEWORKS := -framework IOKit -framework CoreFoundation
+FRAMEWORKS := -framework IOKit -framework CoreFoundation -framework SystemConfiguration
 OZZY_VERSION ?= 0.0.0-dev
 
 .DEFAULT_GOAL := all
@@ -31,7 +31,7 @@ build/shm-client: $(CLIENT_SRC) $(CLIENT_HDR) build/ploytec_codec.o | build
 
 all: build/fake-daemon build/shm-client build/OzzyDaemon
 
-DAEMON_CXX := main.cpp Session.cpp UserBus.cpp RealTime.cpp SharedMemory.cpp \
+DAEMON_CXX := main.cpp ConsoleHandover.cpp Session.cpp UserBus.cpp RealTime.cpp SharedMemory.cpp \
 	../../Devices/Dynacord/DynacordEngine.cpp ../../Devices/Dynacord/DynacordRing.cpp \
 	../../OzzyCore/OzzyEngine.cpp ../../Devices/Ploytec/PloytecEngine.cpp
 DAEMON_C := $(COMMON)/dynacord_pacer.c $(COMMON)/dynacord_feedback.c $(COMMON)/dynacord_midi.c \
@@ -39,7 +39,7 @@ DAEMON_C := $(COMMON)/dynacord_pacer.c $(COMMON)/dynacord_feedback.c $(COMMON)/d
 DAEMON_OBJ := $(addprefix build/,$(notdir $(DAEMON_CXX:.cpp=.o) $(DAEMON_C:.c=.o)))
 DAEMON_HDR := $(FAKE_HDR) ../../OzzyCore/IOzzyBus.h ../../OzzyCore/OzzyEngine.h ../../OzzyCore/OzzyFactory.h \
 	../../Devices/Dynacord/DynacordEngine.h ../../Devices/Ploytec/PloytecEngine.h ../../Shared/OzzyLog.h \
-	Session.h UserBus.h RealTime.h ../OzzyKext/KextStatus.h
+	ConsoleHandover.h Session.h UserBus.h RealTime.h ../OzzyKext/KextStatus.h
 
 vpath %.c $(sort $(dir $(DAEMON_C)))
 vpath %.cpp $(sort $(dir $(DAEMON_CXX)))

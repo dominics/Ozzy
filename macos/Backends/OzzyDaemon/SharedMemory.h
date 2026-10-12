@@ -24,6 +24,11 @@ public:
 	 * the process umask. */
 	CreateResult Create(uint64_t staleAfterMs = 1000);
 
+	/* Unlink the named segment if it is owned by this user and its heartbeat
+	 * has not moved for staleAfterMs (left by a crashed daemon). Leaves live
+	 * or foreign segments alone. Returns true if it removed one. */
+	bool ClearStale(uint64_t staleAfterMs = 1000);
+
 	/* Short description of the last Create() result other than kCreated. */
 	const char* Reason() const { return mReason; }
 

@@ -29,7 +29,7 @@ Session::~Session()
 	IOObjectRelease(mDevice);
 }
 
-bool Session::Start()
+Session::StartStatus Session::Start()
 {
 	/* Create() clears the umask: it must stay on the main thread with no Session thread running. */
 	switch (mShm.Create()) {
@@ -39,11 +39,11 @@ bool Session::Start()
 		LogOzzyDaemon("replaced a stale segment left by a previous daemon");
 		break;
 	case SharedMemorySegment::CreateResult::kInUse:
-		LogOzzyDaemonError("another OzzyDaemon is running; not starting");
-		return false;
+		LogOzzyDaemon("segment still held by another daemon (%{public}s)", mShm.Reason());
+		return StartStatus::kBusy;
 	case SharedMemorySegment::CreateResult::kError:
 		LogOzzyDaemonError("could not create the shared memory segment");
-		return false;
+		return StartStatus::kFailed;
 	}
 	mShm.TickHeartbeat();
 	mHeartbeat = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
@@ -60,7 +60,7 @@ bool Session::Start()
 	ReadString(mDevice, CFSTR("USB Serial Number"), serial, sizeof(serial), "CMS6003");
 	mShm.PublishIdentity(DYNACORD_VENDOR_ID, DYNACORD_PID_CMS600_3, manufacturer, product, serial);
 	mThreadStarted = pthread_create(&mThread, nullptr, ThreadEntry, this) == 0;
-	return mThreadStarted;
+	return mThreadStarted ? StartStatus::kStarted : StartStatus::kFailed;
 }
 
 /* Only ever called on the main thread (main.cpp's notification and signal

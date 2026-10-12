@@ -93,3 +93,33 @@ void test_shm_destroy_keeps_replacement()
 	third.Destroy();
 	shm_unlink(kTestName);
 }
+
+void test_shm_clear_stale_removes_only_dead_own_segment()
+{
+	shm_unlink(kTestName);
+	SharedMemorySegment probe(kTestName);
+	CHECK(!probe.ClearStale(150));                 /* nothing there */
+
+	/* A live daemon keeps ticking: left alone. */
+	SharedMemorySegment live(kTestName);
+	CHECK(live.Create() == SharedMemorySegment::CreateResult::kCreated);
+	if (!live.Get())
+		return;
+	std::atomic<bool> ticking { true };
+	std::thread ticker([&] {
+		while (ticking) {
+			live.TickHeartbeat();
+			usleep(20000);
+		}
+	});
+	CHECK(!probe.ClearStale(150));
+	CHECK_EQ(live.Get()->magic, kOzzyMagic);
+
+	/* It "crashes": stops ticking without unlinking (as in the tests above). */
+	ticking = false;
+	ticker.join();
+	CHECK(probe.ClearStale(150));
+	CHECK(shm_open(kTestName, O_RDONLY, 0) < 0);
+	live.Destroy();                                /* name already gone: no-op */
+	shm_unlink(kTestName);
+}

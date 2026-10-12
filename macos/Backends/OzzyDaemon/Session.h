@@ -19,8 +19,11 @@ public:
 	Session(io_service_t device, bool verbose, void (*onFinished)() = nullptr);
 	~Session();
 
-	/* Create the segment and start the USB thread. */
-	bool Start();
+	enum class StartStatus { kStarted, kBusy, kFailed };
+
+	/* Create the segment and start the USB thread. kBusy: another daemon
+	 * (another user's, during a console handover) still holds the segment. */
+	StartStatus Start();
 
 	/* Stop the USB thread and destroy the segment. Safe to call twice. Main
 	 * thread only. Blocks until an in-progress engine Start() finishes its

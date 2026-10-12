@@ -73,6 +73,7 @@ int main()
 	test_shm_create_sets_header_and_mode();
 	test_shm_create_refuses_live_replaces_stale();
 	test_shm_destroy_keeps_replacement();
+	test_shm_clear_stale_removes_only_dead_own_segment();
 	test_handover_starts_only_when_front_and_present();
 	test_handover_yields_on_switch_and_login_window();
 	test_handover_unplug_and_replug();

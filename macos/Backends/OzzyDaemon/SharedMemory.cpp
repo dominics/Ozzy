@@ -153,6 +153,17 @@ SharedMemorySegment::CreateResult SharedMemorySegment::Create(uint64_t staleAfte
 	return CreateResult::kError;
 }
 
+bool SharedMemorySegment::ClearStale(uint64_t staleAfterMs)
+{
+	int fd = shm_open(mName, O_RDONLY, 0);
+	if (fd < 0)
+		return false;
+	struct stat sb;
+	bool stale = fstat(fd, &sb) == 0 && sb.st_uid == getuid() && !IsLive(fd, staleAfterMs);
+	close(fd);
+	return stale && shm_unlink(mName) == 0;
+}
+
 void SharedMemorySegment::PublishIdentity(uint16_t vid, uint16_t pid, const char* manufacturer, const char* product,
 					  const char* serial)
 {
