@@ -10,6 +10,11 @@
 #include <dispatch/dispatch.h>
 #include <signal.h>
 #include <string.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <memory>
 #include "../../../common/devices/ploytec/ploytec_defs.h"
 #include "../../Shared/OzzyLog.h"
@@ -17,6 +22,29 @@
 
 static std::unique_ptr<Session> gSession;
 static bool gVerbose;
+
+#ifndef OZZY_VERSION
+#define OZZY_VERSION "0.0.0-dev"
+#endif
+
+/* Point stderr at ~/Library/Logs/OzzyDaemon.log. launchd sets HOME for
+ * agents but cannot expand it in the plist, so the daemon resolves it. */
+static void RedirectStderrToUserLog()
+{
+	const char* home = getenv("HOME");
+	if (!home || !*home)
+		return;
+	char dir[1024], path[1100];
+	snprintf(dir, sizeof(dir), "%s/Library/Logs", home);
+	if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
+		snprintf(path, sizeof(path), "%s/Library", home);
+		mkdir(path, 0700);
+		mkdir(dir, 0755);
+	}
+	snprintf(path, sizeof(path), "%s/OzzyDaemon.log", dir);
+	if (freopen(path, "a", stderr))
+		setvbuf(stderr, nullptr, _IOLBF, 0);
+}
 
 static CFMutableDictionaryRef Matching()
 {
@@ -67,7 +95,24 @@ static void Removed(void*, io_iterator_t it)
 
 int main(int argc, char** argv)
 {
-	gVerbose = argc > 1 && strcmp(argv[1], "--verbose") == 0;
+	bool logFile = false;
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--version") == 0) {
+			printf("%s\n", OZZY_VERSION);
+			return 0;
+		} else if (strcmp(argv[i], "--verbose") == 0) {
+			gVerbose = true;
+		} else if (strcmp(argv[i], "--log-file") == 0) {
+			logFile = true;
+		} else {
+			fprintf(stderr, "usage: OzzyDaemon [--verbose] [--log-file] [--version]\n");
+			return 2;
+		}
+	}
+	if (logFile)
+		RedirectStderrToUserLog();
+	fprintf(stderr, "OzzyDaemon %s starting\n", OZZY_VERSION);
+	LogOzzyDaemon("version %{public}s", OZZY_VERSION);
 	signal(SIGTERM, SIG_IGN);
 	signal(SIGINT, SIG_IGN);
 	dispatch_source_t term = dispatch_source_create(DISPATCH_SOURCE_TYPE_SIGNAL, SIGTERM, 0, dispatch_get_main_queue());

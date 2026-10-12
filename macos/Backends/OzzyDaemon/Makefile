@@ -5,6 +5,7 @@ CC       ?= clang
 CXXFLAGS := -std=gnu++20 -O2 -g -Wall -Wextra -Werror -MMD -MP
 CFLAGS   := -std=c11 -O2 -g -Wall -Wextra -Werror -MMD -MP
 FRAMEWORKS := -framework IOKit -framework CoreFoundation
+OZZY_VERSION ?= 0.0.0-dev
 
 .DEFAULT_GOAL := all
 
@@ -47,6 +48,8 @@ build/%.o: %.c | build
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(DAEMON_OBJ): $(DAEMON_HDR)
+
+build/main.o: CXXFLAGS += -DOZZY_VERSION='"$(OZZY_VERSION)"'
 
 # Upstream Xone engine, built only so OzzyFactory links outside the kernel.
 build/PloytecEngine.o: CXXFLAGS += -Wno-unused-parameter -Wno-unused-variable -Wno-error
