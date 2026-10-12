@@ -4,6 +4,17 @@ set -e
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$DIR"
 
+# UUID of the running OzzyKext, or nothing when it isn't loaded
+loaded_kext_uuid() {
+    kmutil showloaded --list-only 2>/dev/null | grep ' com\.ozzy\.kext\.OzzyKext ' |
+        grep -oE '[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}' | head -n 1
+}
+
+# UUID of a kext binary, as kmutil showloaded prints it
+kext_binary_uuid() {
+    otool -l "$1" 2>/dev/null | awk '$1 == "uuid" { print $2; exit }'
+}
+
 clear
 
 # Check for existing installations
@@ -158,8 +169,23 @@ SIP_OUTPUT=$(csrutil status 2>/dev/null)
 
 if echo "$SIP_OUTPUT" | grep -q "Kext Signing: disabled"; then
     echo "✅ Kext Signing is disabled - good to proceed"
-elif echo "$SIP_OUTPUT" | grep -q "disabled"; then
+elif echo "$SIP_OUTPUT" | grep -q "status: disabled"; then
     echo "✅ SIP is fully disabled - kext loading allowed"
+elif [ "$(uname -m)" = "arm64" ]; then
+    # Apple Silicon never loads a third-party kext under full SIP, so
+    # installing anyway would only leave a driver that cannot start.
+    echo "❌ Kext Signing is ENABLED: this Mac cannot load the kext."
+    echo ""
+    echo "   In recoveryOS (hold the power button at startup), in this order:"
+    echo "   1. Startup Security Utility: Reduced Security, with user management"
+    echo "      of kernel extensions allowed (skip if already set; saving a"
+    echo "      change here resets SIP, which is why csrutil comes second)"
+    echo "   2. Terminal: csrutil enable --without kext"
+    echo "   3. Reboot normally and run this script again"
+    echo ""
+    echo "   Or run this again and choose option 3, the userspace driver,"
+    echo "   which needs none of this."
+    exit 1
 else
     echo "⚠️  WARNING: Kext signing appears to be ENABLED"
     echo ""
@@ -180,7 +206,7 @@ fi
 
 if [ "$(uname -m)" = "arm64" ]; then
     echo ""
-    echo "ℹ️  Apple Silicon also needs Reduced Security with user-managed kernel extensions (Startup Security Utility), and approval in System Settings > Privacy & Security after the first install, followed by a reboot."
+    echo "ℹ️  Apple Silicon also needs approval in System Settings > Privacy & Security, followed by a reboot, after the first install and again after every upgrade that replaces the kext."
     echo ""
 fi
 
@@ -337,26 +363,32 @@ echo "🔄 Restarting audio services..."
 sudo killall coreaudiod 2>/dev/null || true
 sudo killall MIDIServer 2>/dev/null || true
 
-# Verify kext is loaded
+# Verify the kext is loaded, and that it is the build just installed: an
+# upgrade whose unload failed keeps the old build running until the new one
+# is approved and the Mac reboots.
 sleep 2
 KEXT_LOADED=false
-if kmutil showloaded 2>/dev/null | grep -q "OzzyKext"; then
-    echo "✅ Kernel Extension is loaded and running!"
-    KEXT_LOADED=true
-else
+OLD_KEXT_RUNNING=false
+INSTALLED_UUID=$(kext_binary_uuid "$INSTALL_PATH/Contents/MacOS/$KEXT_NAME")
+LOADED_UUID=$(loaded_kext_uuid)
+if [ -z "$LOADED_UUID" ]; then
     echo "⚠️  Attempting to load Kernel Extension..."
     # A failed load (e.g. not yet approved) must not abort the script under
     # set -e: everything is installed, and the summary below says what to do.
     if sudo kmutil load -p "$INSTALL_PATH"; then
         sleep 1
     fi
-    if kmutil showloaded 2>/dev/null | grep -q "OzzyKext"; then
-        echo "✅ Kernel Extension loaded successfully!"
-        KEXT_LOADED=true
-    else
-        echo "❌ Kernel Extension did not load yet (see kmutil's message above)."
-        KEXT_LOADED=false
-    fi
+    LOADED_UUID=$(loaded_kext_uuid)
+fi
+if [ -z "$LOADED_UUID" ]; then
+    echo "❌ Kernel Extension did not load yet (see kmutil's message above)."
+elif [ -z "$INSTALLED_UUID" ] || [ "$LOADED_UUID" = "$INSTALLED_UUID" ]; then
+    echo "✅ Kernel Extension is loaded and running!"
+    KEXT_LOADED=true
+else
+    echo "⚠️  The kext running is the previous build ($LOADED_UUID),"
+    echo "   not the one just installed ($INSTALLED_UUID)."
+    OLD_KEXT_RUNNING=true
 fi
 
 echo ""
@@ -377,12 +409,17 @@ if $KEXT_LOADED; then
     echo ""
     read -p "Press [Enter] to exit..."
 else
-    echo "⚠️  Installation complete, but kext didn't load automatically."
+    if $OLD_KEXT_RUNNING; then
+        echo "⚠️  Installation complete, but the previous kext is still running."
+    else
+        echo "⚠️  Installation complete, but kext didn't load automatically."
+    fi
     echo "   All components are installed; nothing was rolled back."
     echo ""
     echo "Next steps:"
     echo "   1. Approve the extension in System Settings > Privacy & Security"
-    echo "      (needed after the first install, especially on Apple Silicon)"
+    echo "      (needed after the first install and after every upgrade that"
+    echo "      replaces the kext, especially on Apple Silicon)"
     echo "   2. Reboot"
     echo "   3. At boot the LaunchDaemon (com.ozzy.kext.load) loads the kext;"
     echo "      if it still fails, see /tmp/ozzy-kext-load.err"

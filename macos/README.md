@@ -12,7 +12,7 @@ The installer will:
 - ✅ Compile HAL and MIDI drivers
 - ✅ Install everything to system directories
 - ✅ Configure auto-loading at boot
-- ✅ Start the drivers immediately (a first install on Apple Silicon needs approval in System Settings > Privacy & Security and a reboot first)
+- ✅ Start the drivers immediately (on Apple Silicon a first install, or an upgrade that replaces the kext, needs approval in System Settings > Privacy & Security and a reboot first)
 
 ## 🗑️ Uninstall
 
@@ -66,7 +66,7 @@ This driver uses a **shared memory model** for zero-copy audio streaming:
 
 ### Dynacord CMS 600-3
 
-- **SIP and security**: needs SIP with the kext exception (`csrutil enable --without kext` in Recovery). On Apple Silicon it also needs Reduced Security with user-managed kernel extensions (Startup Security Utility), and approval in System Settings > Privacy & Security after the first install, followed by a reboot.
+- **SIP and security**: needs SIP with the kext exception (`csrutil enable --without kext` in Recovery). On Apple Silicon it also needs Reduced Security with user-managed kernel extensions (Startup Security Utility). Set that first: saving a Startup Security Utility change resets SIP, so `csrutil` comes second. After the first install, and again after every upgrade that replaces the kext, approve it in System Settings > Privacy & Security and reboot; until then the previous build keeps running.
 - **Power-cycle quirk**: the mixer only enumerates if it is powered on with the USB cable already plugged in. If it does not show up, power it off, plug in the cable, then power it on.
 - **Sample rate**: 44.1, 48 or 96 kHz, changed in Audio MIDI Setup.
 - **MIDI**: two ports, "USB-MIDI" (the DIN sockets) and "SystemCtrl" (FX control). MIDI only moves while audio is streaming.
