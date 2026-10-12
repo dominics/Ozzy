@@ -1,5 +1,17 @@
 # 🎛️ Ozzy - USB Audio & MIDI Driver for Non-Class Compliant Devices
 
+## About this fork
+
+This is [dominics/Ozzy](https://github.com/dominics/Ozzy), a fork of [mischa85/Ozzy](https://github.com/mischa85/Ozzy). It adds two things on macOS:
+
+**Dynacord CMS 600-3 support.** The older CMS 600-3 mixer (USB ID `0562:03eb`) uses a Ploytec USB interface like the Xone mixers, but Dynacord's own driver no longer works on Apple silicon or current macOS. This fork drives its 4 inputs and 4 outputs at 44.1, 48 and 96 kHz, plus USB-MIDI (the mixer's DIN MIDI ports) and its control port. The protocol was reverse-engineered from USB captures, which are kept at [dominics/dynacord-cms-pcap](https://github.com/dominics/dynacord-cms-pcap).
+
+**A userspace driver.** Upstream's macOS driver is a kernel extension, which on Apple silicon means lowering the Mac's security settings. This fork adds OzzyDaemon, a background process that talks to the mixer through macOS's userspace USB API and feeds the same Core Audio (OzzyHAL) and MIDI (OzzyMIDI) plug-ins. It needs no kext and no changes to System Integrity Protection. For now it supports the CMS 600-3 only.
+
+Installer packages for Apple silicon Macs on macOS 26.1 or later are on the [releases page](https://github.com/dominics/Ozzy/releases). To install the latest with Homebrew, run `brew install --cask dominics/tap/ozzy-cms600`.
+
+---
+
 **Bringing legacy professional audio hardware back to life.**
 
 Modern operating systems dropped support for non-class compliant USB audio devices—hardware that doesn't follow the standard USB Audio Class specification. These devices require vendor-specific drivers, and when manufacturers abandon them, perfectly good professional equipment becomes unusable.
