@@ -10,7 +10,7 @@ Needs an Apple Silicon Mac on macOS 26.1 or later. No SIP changes.
 brew install --cask dominics/tap/ozzy-cms600
 ```
 
-Or download `Ozzy-CMS600-<version>.pkg` from [Releases](https://github.com/dominics/Ozzy/releases). The package is not signed with an Apple Developer ID, so Gatekeeper blocks a double-click: right-click it and choose Open, or run `xattr -d com.apple.quarantine Ozzy-CMS600-*.pkg` first.
+Or download `Ozzy-CMS600-<version>.pkg` from [Releases](https://github.com/dominics/Ozzy/releases). The package is not signed with an Apple Developer ID, so Gatekeeper blocks it the first time you open it. Double-click it and close the warning, then open System Settings > Privacy & Security, click **Open Anyway** next to the message about the package, and confirm the warnings that follow. Or skip Gatekeeper from Terminal with `sudo installer -pkg Ozzy-CMS600-*.pkg -target /`.
 
 From source: `./install-userspace.command` builds the same package and installs it.
 

@@ -8,7 +8,7 @@ This is [dominics/Ozzy](https://github.com/dominics/Ozzy), a fork of [mischa85/O
 
 **A userspace driver.** Upstream's macOS driver is a kernel extension, which on Apple silicon means lowering the Mac's security settings. This fork adds OzzyDaemon, a background process that talks to the mixer through macOS's userspace USB API and feeds the same Core Audio (OzzyHAL) and MIDI (OzzyMIDI) plug-ins. It needs no kext and no changes to System Integrity Protection. For now it supports the CMS 600-3 only.
 
-Installer packages for Apple silicon Macs on macOS 26.1 or later are on the [releases page](https://github.com/dominics/Ozzy/releases). To install the latest with Homebrew, run `brew install --cask dominics/tap/ozzy-cms600`.
+Installer packages for Apple silicon Macs on macOS 26.1 or later are on the [releases page](https://github.com/dominics/Ozzy/releases). To install the latest with Homebrew, run `brew install --cask dominics/tap/ozzy-cms600`. The [macOS README](macos/README.md#install-dynacord-cms-600-3) covers installing the package by hand and uninstalling.
 
 ---
 

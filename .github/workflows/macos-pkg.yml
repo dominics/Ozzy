@@ -68,5 +68,5 @@ jobs:
         run: |
           v="$(cat dist/VERSION)"
           gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "Ozzy for Dynacord CMS 600-3 $v" \
-            --notes "Install with \`brew install --cask dominics/tap/ozzy-cms600\`, or download the .pkg (unsigned: right-click > Open). arm64, macOS 26.1 or later." \
+            --notes-file macos/packaging/release-notes.md \
             "dist/Ozzy-CMS600-$v.pkg" "dist/Ozzy-CMS600-$v.pkg.sha256"
