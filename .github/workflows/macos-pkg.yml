@@ -1,0 +1,72 @@
+name: macOS package
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Select Xcode 26.6
+        run: sudo xcode-select -s /Applications/Xcode_26.6.app
+      - name: Install shellcheck
+        run: brew install shellcheck
+      - name: Lint scripts
+        run: |
+          shellcheck macos/packaging/build-pkg.sh macos/tests/check-pkg.sh macos/tests/check-daemon-cli.sh \
+            macos/install-userspace.command macos/uninstall-userspace.command
+          shellcheck --shell=bash macos/packaging/uninstall.sh macos/packaging/scripts/preinstall macos/packaging/scripts/postinstall
+      - name: Unit tests
+        run: make -C macos/tests test
+      - name: Daemon CLI
+        run: macos/tests/check-daemon-cli.sh
+      - name: Build package
+        run: macos/packaging/build-pkg.sh
+      - name: Check package
+        run: |
+          v="$(cat macos/build/pkg/VERSION)"
+          macos/tests/check-pkg.sh "macos/build/pkg/Ozzy-CMS600-$v.pkg" "$v"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ozzy-cms600-pkg
+          path: |
+            macos/build/pkg/*.pkg
+            macos/build/pkg/*.sha256
+            macos/build/pkg/VERSION
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          name: ozzy-cms600-pkg
+          path: dist
+      - name: Check the tag is on main and matches the package
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "$GITHUB_REF_NAME is not on main"; exit 1; }
+          [ "v$(cat dist/VERSION)" = "$GITHUB_REF_NAME" ] || { echo "package version $(cat dist/VERSION) != $GITHUB_REF_NAME"; exit 1; }
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="$(cat dist/VERSION)"
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "Ozzy for Dynacord CMS 600-3 $v" \
+            --notes "Install with \`brew install --cask dominics/tap/ozzy-cms600\`, or download the .pkg (unsigned: right-click > Open). arm64, macOS 26.1 or later." \
+            "dist/Ozzy-CMS600-$v.pkg" "dist/Ozzy-CMS600-$v.pkg.sha256"
