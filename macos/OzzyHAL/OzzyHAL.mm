@@ -4,6 +4,7 @@
 #include "../Shared/OzzyLog.h"
 #include "../Devices/Dynacord/DynacordCodec.h"
 #include "../Devices/Dynacord/DynacordRing.h"
+#include "OzzyVolume.h"
 #include <algorithm>
 #include <cstring>
 #include <mach/mach_time.h>
@@ -75,6 +76,25 @@ static OSStatus WriteUInt32(UInt32 inMax, UInt32* outSize, void* outData, UInt32
     return kAudioHardwareNoError;
 }
 
+static OSStatus WriteFloat32(UInt32 inMax, UInt32* outSize, void* outData, Float32 v) {
+    if (outData && inMax < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
+    if (outData) *(Float32*)outData = v;
+    if (outSize) *outSize = sizeof(Float32);
+    return kAudioHardwareNoError;
+}
+
+static OSStatus WriteObjectIDs(UInt32 inMax, UInt32* outSize, void* outData, const AudioObjectID* ids, UInt32 count) {
+    UInt32 n = outData ? std::min<UInt32>(inMax / sizeof(AudioObjectID), count) : count;
+    if (outData) memcpy(outData, ids, n * sizeof(AudioObjectID));
+    if (outSize) *outSize = n * sizeof(AudioObjectID);
+    return kAudioHardwareNoError;
+}
+
+static const AudioObjectID kOzzyControls[] = { kOzzyVolumeControlID, kOzzyMuteControlID };
+static const AudioObjectID kOzzyDeviceOwned[] = { kOzzyOutputStreamID, kOzzyInputStreamID, kOzzyVolumeControlID, kOzzyMuteControlID };
+
+static bool IsControl(AudioObjectID obj) { return obj == kOzzyVolumeControlID || obj == kOzzyMuteControlID; }
+
 static OSStatus WriteFloat64(UInt32 inMax, UInt32* outSize, void* outData, Float64 v) {
     if (outData && inMax < sizeof(Float64)) return kAudioHardwareBadPropertySizeError;
     if (outData) *(Float64*)outData = v;
@@ -97,6 +117,7 @@ OzzyHAL& OzzyHAL::Get() {
 void OzzyHAL::Init(AudioServerPlugInHostRef host) {
     LogOzzyHAL("init");
     mHost = host;
+    LoadControlState();
 
     mDeviceUID = CFSTR("OzzyHAL.device");
     mModelUID = CFSTR("Ozzy Audio Device");
@@ -129,6 +150,60 @@ void OzzyHAL::Cleanup() {
     mMonitorRunning = false;
     pthread_join(mMonitorThread, NULL);
     UnmapSharedMemory();
+}
+
+static const CFStringRef kVolumeStorageKey = CFSTR("output volume");
+static const CFStringRef kMuteStorageKey = CFSTR("output mute");
+
+/* Restores the volume and mute last set, from the host's per-plug-in storage. */
+void OzzyHAL::LoadControlState() {
+    if (!mHost) return;
+    CFPropertyListRef v = nullptr;
+    if (mHost->CopyFromStorage(mHost, kVolumeStorageKey, &v) == kAudioHardwareNoError && v) {
+        Float32 f;
+        if (CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)v, kCFNumberFloat32Type, &f))
+            mVolumeScalar.store(OzzyVolumeClampScalar(f));
+        CFRelease(v);
+    }
+    v = nullptr;
+    if (mHost->CopyFromStorage(mHost, kMuteStorageKey, &v) == kAudioHardwareNoError && v) {
+        if (CFGetTypeID(v) == CFBooleanGetTypeID())
+            mMuted.store(CFBooleanGetValue((CFBooleanRef)v));
+        CFRelease(v);
+    }
+    LogOzzyHAL("output volume %{public}.3f%{public}s", mVolumeScalar.load(), mMuted.load() ? " (muted)" : "");
+}
+
+void OzzyHAL::SaveControlState() {
+    if (!mHost) return;
+    Float32 f = mVolumeScalar.load();
+    CFNumberRef n = CFNumberCreate(NULL, kCFNumberFloat32Type, &f);
+    if (n) { mHost->WriteToStorage(mHost, kVolumeStorageKey, n); CFRelease(n); }
+    mHost->WriteToStorage(mHost, kMuteStorageKey, mMuted.load() ? kCFBooleanTrue : kCFBooleanFalse);
+}
+
+void OzzyHAL::NotifyControlChanged(AudioObjectID control, const AudioObjectPropertySelector* selectors, UInt32 count) {
+    if (!mHost) return;
+    AudioObjectPropertyAddress addrs[2];
+    count = std::min<UInt32>(count, 2);
+    for (UInt32 i = 0; i < count; i++)
+        addrs[i] = { selectors[i], kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    mHost->PropertiesChanged(mHost, control, count, addrs);
+}
+
+void OzzyHAL::SetVolumeScalar(Float32 scalar) {
+    scalar = OzzyVolumeClampScalar(scalar);
+    if (mVolumeScalar.exchange(scalar) == scalar) return;
+    static const AudioObjectPropertySelector changed[] = { kAudioLevelControlPropertyScalarValue, kAudioLevelControlPropertyDecibelValue };
+    NotifyControlChanged(kOzzyVolumeControlID, changed, 2);
+    SaveControlState();
+}
+
+void OzzyHAL::SetMuted(bool muted) {
+    if (mMuted.exchange(muted) == muted) return;
+    static const AudioObjectPropertySelector changed[] = { kAudioBooleanControlPropertyValue };
+    NotifyControlChanged(kOzzyMuteControlID, changed, 1);
+    SaveControlState();
 }
 
 void OzzyHAL::ClearOutputBuffer() {
@@ -716,6 +791,9 @@ OSStatus OzzyHAL::ioOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID
     if (inOperationID == kAudioServerPlugInIOOperationWriteMix) {
         if (mWriteOutput) {
             uint64_t sampleTime = (uint64_t)inIOCycleInfo->mOutputTime.mSampleTime;
+            const float gain = mMuted.load() ? 0.0f : OzzyVolumeScalarToGain(mVolumeScalar.load());
+            OzzyApplyGainRamp((float*)ioMainBuffer, inIOBufferFrameSize, mChannels, mAppliedGain, gain);
+            mAppliedGain = gain;
             mWriteOutput(mOutputBufferAddr, (const float*)ioMainBuffer, sampleTime, inIOBufferFrameSize, mRingSize, mOutputBytesPerFrame);
             mSHM->audio.halWritePosition.store(sampleTime + inIOBufferFrameSize, std::memory_order_release);
         }
@@ -794,9 +872,26 @@ extern "C" Boolean OzzyHasProperty(AudioServerPlugInDriverRef, AudioObjectID inO
             case kAudioDevicePropertyAvailableNominalSampleRates: case kAudioDevicePropertyStreams:
             case kAudioDevicePropertyStreamConfiguration: case kAudioDevicePropertyLatency:
             case kAudioDevicePropertySafetyOffset: case kAudioDevicePropertyPreferredChannelLayout:
-            case kAudioDevicePropertyZeroTimeStampPeriod: return true;
+            case kAudioDevicePropertyZeroTimeStampPeriod: case kAudioObjectPropertyOwnedObjects:
+            case kAudioObjectPropertyControlList: return true;
         }
         return false;
+    }
+    if (IsControl(inObjectID)) {
+        switch (inAddress->mSelector) {
+            case kAudioObjectPropertyBaseClass: case kAudioObjectPropertyClass:
+            case kAudioObjectPropertyOwner: case kAudioObjectPropertyOwnedObjects:
+            case kAudioControlPropertyScope: case kAudioControlPropertyElement: return true;
+        }
+        if (inObjectID == kOzzyVolumeControlID) {
+            switch (inAddress->mSelector) {
+                case kAudioLevelControlPropertyScalarValue: case kAudioLevelControlPropertyDecibelValue:
+                case kAudioLevelControlPropertyDecibelRange: case kAudioLevelControlPropertyConvertScalarToDecibels:
+                case kAudioLevelControlPropertyConvertDecibelsToScalar: return true;
+            }
+            return false;
+        }
+        return inAddress->mSelector == kAudioBooleanControlPropertyValue;
     }
     if (inObjectID == kOzzyOutputStreamID || inObjectID == kOzzyInputStreamID) {
         switch (inAddress->mSelector) {
@@ -813,7 +908,14 @@ extern "C" Boolean OzzyHasProperty(AudioServerPlugInDriverRef, AudioObjectID inO
 }
 
 extern "C" HRESULT OzzyIsPropertySettable(AudioServerPlugInDriverRef, AudioObjectID inObjectID, pid_t, const AudioObjectPropertyAddress* inAddress, Boolean* outIsSettable) {
-    *outIsSettable = inObjectID == kOzzyDeviceID && inAddress->mSelector == kAudioDevicePropertyNominalSampleRate && OzzyHAL::Get().IsRateSettable();
+    if (inObjectID == kOzzyDeviceID)
+        *outIsSettable = inAddress->mSelector == kAudioDevicePropertyNominalSampleRate && OzzyHAL::Get().IsRateSettable();
+    else if (inObjectID == kOzzyVolumeControlID)
+        *outIsSettable = inAddress->mSelector == kAudioLevelControlPropertyScalarValue || inAddress->mSelector == kAudioLevelControlPropertyDecibelValue;
+    else if (inObjectID == kOzzyMuteControlID)
+        *outIsSettable = inAddress->mSelector == kAudioBooleanControlPropertyValue;
+    else
+        *outIsSettable = false;
     return kAudioHardwareNoError;
 }
 
@@ -836,7 +938,9 @@ extern "C" HRESULT OzzyGetPropertyDataSize(AudioServerPlugInDriverRef, AudioObje
             case kAudioObjectPropertyName: case kAudioObjectPropertyManufacturer:
             case kAudioDevicePropertyDeviceUID: case kAudioDevicePropertyModelUID:
                 *outDataSize = sizeof(CFStringRef); return kAudioHardwareNoError;
-            case kAudioObjectPropertyControlList: *outDataSize = 0; return kAudioHardwareNoError;
+            case kAudioObjectPropertyControlList:
+                *outDataSize = IsOutputScope(inAddress->mScope) ? sizeof(kOzzyControls) : 0; return kAudioHardwareNoError;
+            case kAudioObjectPropertyOwnedObjects: *outDataSize = sizeof(kOzzyDeviceOwned); return kAudioHardwareNoError;
             case kAudioObjectPropertyOwner: *outDataSize = sizeof(AudioObjectID); return kAudioHardwareNoError;
             case kAudioObjectPropertyBaseClass: case kAudioObjectPropertyClass: *outDataSize = sizeof(AudioClassID); return kAudioHardwareNoError;
             case kAudioDevicePropertyTransportType: case kAudioDevicePropertyIsHidden:
@@ -870,6 +974,26 @@ extern "C" HRESULT OzzyGetPropertyDataSize(AudioServerPlugInDriverRef, AudioObje
             default: return kAudioHardwareUnknownPropertyError;
         }
     }
+    if (IsControl(inObjectID)) {
+        switch (inAddress->mSelector) {
+            case kAudioObjectPropertyBaseClass: case kAudioObjectPropertyClass: *outDataSize = sizeof(AudioClassID); return kAudioHardwareNoError;
+            case kAudioObjectPropertyOwner: *outDataSize = sizeof(AudioObjectID); return kAudioHardwareNoError;
+            case kAudioObjectPropertyOwnedObjects: *outDataSize = 0; return kAudioHardwareNoError;
+            case kAudioControlPropertyScope: *outDataSize = sizeof(AudioObjectPropertyScope); return kAudioHardwareNoError;
+            case kAudioControlPropertyElement: *outDataSize = sizeof(AudioObjectPropertyElement); return kAudioHardwareNoError;
+            case kAudioLevelControlPropertyScalarValue: case kAudioLevelControlPropertyDecibelValue:
+            case kAudioLevelControlPropertyConvertScalarToDecibels: case kAudioLevelControlPropertyConvertDecibelsToScalar:
+                if (inObjectID != kOzzyVolumeControlID) return kAudioHardwareUnknownPropertyError;
+                *outDataSize = sizeof(Float32); return kAudioHardwareNoError;
+            case kAudioLevelControlPropertyDecibelRange:
+                if (inObjectID != kOzzyVolumeControlID) return kAudioHardwareUnknownPropertyError;
+                *outDataSize = sizeof(AudioValueRange); return kAudioHardwareNoError;
+            case kAudioBooleanControlPropertyValue:
+                if (inObjectID != kOzzyMuteControlID) return kAudioHardwareUnknownPropertyError;
+                *outDataSize = sizeof(UInt32); return kAudioHardwareNoError;
+            default: return kAudioHardwareUnknownPropertyError;
+        }
+    }
     return kAudioHardwareBadObjectError;
 }
 
@@ -891,7 +1015,9 @@ extern "C" HRESULT OzzyGetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
         switch (inAddress->mSelector) {
             case kAudioObjectPropertyBaseClass: return WriteClassID(inMax, outSize, outData, kAudioObjectClassID);
             case kAudioObjectPropertyClass: return WriteClassID(inMax, outSize, outData, kAudioDeviceClassID);
-            case kAudioObjectPropertyControlList: if (outSize) *outSize = 0; return kAudioHardwareNoError;
+            case kAudioObjectPropertyControlList:
+                if (!IsOutputScope(inAddress->mScope)) { if (outSize) *outSize = 0; return kAudioHardwareNoError; }
+                return WriteObjectIDs(inMax, outSize, outData, kOzzyControls, 2);
             case kAudioObjectPropertyOwner: return WriteObjectID(inMax, outSize, outData, kAudioObjectPlugInObject);
             case kAudioObjectPropertyName: return WriteCFString(inMax, outSize, outData, OzzyHAL::Get().GetDeviceName());
             case kAudioObjectPropertyManufacturer: return WriteCFString(inMax, outSize, outData, OzzyHAL::Get().GetManufacturer());
@@ -914,11 +1040,7 @@ extern "C" HRESULT OzzyGetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
                 else if (inAddress->mScope == kAudioObjectPropertyScopeOutput) return WriteObjectID(inMax, outSize, outData, kOzzyOutputStreamID);
                 else { if (outData && inMax < sizeof(streamList)) return kAudioHardwareBadPropertySizeError; if (outData) memcpy(outData, streamList, sizeof(streamList)); if (outSize) *outSize = sizeof(streamList); return kAudioHardwareNoError; }
             }
-            case kAudioObjectPropertyOwnedObjects: {
-                if (inMax < 2 * sizeof(AudioObjectID)) return kAudioHardwareBadPropertySizeError;
-                AudioObjectID* list = (AudioObjectID*)outData; if (list) { list[0] = kOzzyOutputStreamID; list[1] = kOzzyInputStreamID; }
-                if (outSize) *outSize = 2 * sizeof(AudioObjectID); return kAudioHardwareNoError;
-            }
+            case kAudioObjectPropertyOwnedObjects: return WriteObjectIDs(inMax, outSize, outData, kOzzyDeviceOwned, 4);
             case kAudioDevicePropertyStreamConfiguration: {
                 AudioBufferList* config = (inAddress->mScope == kAudioObjectPropertyScopeInput) ? OzzyHAL::Get().GetInputStreamConfiguration() : OzzyHAL::Get().GetOutputStreamConfiguration();
                 UInt32 actualSize = GetAudioBufferListSize(config->mNumberBuffers); if (outSize) *outSize = actualSize;
@@ -966,6 +1088,40 @@ extern "C" HRESULT OzzyGetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
             default: return kAudioHardwareUnknownPropertyError;
         }
     }
+    if (IsControl(inObjectID)) {
+        const bool isVolume = inObjectID == kOzzyVolumeControlID;
+        switch (inAddress->mSelector) {
+            case kAudioObjectPropertyBaseClass: return WriteClassID(inMax, outSize, outData, isVolume ? kAudioLevelControlClassID : kAudioBooleanControlClassID);
+            case kAudioObjectPropertyClass: return WriteClassID(inMax, outSize, outData, isVolume ? kAudioVolumeControlClassID : kAudioMuteControlClassID);
+            case kAudioObjectPropertyOwner: return WriteObjectID(inMax, outSize, outData, kOzzyDeviceID);
+            case kAudioObjectPropertyOwnedObjects: if (outSize) *outSize = 0; return kAudioHardwareNoError;
+            case kAudioControlPropertyScope: return WriteUInt32(inMax, outSize, outData, kAudioObjectPropertyScopeOutput);
+            case kAudioControlPropertyElement: return WriteUInt32(inMax, outSize, outData, kAudioObjectPropertyElementMain);
+            default: break;
+        }
+        if (isVolume) {
+            switch (inAddress->mSelector) {
+                case kAudioLevelControlPropertyScalarValue: return WriteFloat32(inMax, outSize, outData, OzzyHAL::Get().GetVolumeScalar());
+                case kAudioLevelControlPropertyDecibelValue: return WriteFloat32(inMax, outSize, outData, OzzyVolumeScalarToDB(OzzyHAL::Get().GetVolumeScalar()));
+                case kAudioLevelControlPropertyDecibelRange: {
+                    if (outData && inMax < sizeof(AudioValueRange)) return kAudioHardwareBadPropertySizeError;
+                    if (outData) *(AudioValueRange*)outData = { kOzzyVolumeMinDB, kOzzyVolumeMaxDB };
+                    if (outSize) *outSize = sizeof(AudioValueRange);
+                    return kAudioHardwareNoError;
+                }
+                // The value to convert arrives in outData and is converted in place.
+                case kAudioLevelControlPropertyConvertScalarToDecibels:
+                    if (!outData || inMax < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
+                    return WriteFloat32(inMax, outSize, outData, OzzyVolumeScalarToDB(*(Float32*)outData));
+                case kAudioLevelControlPropertyConvertDecibelsToScalar:
+                    if (!outData || inMax < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
+                    return WriteFloat32(inMax, outSize, outData, OzzyVolumeDBToScalar(*(Float32*)outData));
+                default: return kAudioHardwareUnknownPropertyError;
+            }
+        }
+        if (inAddress->mSelector == kAudioBooleanControlPropertyValue) return WriteUInt32(inMax, outSize, outData, OzzyHAL::Get().IsMuted() ? 1 : 0);
+        return kAudioHardwareUnknownPropertyError;
+    }
     return kAudioHardwareBadObjectError;
 }
 
@@ -973,6 +1129,18 @@ extern "C" HRESULT OzzySetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
     if (inObjectID == kOzzyDeviceID && inAddress->mSelector == kAudioDevicePropertyNominalSampleRate) {
         if (inDataSize < sizeof(Float64)) return kAudioHardwareBadPropertySizeError;
         return OzzyHAL::Get().RequestSampleRate(*(const Float64*)inData);
+    }
+    if (inObjectID == kOzzyVolumeControlID) {
+        if (inDataSize < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
+        Float32 v = *(const Float32*)inData;
+        if (inAddress->mSelector == kAudioLevelControlPropertyScalarValue) { OzzyHAL::Get().SetVolumeScalar(v); return kAudioHardwareNoError; }
+        if (inAddress->mSelector == kAudioLevelControlPropertyDecibelValue) { OzzyHAL::Get().SetVolumeScalar(OzzyVolumeDBToScalar(v)); return kAudioHardwareNoError; }
+        return kAudioHardwareUnknownPropertyError;
+    }
+    if (inObjectID == kOzzyMuteControlID && inAddress->mSelector == kAudioBooleanControlPropertyValue) {
+        if (inDataSize < sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+        OzzyHAL::Get().SetMuted(*(const UInt32*)inData != 0);
+        return kAudioHardwareNoError;
     }
     return kAudioHardwareUnsupportedOperationError;
 }

@@ -24,6 +24,8 @@ typedef void (*ClearOutputFunc)(uint8_t* outputBuffer, uint32_t bufferSize);
 #define kOzzyDeviceID 100
 #define kOzzyInputStreamID 150
 #define kOzzyOutputStreamID 200
+#define kOzzyVolumeControlID 300
+#define kOzzyMuteControlID 301
 
 class OzzyHAL {
 public:
@@ -67,6 +69,12 @@ public:
     AudioChannelLayout* GetPreferredChannelLayout(AudioObjectPropertyScope inScope);
     UInt32 GetPreferredChannelLayoutSize(AudioObjectPropertyScope inScope) const;
     
+    // Output volume and mute, applied to the mix before it is encoded
+    Float32 GetVolumeScalar() const { return mVolumeScalar.load(); }
+    void SetVolumeScalar(Float32 scalar);
+    bool IsMuted() const { return mMuted.load(); }
+    void SetMuted(bool muted);
+
     OSStatus ioOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inStreamObjectID, UInt32 inClientID, UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo, void* ioMainBuffer, void* ioSecondaryBuffer);
 
 private:
@@ -121,6 +129,10 @@ private:
     UInt32 mNumSampleRates = 1;
     
     bool mIOStarted = false;
+
+    std::atomic<Float32> mVolumeScalar { 1.0f };
+    std::atomic<bool> mMuted { false };
+    float mAppliedGain = 1.0f;   // IO thread only: the gain the last WriteMix ended on
     uint32_t mTimestampSeed = 1;
 
     AudioServerPlugInHostRef mHost = nullptr;
@@ -154,6 +166,9 @@ private:
     void DropMapping();
 
     void ClearOutputBuffer();
+    void LoadControlState();
+    void SaveControlState();
+    void NotifyControlChanged(AudioObjectID control, const AudioObjectPropertySelector* selectors, UInt32 count);
 };
 
 #endif

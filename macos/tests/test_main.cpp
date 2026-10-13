@@ -81,6 +81,11 @@ int main()
 	test_handover_slow_retry_stops_when_front_lost();
 	test_handover_retry_timer_after_losing_front_does_nothing();
 	test_handover_failed_start_and_session_gone();
+	test_volume_endpoints();
+	test_volume_clamps();
+	test_volume_round_trip();
+	test_volume_curve_is_linear_in_db();
+	test_volume_ramp_scales_buffer();
 	if (test_failures) {
 		std::fprintf(stderr, "%d failure(s)\n", test_failures);
 		return 1;

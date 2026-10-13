@@ -75,3 +75,8 @@ void test_handover_busy_falls_back_to_slow_retries();
 void test_handover_slow_retry_stops_when_front_lost();
 void test_handover_retry_timer_after_losing_front_does_nothing();
 void test_handover_failed_start_and_session_gone();
+void test_volume_endpoints();
+void test_volume_clamps();
+void test_volume_round_trip();
+void test_volume_curve_is_linear_in_db();
+void test_volume_ramp_scales_buffer();
