@@ -154,6 +154,37 @@ void OzzyHAL::Cleanup() {
 
 static const CFStringRef kVolumeStorageKey = CFSTR("output volume");
 static const CFStringRef kMuteStorageKey = CFSTR("output mute");
+static const CFStringRef kInputStereoPairStorageKey = CFSTR("input stereo pair");
+static const CFStringRef kOutputStereoPairStorageKey = CFSTR("output stereo pair");
+
+/* Reads a stereo pair stored as an array of two channel numbers. */
+static bool CopyStereoPairFromStorage(AudioServerPlugInHostRef host, CFStringRef key, OzzyStereoPair* outPair) {
+    CFPropertyListRef v = nullptr;
+    if (host->CopyFromStorage(host, key, &v) != kAudioHardwareNoError || !v) return false;
+    bool ok = false;
+    if (CFGetTypeID(v) == CFArrayGetTypeID() && CFArrayGetCount((CFArrayRef)v) == 2) {
+        SInt32 ch[2];
+        ok = true;
+        for (CFIndex i = 0; i < 2; i++) {
+            CFTypeRef n = CFArrayGetValueAtIndex((CFArrayRef)v, i);
+            ok = ok && CFGetTypeID(n) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)n, kCFNumberSInt32Type, &ch[i]) && ch[i] > 0;
+        }
+        if (ok) *outPair = { (uint32_t)ch[0], (uint32_t)ch[1] };
+    }
+    CFRelease(v);
+    return ok;
+}
+
+static void WriteStereoPairToStorage(AudioServerPlugInHostRef host, CFStringRef key, OzzyStereoPair pair) {
+    SInt32 ch[2] = { (SInt32)pair.left, (SInt32)pair.right };
+    CFNumberRef n[2] = { CFNumberCreate(NULL, kCFNumberSInt32Type, &ch[0]), CFNumberCreate(NULL, kCFNumberSInt32Type, &ch[1]) };
+    if (n[0] && n[1]) {
+        CFArrayRef a = CFArrayCreate(NULL, (const void**)n, 2, &kCFTypeArrayCallBacks);
+        if (a) { host->WriteToStorage(host, key, a); CFRelease(a); }
+    }
+    if (n[0]) CFRelease(n[0]);
+    if (n[1]) CFRelease(n[1]);
+}
 
 /* Restores the volume and mute last set, from the host's per-plug-in storage. */
 void OzzyHAL::LoadControlState() {
@@ -172,6 +203,10 @@ void OzzyHAL::LoadControlState() {
         CFRelease(v);
     }
     LogOzzyHAL("output volume %{public}.3f%{public}s", mVolumeScalar.load(), mMuted.load() ? " (muted)" : "");
+
+    OzzyStereoPair pair;
+    if (CopyStereoPairFromStorage(mHost, kInputStereoPairStorageKey, &pair)) mStereoPairIn.store(OzzyStereoPairPack(pair));
+    if (CopyStereoPairFromStorage(mHost, kOutputStereoPairStorageKey, &pair)) mStereoPairOut.store(OzzyStereoPairPack(pair));
 }
 
 void OzzyHAL::SaveControlState() {
@@ -189,6 +224,12 @@ void OzzyHAL::NotifyControlChanged(AudioObjectID control, const AudioObjectPrope
     for (UInt32 i = 0; i < count; i++)
         addrs[i] = { selectors[i], kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
     mHost->PropertiesChanged(mHost, control, count, addrs);
+}
+
+void OzzyHAL::NotifyDeviceChanged(AudioObjectPropertySelector selector, AudioObjectPropertyScope scope) {
+    if (!mHost) return;
+    AudioObjectPropertyAddress addr = { selector, scope, kAudioObjectPropertyElementMain };
+    mHost->PropertiesChanged(mHost, kOzzyDeviceID, 1, &addr);
 }
 
 void OzzyHAL::SetVolumeScalar(Float32 scalar) {
@@ -821,13 +862,24 @@ AudioObjectID OzzyHAL::GetOutputStreamID() const { return kOzzyOutputStreamID; }
 AudioStreamBasicDescription OzzyHAL::GetStreamFormat() const { return mCurrentStreamFormat; }
 UInt32 OzzyHAL::GetZeroTimestampPeriod() const { return mZeroTimestampPeriod; }
 
+/* The CMS 600-3 labels its first pair of each scope as speakers and the rest
+ * by position; the Ploytec devices leave every channel unlabelled. */
 AudioChannelLayout* OzzyHAL::GetPreferredChannelLayout(AudioObjectPropertyScope inScope) {
     AudioChannelLayout* layout = (AudioChannelLayout*)mChannelLayoutBuffer;
     layout->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
     layout->mChannelBitmap = 0;
     layout->mNumberChannelDescriptions = mChannels;
     for (UInt32 i = 0; i < mChannels; ++i) {
-        layout->mChannelDescriptions[i].mChannelLabel = kAudioChannelLabel_Unknown;
+        AudioChannelLabel label = kAudioChannelLabel_Unknown;
+        const OzzyChannelInfo* info = mIsDynacord ? OzzyDynacordChannel(IsOutputScope(inScope), i + 1) : nullptr;
+        if (info) {
+            switch (info->role) {
+                case OzzyChannelRole::Left: label = kAudioChannelLabel_Left; break;
+                case OzzyChannelRole::Right: label = kAudioChannelLabel_Right; break;
+                case OzzyChannelRole::Discrete: label = kAudioChannelLabel_Discrete_0 + i; break;
+            }
+        }
+        layout->mChannelDescriptions[i].mChannelLabel = label;
         layout->mChannelDescriptions[i].mChannelFlags = kAudioChannelFlags_AllOff;
     }
     return layout;
@@ -835,6 +887,30 @@ AudioChannelLayout* OzzyHAL::GetPreferredChannelLayout(AudioObjectPropertyScope 
 
 UInt32 OzzyHAL::GetPreferredChannelLayoutSize(AudioObjectPropertyScope inScope) const {
     return offsetof(AudioChannelLayout, mChannelDescriptions) + (mChannels * sizeof(AudioChannelDescription));
+}
+
+/* A +1 name for a CMS 600-3 channel, or nullptr where the channel has none. */
+CFStringRef OzzyHAL::CopyChannelName(AudioObjectPropertyScope scope, AudioObjectPropertyElement element) const {
+    if (!mIsDynacord || element > mChannels) return nullptr;
+    if (scope != kAudioObjectPropertyScopeInput && scope != kAudioObjectPropertyScopeOutput) return nullptr;
+    const OzzyChannelInfo* info = OzzyDynacordChannel(scope == kAudioObjectPropertyScopeOutput, element);
+    return info ? CFStringCreateWithCString(NULL, info->name, kCFStringEncodingUTF8) : nullptr;
+}
+
+OzzyStereoPair OzzyHAL::GetStereoPair(AudioObjectPropertyScope scope) const {
+    const std::atomic<uint32_t>& stored = IsOutputScope(scope) ? mStereoPairOut : mStereoPairIn;
+    return OzzyStereoPairFor(OzzyStereoPairUnpack(stored.load()), mChannels);
+}
+
+OSStatus OzzyHAL::SetStereoPair(AudioObjectPropertyScope scope, OzzyStereoPair pair) {
+    if (!OzzyStereoPairValid(pair, mChannels)) return kAudioHardwareIllegalOperationError;
+    const bool output = IsOutputScope(scope);
+    std::atomic<uint32_t>& stored = output ? mStereoPairOut : mStereoPairIn;
+    if (stored.exchange(OzzyStereoPairPack(pair)) == OzzyStereoPairPack(pair)) return kAudioHardwareNoError;
+    LogOzzyHAL("%{public}s stereo pair %{public}u,%{public}u", output ? "output" : "input", pair.left, pair.right);
+    NotifyDeviceChanged(kAudioDevicePropertyPreferredChannelsForStereo, output ? kAudioObjectPropertyScopeOutput : kAudioObjectPropertyScopeInput);
+    if (mHost) WriteStereoPairToStorage(mHost, output ? kOutputStereoPairStorageKey : kInputStereoPairStorageKey, pair);
+    return kAudioHardwareNoError;
 }
 
 extern "C" HRESULT OzzyInitialize(AudioServerPlugInDriverRef, AudioServerPlugInHostRef inHost) {
@@ -873,7 +949,12 @@ extern "C" Boolean OzzyHasProperty(AudioServerPlugInDriverRef, AudioObjectID inO
             case kAudioDevicePropertyStreamConfiguration: case kAudioDevicePropertyLatency:
             case kAudioDevicePropertySafetyOffset: case kAudioDevicePropertyPreferredChannelLayout:
             case kAudioDevicePropertyZeroTimeStampPeriod: case kAudioObjectPropertyOwnedObjects:
-            case kAudioObjectPropertyControlList: return true;
+            case kAudioObjectPropertyControlList: case kAudioDevicePropertyPreferredChannelsForStereo: return true;
+            case kAudioObjectPropertyElementName: {
+                CFStringRef name = OzzyHAL::Get().CopyChannelName(inAddress->mScope, inAddress->mElement);
+                if (name) CFRelease(name);
+                return name != nullptr;
+            }
         }
         return false;
     }
@@ -909,7 +990,8 @@ extern "C" Boolean OzzyHasProperty(AudioServerPlugInDriverRef, AudioObjectID inO
 
 extern "C" HRESULT OzzyIsPropertySettable(AudioServerPlugInDriverRef, AudioObjectID inObjectID, pid_t, const AudioObjectPropertyAddress* inAddress, Boolean* outIsSettable) {
     if (inObjectID == kOzzyDeviceID)
-        *outIsSettable = inAddress->mSelector == kAudioDevicePropertyNominalSampleRate && OzzyHAL::Get().IsRateSettable();
+        *outIsSettable = (inAddress->mSelector == kAudioDevicePropertyNominalSampleRate && OzzyHAL::Get().IsRateSettable()) ||
+                         inAddress->mSelector == kAudioDevicePropertyPreferredChannelsForStereo;
     else if (inObjectID == kOzzyVolumeControlID)
         *outIsSettable = inAddress->mSelector == kAudioLevelControlPropertyScalarValue || inAddress->mSelector == kAudioLevelControlPropertyDecibelValue;
     else if (inObjectID == kOzzyMuteControlID)
@@ -959,6 +1041,13 @@ extern "C" HRESULT OzzyGetPropertyDataSize(AudioServerPlugInDriverRef, AudioObje
                 return kAudioHardwareNoError;
             case kAudioDevicePropertySafetyOffset: case kAudioDevicePropertyLatency: case kAudioDevicePropertyZeroTimeStampPeriod: *outDataSize = sizeof(UInt32); return kAudioHardwareNoError;
             case kAudioDevicePropertyPreferredChannelLayout: *outDataSize = OzzyHAL::Get().GetPreferredChannelLayoutSize(inAddress->mScope); return kAudioHardwareNoError;
+            case kAudioDevicePropertyPreferredChannelsForStereo: *outDataSize = 2 * sizeof(UInt32); return kAudioHardwareNoError;
+            case kAudioObjectPropertyElementName: {
+                CFStringRef name = OzzyHAL::Get().CopyChannelName(inAddress->mScope, inAddress->mElement);
+                if (!name) return kAudioHardwareUnknownPropertyError;
+                CFRelease(name);
+                *outDataSize = sizeof(CFStringRef); return kAudioHardwareNoError;
+            }
             default: return kAudioHardwareUnknownPropertyError;
         }
     }
@@ -1056,6 +1145,21 @@ extern "C" HRESULT OzzyGetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
                 if (outData) { if (inMax < size) return kAudioHardwareBadPropertySizeError; memcpy(outData, OzzyHAL::Get().GetPreferredChannelLayout(inAddress->mScope), size); }
                 return kAudioHardwareNoError;
             }
+            case kAudioDevicePropertyPreferredChannelsForStereo: {
+                if (outData && inMax < 2 * sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+                const OzzyStereoPair pair = OzzyHAL::Get().GetStereoPair(inAddress->mScope);
+                if (outData) { ((UInt32*)outData)[0] = pair.left; ((UInt32*)outData)[1] = pair.right; }
+                if (outSize) *outSize = 2 * sizeof(UInt32);
+                return kAudioHardwareNoError;
+            }
+            case kAudioObjectPropertyElementName: {
+                if (outData && inMax < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
+                CFStringRef name = OzzyHAL::Get().CopyChannelName(inAddress->mScope, inAddress->mElement);
+                if (!name) return kAudioHardwareUnknownPropertyError;
+                if (outData) *(CFStringRef*)outData = name; else CFRelease(name);
+                if (outSize) *outSize = sizeof(CFStringRef);
+                return kAudioHardwareNoError;
+            }
             default: return kAudioHardwareUnknownPropertyError;
         }
     }
@@ -1129,6 +1233,11 @@ extern "C" HRESULT OzzySetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
     if (inObjectID == kOzzyDeviceID && inAddress->mSelector == kAudioDevicePropertyNominalSampleRate) {
         if (inDataSize < sizeof(Float64)) return kAudioHardwareBadPropertySizeError;
         return OzzyHAL::Get().RequestSampleRate(*(const Float64*)inData);
+    }
+    if (inObjectID == kOzzyDeviceID && inAddress->mSelector == kAudioDevicePropertyPreferredChannelsForStereo) {
+        if (inDataSize < 2 * sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
+        const UInt32* ch = (const UInt32*)inData;
+        return OzzyHAL::Get().SetStereoPair(inAddress->mScope, { ch[0], ch[1] });
     }
     if (inObjectID == kOzzyVolumeControlID) {
         if (inDataSize < sizeof(Float32)) return kAudioHardwareBadPropertySizeError;

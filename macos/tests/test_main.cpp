@@ -86,6 +86,10 @@ int main()
 	test_volume_round_trip();
 	test_volume_curve_is_linear_in_db();
 	test_volume_ramp_scales_buffer();
+	test_channels_names();
+	test_channels_out_of_range();
+	test_channels_roles();
+	test_channels_stereo_pair();
 	if (test_failures) {
 		std::fprintf(stderr, "%d failure(s)\n", test_failures);
 		return 1;

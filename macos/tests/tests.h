@@ -80,3 +80,7 @@ void test_volume_clamps();
 void test_volume_round_trip();
 void test_volume_curve_is_linear_in_db();
 void test_volume_ramp_scales_buffer();
+void test_channels_names();
+void test_channels_out_of_range();
+void test_channels_roles();
+void test_channels_stereo_pair();

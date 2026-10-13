@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include "../Shared/OzzySharedData.h"
+#include "OzzyChannels.h"
 
 // Codec function pointer types for device-agnostic encoding/decoding
 typedef void (*PCMEncoderFunc)(uint8_t* dst, const float* src);
@@ -75,6 +76,11 @@ public:
     bool IsMuted() const { return mMuted.load(); }
     void SetMuted(bool muted);
 
+    // Per-channel names, and the channels stereo clients use, for each scope
+    CFStringRef CopyChannelName(AudioObjectPropertyScope scope, AudioObjectPropertyElement element) const;
+    OzzyStereoPair GetStereoPair(AudioObjectPropertyScope scope) const;
+    OSStatus SetStereoPair(AudioObjectPropertyScope scope, OzzyStereoPair pair);
+
     OSStatus ioOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inStreamObjectID, UInt32 inClientID, UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo, void* ioMainBuffer, void* ioSecondaryBuffer);
 
 private:
@@ -133,6 +139,8 @@ private:
     std::atomic<Float32> mVolumeScalar { 1.0f };
     std::atomic<bool> mMuted { false };
     float mAppliedGain = 1.0f;   // IO thread only: the gain the last WriteMix ended on
+    std::atomic<uint32_t> mStereoPairIn { OzzyStereoPairPack({}) };
+    std::atomic<uint32_t> mStereoPairOut { OzzyStereoPairPack({}) };
     uint32_t mTimestampSeed = 1;
 
     AudioServerPlugInHostRef mHost = nullptr;
@@ -169,6 +177,7 @@ private:
     void LoadControlState();
     void SaveControlState();
     void NotifyControlChanged(AudioObjectID control, const AudioObjectPropertySelector* selectors, UInt32 count);
+    void NotifyDeviceChanged(AudioObjectPropertySelector selector, AudioObjectPropertyScope scope);
 };
 
 #endif
