@@ -386,6 +386,12 @@ static int ozzy_pcm_prepare(struct snd_pcm_substream *alsa_sub)
 
 	mutex_lock(&rt->stream_mutex);
 
+	/* An abort may have run while this waited for the mutex */
+	if (rt->panic) {
+		mutex_unlock(&rt->stream_mutex);
+		return -EPIPE;
+	}
+
 	if (alsa_rt->format != SNDRV_PCM_FORMAT_S24_3LE) {
 		mutex_unlock(&rt->stream_mutex);
 		return -EINVAL;
@@ -663,18 +669,23 @@ error:
 /*
  * ozzy_pcm_abort - Emergency stop all PCM activity.
  * Sets panic flag and poisons all URBs to prevent resubmission.
+ * Takes stream_mutex, so a prepare that is changing the rate (and with it
+ * stopping and restarting a device's own URBs) finishes first, and one
+ * that comes later sees panic and gives up.
  */
 void ozzy_pcm_abort(struct ozzy_chip *chip)
 {
 	struct pcm_runtime *rt = chip->pcm;
 
 	if (rt) {
+		mutex_lock(&rt->stream_mutex);
 		rt->panic = true;
 		ozzy_pcm_stream_stop(rt);
 		if (chip->ops->stop_urbs)
 			chip->ops->stop_urbs(chip);
 		else
 			ozzy_pcm_poison_urbs(rt);
+		mutex_unlock(&rt->stream_mutex);
 	}
 }
 
