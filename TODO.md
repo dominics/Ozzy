@@ -1,52 +1,40 @@
 # TODO
 
-Open work on the Dynacord CMS 600-3 support, gathered on 2026-10-26 from three session handoffs: the kext follow-ups, the Linux ALSA port and its security review. Checked against `dynacord-cms600` at 5966e13; anything already landed has been dropped. Reverse-engineering TODOs stay in `~/workspace/dynacord-cms-pcap/TODO.md`.
+Open work on the Dynacord CMS 600-3 support, last checked on 2026-10-26 against `dynacord-cms600`. The macOS userspace driver (v0.2.0, Homebrew cask `ozzy-cms600`) is in daily use without faults. Reverse-engineering TODOs stay in `~/workspace/dynacord-cms-pcap/TODO.md`.
 
 ## Linux ALSA driver (`linux/devices/dynacord.c`)
 
-Playback, capture, two-port MIDI and unplug/replug all work on spork (kernel 6.8). Left to do:
+Playback, capture, two-port MIDI and unplug/replug work on spork (kernel 6.8).
 
-- [ ] **Security review triage.** The background review of the 46577ac push flagged two categories in `dynacord.c`, labels only: (1) race / use-after-free, (2) untrusted device input. Nobody has looked at them yet, and the MIDI work (7548a01) has added more completion-handler code since. Candidates to confirm or rule out:
-  - `dynacord_fill_out` / `dynacord_in_complete` call `snd_pcm_period_elapsed()` after dropping `sub->lock`, while `ozzy_pcm_close` can clear `sub->instance` in between. The URBs are device-owned and keep running after the trigger stops, so this window is wider than in the core's own handlers.
-  - `dynacord_init` frees `priv` when a post-reset handshake fails, while MIDI and PCM paths can still reach `chip->private_data`. Also `dynacord_free` racing an in-flight `midi_out` completion.
-  - `xchg()` on `bool` fields (`fb_lost`, `misaligned`); a plain `priv->running` read in `dynacord_set_rate` racing `dynacord_stop_urbs` on disconnect.
-  - Device input looks bounded on a first read (the USB core caps `actual_length` at the buffer size, iso offsets are set by the driver, MIDI parsing loops on `actual_length`), but nobody has checked it properly.
-  - Fix what is real as `git commit --fixup` against the commit that introduced it, build with `make -C linux` on spork (no Linux build on the Mac; don't load the module on dagger), checkpatch clean, and let the review re-run on the next push.
-- [ ] **Recovery after the feedback watchdog.** Once the 50 ms no-feedback watchdog sets `panic`, `ozzy_pcm_open` returns `-EPIPE` until replug or module reload, because `panic` is only cleared in `ozzy_pcm_stream_start`. A fresh handshake probably re-arms the device, so try stop / handshake / start on the next open or prepare.
-- [ ] **5-minute soaks** per rate (44.1 / 48 / 96 kHz) with `speaker-test -D hw:<card> -c 4 -r <rate> -F S24_3LE`. Only 20 s per rate has been run.
-- [ ] **Xone regression check.** The period-units fix (5b1a82e) and the `set_rate` error return change the Xone path too, and haven't been tested on a Xone.
-- [ ] **Deduplicate the pacer and feedback code.** `common/devices/ploytec/dynacord_{pacer,feedback}.c` began as copies of `userspace/ploytec-play/{pacer,feedback}.c` and have drifted apart since.
+- [x] Security review triage, done on 2026-10-26 by reading the code; the fixes are compile-tested on 7.0, not yet on hardware:
+  - [x] Real: disconnect or `pre_reset` running `ozzy_pcm_abort` (no `stream_mutex`) during a prepare whose `set_rate` stops and restarts the device's URBs. That gave two concurrent `stop_urbs` freeing the same URBs, or a restart after the abort. Fixed in "fix(linux): serialise ozzy_pcm_abort with prepare".
+  - [x] Real, theoretical window: `snd_pcm_period_elapsed()` after dropping `sub->lock`, while the URBs keep running after a trigger stop, so hw_free or close could free the runtime under it. The core handlers also read `sub->instance` after the unlock. Fixed with a `sync_stop` callback that waits for in-flight reports, in "fix(linux): wait for in-flight period reports before ALSA frees a runtime".
+  - [x] Not a use-after-free: `dynacord_init` dropping `priv` after a failed post-reset handshake. URBs are already stopped by `pre_reset`, every op checks for a NULL `priv`, and the rawmidi device owns `priv` once created. The `midi_out` completion can't outlive `stop_urbs`, which unpublishes it under `midi_lock` and then kills it.
+  - [x] Not exploitable: device input. Capture is bounded by `actual_length` (capped by the USB core) and a ring of at least 6912 bytes, against at most 3456 written per URB. Feedback offsets are set by the driver. `dynacord_midi_in_slot` checks the packet length and stays within its slot.
+- [ ] Hardware-test the two fixes on spork: playback / capture / rate changes, and unplug while changing rate (`speaker-test` with `-r` flips).
+- [ ] A post-reset re-init after a failed one allocates a new `priv` and creates a second rawmidi device, so MIDI breaks until replug. Functional, not memory safety.
+- [ ] Recovery after the 50 ms feedback watchdog. `ozzy_pcm_open` returns `-EPIPE` until replug, because `panic` is only cleared in `ozzy_pcm_stream_start`, which runs after open. Try stop / handshake / start on the next open or prepare.
+- [ ] 5-minute soaks at 44.1 / 48 / 96 kHz (only 20 s each so far).
+- [ ] Xone regression check of the core changes: period units (5b1a82e), `set_rate` errors, the abort lock and `sync_stop`.
+- [ ] Deduplicate `common/devices/ploytec/dynacord_{pacer,feedback}.c` and `userspace/ploytec-play/{pacer,feedback}.c`, which have drifted apart.
 
-## macOS kext (`macos/Backends/OzzyKext`)
+## macOS userspace driver (OzzyDaemon, OzzyHAL, OzzyMIDI)
 
-The userspace driver (OzzyDaemon) is now the supported path for the CMS 600-3, and the kext is no longer installed on dominic-macbook. Treat these as low priority unless the kext comes back for the CMS. Any kext testing needs a Recovery trip to lower SIP first, and the KDK for removal.
+- [x] A failed `MIDIDeviceCreate` is retried on every tenth periodic poll check ("fix(macos): retry a failed MIDIDeviceCreate"). Build-tested only.
+- [ ] IsoTooOld / IsoTooNew at 48 kHz. The bus already reseeds the start frame from `GetBusFrameNumber` after any iso error (`UserBus.cpp`, since 98ede90). What's left is that a request-level error sets the engine's `mFailed`, which costs a Poll restart of about 1.5 s. Check the logs on the machine in daily use (`~/Library/Logs/OzzyDaemon.log`, `log show --predicate 'subsystem == "OzzyDaemon" OR subsystem == "Ozzy"'`) before touching it. No occurrences closes this.
+- [ ] MIDI bytes dropped until the device-online block has run after a MIDIServer restart (`PostDeviceOnline`).
+- [ ] Duplicate `PropertiesChanged(NominalSampleRate)` from the HAL.
+- [ ] Possible stale byte 0x00 on bulk IN after a rate change (full-scale clicks on in1/in3). Not seen since 2026-10-12; watch for it.
 
-- [ ] **`kmutil unload` leaves an instance behind.** With a stream running, unload logs `stop` and an aborted iso pipe, then nothing: no `free`, and "class OzzyKext has 1 instance". `StopThread` returns early on `mTransfersLeaked` without logging. Next step: log at every `StopThread` exit and at the end of `Teardown` with the drain result, then test the unload path (no `willTerminate`) with the stream running and idle.
-- [ ] **`OzzyUserClient::clientMemoryForType`** reads the owner's shm descriptor without synchronising against `UnmapSharedMemory` (a narrow use-after-free window), and `mOwner` is not retained.
-- [ ] **Bulk 0x86 NotResponding / Overrun at 96 kHz.** The Poll restart recovers in about 1.5 s.
-- [ ] **MIDI bytes dropped after a MIDIServer restart.** One loop round-trip came back empty. OzzyMIDI drops bytes until the device-online block has run (`PostDeviceOnline`).
-- [ ] **A failed `MIDIDeviceCreate` is not retried** (`EnsureMIDIDeviceCreated` logs and gives up).
-- [ ] **Duplicate `PropertiesChanged(NominalSampleRate)`** from the HAL.
-- [ ] **Boot-time kext log lines missing** at first light.
-- [ ] **Long sleep that re-enumerates the mixer**: untested, though unplug + replug passed.
-- [ ] **The uninstaller's `kmutil rebuild` path** has only been stub-tested: the real rebuild, its exit code on an approval timeout, and `kmutil inspect` between rebuild and reboot.
-- [ ] **The kext uninstaller half-removes a userspace install.** `uninstall.command` deletes `/usr/local/bin/OzzyDaemon` and the HAL/MIDI drivers but leaves the userspace LaunchAgent behind. The `.pkg` with receipt `com.ozzy.userspace` now exists, so this is no longer blocked: if `pkgutil --pkg-info com.ozzy.userspace` succeeds, `uninstall.command` should refuse (or hand over to `/Library/Application Support/Ozzy/uninstall.sh`), and `install.command` option 1 should refuse until the package is removed. Needs Dominic's go-ahead.
-- [ ] **dominic-rilla install** (ask first; nothing is installed there). Check `profiles status -type enrollment` (MDM may forbid Reduced Security or kext loading), `uname -m`, and that the 26.5 SDK is present. Anything done there is visible at work.
-- [ ] **Deferred review minors** from the kext build. The ones still worth acting on:
-  - `dynacord_pacer.c:109` subtracts before the `< 0` guard (INT_MIN overflow).
-  - Seqlock writes are volatile-only, with no release barrier; check HAL reader and writer ordering on arm64.
-  - The completion ctx index and the `frameCount` reported by the bus aren't bounds-checked.
-  - The `mRefFrame` / `mRefHost` reference pair is never refreshed, though the comment says "latest".
-  - A queue-full drop leaks an iso slot and loses its callback; the isoch completion lacks a null check.
-  - The MIDI parser edge cases have been traced but have no tests: realtime bytes inside SysEx, an F0 interrupting SysEx, a stray F7, SysEx of exactly 256 bytes.
-  - `ConfigureEntities` can run concurrently from `Send` and the poll thread.
-  - `StopIO` decides which client is last from a single load.
+## Features
 
-## macOS userspace driver (OzzyDaemon)
-
-- [ ] **Occasional IsoTooOld / IsoTooNew self-restarts at 48 kHz.** Candidate fix: reseed `nextFrame` from the bus frame number instead of carrying it forward (`UserBus.cpp`, iso submit).
-- [ ] **Possible stale byte from the mixer on bulk IN.** In some 48 kHz sessions started right after a rate change, byte 0x00 of the 64-byte IN frame repeated the previous frame's value in about 8% of frames. That byte holds bit 23 of in1 and in3, so quiet signals there decode as full-scale clicks. It hasn't been reproduced since, and a later rate change cleared it. Suspect this first if in1/in3 click.
+- [ ] System-wide input mute.
+- [ ] Input volume, like the output volume (`macos/OzzyHAL/OzzyVolume.h`). This reverses an earlier decision against input volume, made because Slack/Zoom/Chrome automatic gain control would drive it. Settle that first, e.g. hide the control from apps or accept that they move it. Mute has no such conflict.
 
 ## Test tools
 
-- [ ] The loopio / ratectl / midiloop / midimon / midiecho / flipper.sh test tools were never committed. Their sources can be recovered from the Bash heredocs in session transcript 84cd2a6e-4a50-4b8f-bd02-87c7a977d680. Worth committing under `macos/tests/tools/` if more hardware testing is coming.
+- [ ] Recover loopio / ratectl / midiloop / midimon / midiecho / flipper.sh from the Bash heredocs in session transcript 84cd2a6e-4a50-4b8f-bd02-87c7a977d680, and commit them under `macos/tests/tools/`.
+
+## Parked: the macOS kext
+
+The userspace driver replaced the kext for the CMS 600-3, so no more work goes into it unless that changes. Known open items: `kmutil unload` leaves an instance behind (`StopThread` returns early without logging); `OzzyUserClient::clientMemoryForType` reads the shm descriptor without synchronising against unmap; 0x86 overruns at 96 kHz; the uninstaller's `kmutil rebuild` path has only been stub-tested; the kext uninstaller half-removes a userspace install (the `com.ozzy.userspace` receipt check is now possible); plus the deferred review minors from the kext build.
