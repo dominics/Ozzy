@@ -50,6 +50,9 @@ static std::atomic<uint32_t> gGeneration{1};
  * gSources only while this equals gGeneration; bumping the generation
  * clears it. */
 static std::atomic<uint32_t> gEntitiesReady{0};
+/* The generation whose block ran but could not create the device, so the
+ * poll thread posts it again. */
+static std::atomic<uint32_t> gCreateFailed{0};
 static int gRequestedPorts = 0;                             // poll thread only: ports last posted
 
 // The port count comes from shared memory the other side can write, so it is clamped to 1..2.
@@ -192,6 +195,8 @@ static void PostDeviceOnline() {
 		EnsureMIDIDeviceCreated(snap);
 		if (gMidiDeviceRef)
 			gEntitiesReady.store(gen, std::memory_order_release);
+		else
+			gCreateFailed.store(gen, std::memory_order_relaxed);
 	});
 }
 
@@ -367,10 +372,17 @@ static void* MidiInputPollThread(void* arg) {
 					continue;
 				}
 				if (!sessionValid && !OnSessionChange()) continue;
-				// Repost on a port count change, or once this generation's block
-				// has run but configured fewer entities than requested.
-				bool configured = gEntitiesReady.load(std::memory_order_acquire) == gGeneration.load(std::memory_order_relaxed);
-				if (WantedPorts() != gRequestedPorts || (configured && gPortCount.load() != gRequestedPorts))
+				// Repost on a port count change, once this generation's block
+				// has run but configured fewer entities than requested, or
+				// (every tenth check) once it has run but MIDIDeviceCreate failed.
+				static int createRetry = 0;
+				uint32_t gen = gGeneration.load(std::memory_order_relaxed);
+				bool configured = gEntitiesReady.load(std::memory_order_acquire) == gen;
+				bool createFailed = gCreateFailed.load(std::memory_order_relaxed) == gen;
+				if (!createFailed)
+					createRetry = 0;
+				if (WantedPorts() != gRequestedPorts || (configured && gPortCount.load() != gRequestedPorts) ||
+				    (createFailed && ++createRetry % 10 == 0))
 					PostDeviceOnline();
 			}
 			
