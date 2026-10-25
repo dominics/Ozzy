@@ -8,6 +8,8 @@
 #ifndef OZZY_PCM_H
 #define OZZY_PCM_H
 
+#include <linux/atomic.h>
+
 struct ozzy_chip;
 
 #define OZZY_PCM_N_URBS  4
@@ -27,6 +29,8 @@ struct pcm_substream {
 
 	snd_pcm_uframes_t dma_off;     /* current position in ALSA DMA area (bytes) */
 	snd_pcm_uframes_t period_off;  /* current position within current period */
+
+	atomic_t elapsing;             /* periods found but not yet reported */
 };
 
 /* PCM streaming states */
@@ -73,10 +77,17 @@ int ozzy_pcm_init_urbs(struct ozzy_chip *chip);
 /*
  * ozzy_pcm_advance - Advance a substream's DMA position by `bytes`.
  * For devices that run their own URBs. Call with sub->lock held.
- * Returns true if the caller must call snd_pcm_period_elapsed() after
- * dropping the lock.
+ * Returns true if the caller must pass sub->instance, read under the lock,
+ * to ozzy_pcm_period_elapsed() after dropping it.
  */
 bool ozzy_pcm_advance(struct pcm_substream *sub, unsigned int bytes);
+
+/*
+ * ozzy_pcm_period_elapsed - Report a period that ozzy_pcm_advance() found.
+ * Call after dropping sub->lock, with the instance read under it.
+ */
+void ozzy_pcm_period_elapsed(struct pcm_substream *sub,
+			     struct snd_pcm_substream *instance);
 
 /*
  * ozzy_pcm_abort - Emergency stop all PCM URBs.

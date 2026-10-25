@@ -10,6 +10,7 @@
  */
 
 #include <linux/slab.h>
+#include <linux/wait_bit.h>
 #include <sound/pcm.h>
 
 #include "ozzy.h"
@@ -110,8 +111,9 @@ static void ozzy_pcm_poison_urbs(struct pcm_runtime *rt)
 /*
  * ozzy_pcm_advance - Advance a substream's DMA position after a transfer.
  * Call with sub->lock held. Returns true if a period boundary was crossed,
- * in which case the caller must call snd_pcm_period_elapsed() after
- * dropping the lock.
+ * in which case the caller must pass sub->instance, read under the lock, to
+ * ozzy_pcm_period_elapsed() after dropping it. Until then the period counts
+ * in sub->elapsing, which ozzy_pcm_sync_stop() waits on.
  */
 bool ozzy_pcm_advance(struct pcm_substream *sub, unsigned int bytes)
 {
@@ -125,9 +127,22 @@ bool ozzy_pcm_advance(struct pcm_substream *sub, unsigned int bytes)
 	sub->period_off += bytes;
 	if (sub->period_off >= period_bytes) {
 		sub->period_off %= period_bytes;
+		atomic_inc(&sub->elapsing);
 		return true;
 	}
 	return false;
+}
+
+/*
+ * ozzy_pcm_period_elapsed - Report a period that ozzy_pcm_advance() found,
+ * then let a waiting ozzy_pcm_sync_stop() go once none are left.
+ */
+void ozzy_pcm_period_elapsed(struct pcm_substream *sub,
+			     struct snd_pcm_substream *instance)
+{
+	snd_pcm_period_elapsed(instance);
+	if (atomic_dec_and_test(&sub->elapsing))
+		wake_up_var(&sub->elapsing);
 }
 
 /*
@@ -140,7 +155,7 @@ static void ozzy_pcm_in_urb_handler(struct urb *usb_urb)
 	struct ozzy_chip *chip = in_urb->chip;
 	struct pcm_runtime *rt = chip->pcm;
 	struct pcm_substream *sub;
-	bool do_period_elapsed = false;
+	struct snd_pcm_substream *elapsed = NULL;
 	unsigned long flags;
 	unsigned int bytes;
 	int ret;
@@ -165,12 +180,13 @@ static void ozzy_pcm_in_urb_handler(struct urb *usb_urb)
 						     sub->dma_off,
 						     pcm_buffer_size);
 
-		do_period_elapsed = ozzy_pcm_advance(sub, bytes);
+		if (ozzy_pcm_advance(sub, bytes))
+			elapsed = sub->instance;
 	}
 	spin_unlock_irqrestore(&sub->lock, flags);
 
-	if (do_period_elapsed)
-		snd_pcm_period_elapsed(sub->instance);
+	if (elapsed)
+		ozzy_pcm_period_elapsed(sub, elapsed);
 
 	ret = usb_submit_urb(&in_urb->instance, GFP_ATOMIC);
 	if (ret < 0)
@@ -194,7 +210,7 @@ static void ozzy_pcm_out_urb_handler(struct urb *usb_urb)
 	struct ozzy_chip *chip = out_urb->chip;
 	struct pcm_runtime *rt = chip->pcm;
 	struct pcm_substream *sub;
-	bool do_period_elapsed = false;
+	struct snd_pcm_substream *elapsed = NULL;
 	unsigned long flags;
 	unsigned int bytes;
 	int ret;
@@ -219,15 +235,16 @@ static void ozzy_pcm_out_urb_handler(struct urb *usb_urb)
 						      sub->dma_off,
 						      pcm_buffer_size);
 
-		do_period_elapsed = ozzy_pcm_advance(sub, bytes);
+		if (ozzy_pcm_advance(sub, bytes))
+			elapsed = sub->instance;
 	} else {
 		/* No active playback -- re-initialize silence pattern */
 		chip->ops->init_out_urb(chip, out_urb->buffer);
 	}
 	spin_unlock_irqrestore(&sub->lock, flags);
 
-	if (do_period_elapsed)
-		snd_pcm_period_elapsed(sub->instance);
+	if (elapsed)
+		ozzy_pcm_period_elapsed(sub, elapsed);
 
 	/* Embed pending MIDI output bytes */
 	if (chip->ops->fill_midi_out)
@@ -490,12 +507,29 @@ static snd_pcm_uframes_t ozzy_pcm_pointer(struct snd_pcm_substream *alsa_sub)
 	return bytes_to_frames(alsa_sub->runtime, dma_offset);
 }
 
+/*
+ * ozzy_pcm_sync_stop - ALSA sync_stop callback, run after a stop and before
+ * hw_free, prepare or close. URBs keep running after the stop, so this
+ * waits for any completion still reporting a period it found while the
+ * substream was active, before ALSA can free the runtime under it. The
+ * stop cleared sub->active, so no new ones start.
+ */
+static int ozzy_pcm_sync_stop(struct snd_pcm_substream *alsa_sub)
+{
+	struct pcm_substream *sub = ozzy_pcm_get_substream(alsa_sub);
+
+	if (sub)
+		wait_var_event(&sub->elapsing, !atomic_read(&sub->elapsing));
+	return 0;
+}
+
 static const struct snd_pcm_ops ozzy_pcm_ops = {
-	.open    = ozzy_pcm_open,
-	.close   = ozzy_pcm_close,
-	.prepare = ozzy_pcm_prepare,
-	.trigger = ozzy_pcm_trigger,
-	.pointer = ozzy_pcm_pointer,
+	.open      = ozzy_pcm_open,
+	.close     = ozzy_pcm_close,
+	.prepare   = ozzy_pcm_prepare,
+	.trigger   = ozzy_pcm_trigger,
+	.pointer   = ozzy_pcm_pointer,
+	.sync_stop = ozzy_pcm_sync_stop,
 };
 
 /* ========================================================================
@@ -709,6 +743,8 @@ int ozzy_pcm_init(struct ozzy_chip *chip)
 	mutex_init(&rt->stream_mutex);
 	spin_lock_init(&rt->playback.lock);
 	spin_lock_init(&rt->capture.lock);
+	atomic_set(&rt->playback.elapsing, 0);
+	atomic_set(&rt->capture.elapsing, 0);
 
 	ret = snd_pcm_new(chip->card, chip->dev->product, 0, 1,
 			  chip->info->capture_channels ? 1 : 0, &pcm);

@@ -344,7 +344,7 @@ static void dynacord_fill_out(struct ozzy_chip *chip, struct urb *urb)
 	spin_unlock_irqrestore(&sub->lock, flags);
 
 	if (elapsed)
-		snd_pcm_period_elapsed(elapsed);
+		ozzy_pcm_period_elapsed(sub, elapsed);
 }
 
 /*
@@ -664,7 +664,7 @@ static void dynacord_in_complete(struct urb *urb)
 	spin_unlock_irqrestore(&sub->lock, flags);
 
 	if (elapsed)
-		snd_pcm_period_elapsed(elapsed);
+		ozzy_pcm_period_elapsed(sub, elapsed);
 
 	dynacord_resubmit(chip, urb);
 }
