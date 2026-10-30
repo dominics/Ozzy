@@ -18,6 +18,7 @@ int main()
 	test_codec_read_input_matches_shared_decoder();
 	test_codec_wrap_large_sample_time();
 	test_codec_nan_is_silence();
+	test_codec_read_input_channel();
 	test_feedback_parse();
 	test_feedback_out_of_range_rejected_by_pacer();
 	test_bus_isoch_defaults_unsupported();
@@ -90,6 +91,9 @@ int main()
 	test_channels_out_of_range();
 	test_channels_roles();
 	test_channels_stereo_pair();
+	test_devices_count();
+	test_devices_lookup();
+	test_devices_mono_channels();
 	if (test_failures) {
 		std::fprintf(stderr, "%d failure(s)\n", test_failures);
 		return 1;

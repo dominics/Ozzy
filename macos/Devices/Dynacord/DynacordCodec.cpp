@@ -30,18 +30,37 @@ void DynacordWriteOutput(uint8_t* ring, const float* src, uint64_t sampleTime, u
 		DynacordEncodeFrame(ring + (size_t)((sampleTime + i) % ringFrames) * bytesPerFrame, src + 4 * i);
 }
 
+/* One channel of a decoded S24_3LE frame as a float in [-1, 1). */
+static float FromS24(const uint8_t s24[24], int c)
+{
+	int32_t v = s24[3 * c] | (s24[3 * c + 1] << 8) | (s24[3 * c + 2] << 16);
+	if (v & 0x800000)
+		v -= 0x1000000;
+	return (float)v / 8388608.0f;
+}
+
 void DynacordReadInput(float* dst, const uint8_t* ring, uint64_t sampleTime, uint32_t frameCount,
 		       uint32_t ringFrames, uint32_t bytesPerFrame)
 {
 	for (uint32_t i = 0; i < frameCount; i++) {
 		uint8_t s24[24];
 		ploytec_decode_frame(s24, ring + (size_t)((sampleTime + i) % ringFrames) * bytesPerFrame);
-		for (int c = 0; c < 4; c++) {
-			int32_t v = s24[3 * c] | (s24[3 * c + 1] << 8) | (s24[3 * c + 2] << 16);
-			if (v & 0x800000)
-				v -= 0x1000000;
-			dst[4 * i + c] = (float)v / 8388608.0f;
-		}
+		for (int c = 0; c < 4; c++)
+			dst[4 * i + c] = FromS24(s24, c);
+	}
+}
+
+void DynacordReadInputChannel(float* dst, const uint8_t* ring, uint64_t sampleTime, uint32_t frameCount,
+			      uint32_t ringFrames, uint32_t bytesPerFrame, uint32_t channel)
+{
+	if (channel < 1 || channel > 4) {
+		memset(dst, 0, (size_t)frameCount * sizeof(float));
+		return;
+	}
+	for (uint32_t i = 0; i < frameCount; i++) {
+		uint8_t s24[24];
+		ploytec_decode_frame(s24, ring + (size_t)((sampleTime + i) % ringFrames) * bytesPerFrame);
+		dst[i] = FromS24(s24, (int)channel - 1);
 	}
 }
 

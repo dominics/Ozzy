@@ -43,7 +43,8 @@ TEST_SRC := \
 	test_shm.cpp \
 	test_handover.cpp \
 	test_volume.cpp \
-	test_channels.cpp
+	test_channels.cpp \
+	test_devices.cpp
 
 OBJ := $(addprefix build/,$(notdir $(C_SRC:.c=.o) $(LIB_SRC:.cpp=.o) $(TEST_SRC:.cpp=.o)))
 vpath %.c $(sort $(dir $(C_SRC)))

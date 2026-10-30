@@ -19,5 +19,10 @@ void DynacordWriteOutput(uint8_t* ring, const float* src, uint64_t sampleTime, u
 void DynacordReadInput(float* dst, const uint8_t* ring, uint64_t sampleTime, uint32_t frameCount,
 		       uint32_t ringFrames, uint32_t bytesPerFrame);
 
+/* Read frameCount mono frames of one 1-based channel (1-4) from sampleTime;
+ * silence for any other channel. */
+void DynacordReadInputChannel(float* dst, const uint8_t* ring, uint64_t sampleTime, uint32_t frameCount,
+			      uint32_t ringFrames, uint32_t bytesPerFrame, uint32_t channel);
+
 /* Silence the whole output ring. */
 void DynacordClearOutput(uint8_t* ring, uint32_t bufferSize);

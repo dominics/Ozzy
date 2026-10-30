@@ -122,6 +122,7 @@ void OzzyHAL::Init(AudioServerPlugInHostRef host) {
     mDeviceUID = CFSTR("OzzyHAL.device");
     mModelUID = CFSTR("Ozzy Audio Device");
     mManufacturerUID = CFSTR("Ozzy");
+    RebuildDeviceStrings();
     mZeroTimestampPeriod = 640;
 
     mCurrentStreamFormat.mSampleRate = 96000.0;
@@ -226,10 +227,49 @@ void OzzyHAL::NotifyControlChanged(AudioObjectID control, const AudioObjectPrope
     mHost->PropertiesChanged(mHost, control, count, addrs);
 }
 
-void OzzyHAL::NotifyDeviceChanged(AudioObjectPropertySelector selector, AudioObjectPropertyScope scope) {
+void OzzyHAL::NotifyDeviceChanged(AudioObjectID device, AudioObjectPropertySelector selector, AudioObjectPropertyScope scope) {
     if (!mHost) return;
     AudioObjectPropertyAddress addr = { selector, scope, kAudioObjectPropertyElementMain };
-    mHost->PropertiesChanged(mHost, kOzzyDeviceID, 1, &addr);
+    mHost->PropertiesChanged(mHost, device, 1, &addr);
+}
+
+/* Tells the host a global property changed on every device the attached hardware publishes. */
+void OzzyHAL::NotifyAllDevicesChanged(AudioObjectPropertySelector selector) {
+    for (UInt32 i = 0; i < OzzyDeviceCount(true, mIsDynacord); i++)
+        NotifyDeviceChanged(kOzzyDevices[i].device, selector, kAudioObjectPropertyScopeGlobal);
+}
+
+/* Takes the product, manufacturer and serial number the engine published,
+ * leaving any that are empty as they were. */
+void OzzyHAL::SetIdentity(const char* product, const char* manufacturer, const char* serial) {
+    if (product[0] != 0) {
+        if (mModelUID) CFRelease(mModelUID);
+        mModelUID = SafeCreateString(product);
+    }
+    if (manufacturer[0] != 0) {
+        if (mManufacturerUID) CFRelease(mManufacturerUID);
+        mManufacturerUID = SafeCreateString(manufacturer);
+    }
+    if (serial[0] != 0) {
+        if (mDeviceUID) CFRelease(mDeviceUID);
+        char uidBuf[128];
+        snprintf(uidBuf, sizeof(uidBuf), "OzzyHAL.%s", serial);
+        mDeviceUID = SafeCreateString(uidBuf);
+    }
+    RebuildDeviceStrings();
+}
+
+/* Derives each device's UID and model UID from the main device's, so the
+ * mono devices keep a stable UID across replugs. */
+void OzzyHAL::RebuildDeviceStrings() {
+    for (UInt32 i = 0; i < kOzzyMaxDevices; i++) {
+        DeviceState& d = mDevices[i];
+        if (!d.name && kOzzyDevices[i].name) d.name = SafeCreateString(kOzzyDevices[i].name);
+        if (d.uid) CFRelease(d.uid);
+        if (d.model) CFRelease(d.model);
+        d.uid = mDeviceUID ? CFStringCreateWithFormat(NULL, NULL, CFSTR("%@%s"), mDeviceUID, kOzzyDevices[i].uidSuffix) : nullptr;
+        d.model = mModelUID ? CFStringCreateWithFormat(NULL, NULL, CFSTR("%@%s"), mModelUID, kOzzyDevices[i].uidSuffix) : nullptr;
+    }
 }
 
 void OzzyHAL::SetVolumeScalar(Float32 scalar) {
@@ -266,6 +306,13 @@ void OzzyHAL::RebuildStreamConfigs() {
     mOutputConfig.mBuffers[0].mNumberChannels = mChannels;
     mOutputConfig.mBuffers[0].mDataByteSize = kDefaultIOFrames * kBytesPerFrame;
     mOutputConfig.mBuffers[0].mData = nullptr;
+
+    mMonoInputConfig.mNumberBuffers = 1;
+    mMonoInputConfig.mBuffers[0].mNumberChannels = 1;
+    mMonoInputConfig.mBuffers[0].mDataByteSize = kDefaultIOFrames * sizeof(Float32);
+    mMonoInputConfig.mBuffers[0].mData = nullptr;
+
+    mNoConfig.mNumberBuffers = 0;
 }
 
 /* Layout v1 (Xone): 8x8 at 96 kHz in 80-frame packet rings. Returns false, leaving state untouched, if the segment's values are unusable. */
@@ -503,8 +550,7 @@ void OzzyHAL::UnmapSharedMemory() {
 
     mIsKextMapping = false;
     mMappingDead.store(false);
-    mLastAnchorSample = 0;
-    mLastAnchorHost = 0;
+    for (DeviceState& d : mDevices) d.anchorSample = d.anchorHost = 0;
 }
 
 void* OzzyHAL::MonitorEntry(void* arg) {
@@ -528,20 +574,7 @@ void OzzyHAL::MonitorLoop() {
             mLastConnectedState = true;
             
             // Update device metadata
-            if (product.s[0] != 0) {
-                if (mModelUID) CFRelease(mModelUID);
-                mModelUID = SafeCreateString(product.s);
-            }
-            if (manufacturer.s[0] != 0) {
-                if (mManufacturerUID) CFRelease(mManufacturerUID);
-                mManufacturerUID = SafeCreateString(manufacturer.s);
-            }
-            if (serial.s[0] != 0) {
-                if (mDeviceUID) CFRelease(mDeviceUID);
-                char uidBuf[128];
-                snprintf(uidBuf, sizeof(uidBuf), "OzzyHAL.%s", serial.s);
-                mDeviceUID = SafeCreateString(uidBuf);
-            }
+            SetIdentity(product.s, manufacturer.s, serial.s);
             
             // Notify CoreAudio
             if (mHost) {
@@ -616,7 +649,7 @@ void OzzyHAL::MonitorLoop() {
             }
             // The engine publishes a restart's layout some time after its new
             // session, and a rate change it applied late (after
-            // PerformSampleRateChange gave up) brings a new one: check every
+            // PerformDeviceConfigurationChange gave up) brings a new one: check every
             // poll and reattach so the DOWN/UP path re-applies it. A read torn
             // by a publish in progress costs one extra reattach at most.
             if (mSHM && !mMappingDead.load() && mIsDynacord && !mRateChangeActive.load() && !FrameLayoutUnchanged()) {
@@ -652,50 +685,32 @@ void OzzyHAL::MonitorLoop() {
                     usleep(250000);
                     continue;
                 }
-                if (product.s[0] != 0) {
-                    if (mModelUID) CFRelease(mModelUID);
-                    mModelUID = SafeCreateString(product.s);
-                }
-                if (manufacturer.s[0] != 0) {
-                    if (mManufacturerUID) CFRelease(mManufacturerUID);
-                    mManufacturerUID = SafeCreateString(manufacturer.s);
-                }
-                if (serial.s[0] != 0) {
-                    if (mDeviceUID) CFRelease(mDeviceUID);
-                    char uidBuf[128];
-                    snprintf(uidBuf, sizeof(uidBuf), "OzzyHAL.%s", serial.s);
-                    mDeviceUID = SafeCreateString(uidBuf);
-                }
+                SetIdentity(product.s, manufacturer.s, serial.s);
                 LogOzzyHAL("device ready: '%{public}s'", product.s);
             }
 
             mLastConnectedState = currentlyConnected;
             LogOzzyHAL("connection: %{public}s", currentlyConnected ? "UP" : "DOWN");
             
-            // Stop I/O if device disconnected
-            if (!currentlyConnected && mIOStarted) {
-                mIOStarted = false;
-                mTimestampSeed++;
-                LogOzzyHAL("auto-stopped I/O due to disconnect");
+            // The timeline ends with the device; CoreAudio stops IO as it goes away
+            if (!currentlyConnected && mIOClients.load() > 0) {
+                for (DeviceState& d : mDevices) d.seed++;
+                LogOzzyHAL("I/O lost its device");
             }
             
             if (mHost) {
                 if (currentlyConnected) {
                     // Device connected - notify about device properties first, then add to list
-                    AudioObjectPropertyAddress devAddr = { kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
-                    mHost->PropertiesChanged(mHost, kOzzyDeviceID, 1, &devAddr);
-                    devAddr.mSelector = kAudioObjectPropertyManufacturer;
-                    mHost->PropertiesChanged(mHost, kOzzyDeviceID, 1, &devAddr);
-                    devAddr.mSelector = kAudioDevicePropertyDeviceUID;
-                    mHost->PropertiesChanged(mHost, kOzzyDeviceID, 1, &devAddr);
-                    
+                    NotifyAllDevicesChanged(kAudioObjectPropertyName);
+                    NotifyAllDevicesChanged(kAudioObjectPropertyManufacturer);
+                    NotifyAllDevicesChanged(kAudioDevicePropertyDeviceUID);
+
                     AudioObjectPropertyAddress listAddr = { kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
                     mHost->PropertiesChanged(mHost, kAudioObjectPlugInObject, 1, &listAddr);
                 } else {
                     // Device disconnected - notify that device is no longer alive, then remove from list
-                    AudioObjectPropertyAddress aliveAddr = { kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
-                    mHost->PropertiesChanged(mHost, kOzzyDeviceID, 1, &aliveAddr);
-                    
+                    NotifyAllDevicesChanged(kAudioDevicePropertyDeviceIsAlive);
+
                     AudioObjectPropertyAddress listAddr = { kAudioPlugInPropertyDeviceList, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
                     mHost->PropertiesChanged(mHost, kAudioObjectPlugInObject, 1, &listAddr);
                 }
@@ -707,7 +722,18 @@ void OzzyHAL::MonitorLoop() {
 
 bool OzzyHAL::IsConnected() { return mLastConnectedState; }
 
-kern_return_t OzzyHAL::StartIO() {
+/* Decrements a client count, never below zero; returns the count it saw. */
+static uint32_t ReleaseClient(std::atomic<uint32_t>& count) {
+    uint32_t n = count.load();
+    while (n > 0 && !count.compare_exchange_weak(n, n - 1)) {}
+    return n;
+}
+
+/* Every device runs on the one engine stream; only the main device writes
+ * output, so only its clients touch the output side. */
+kern_return_t OzzyHAL::StartIO(AudioObjectID device) {
+    const int i = DeviceIndex(device);
+    if (i < 0) return kAudioHardwareBadObjectError;
     if (!IsConnected()) return kAudioHardwareNotRunningError;
     // Count first, then look at the mapping: the monitor marks it dead first
     // and then reads the count, so one of the two sides always sees the other.
@@ -716,30 +742,30 @@ kern_return_t OzzyHAL::StartIO() {
         mIOClients.fetch_sub(1);
         return kAudioHardwareNotRunningError;
     }
-    mSHM->audio.halWritePosition.store(0, std::memory_order_relaxed);
-    LogOzzyHAL("start I/O");
-    mIOStarted = true;
-    mTimestampSeed++;
+    if (mDevices[i].clients.fetch_add(1) == 0 && i == 0)
+        mSHM->audio.halWritePosition.store(0, std::memory_order_relaxed);
+    LogOzzyHAL("start I/O on device %{public}u", (unsigned)device);
+    mDevices[i].seed++;
     return kIOReturnSuccess;
 }
 
-kern_return_t OzzyHAL::StopIO() {
-    LogOzzyHAL("stop I/O");
-    mTimestampSeed++;
+kern_return_t OzzyHAL::StopIO(AudioObjectID device) {
+    const int i = DeviceIndex(device);
+    if (i < 0) return kAudioHardwareBadObjectError;
+    LogOzzyHAL("stop I/O on device %{public}u", (unsigned)device);
+    mDevices[i].seed++;
     // Clear while this client is still counted: the monitor only unmaps a
     // dropped mapping once the count reaches zero, so the buffer stays mapped.
-    uint32_t n = mIOClients.load();
-    if (n <= 1) {   // this is the last client
-        mIOStarted = false;
+    // The engine keeps playing the ring while any other device runs, so the
+    // main device's last client silences it.
+    if (ReleaseClient(mDevices[i].clients) <= 1 && i == 0)
         ClearOutputBuffer();
-    }
-    // Never below zero.
-    while (n > 0 && !mIOClients.compare_exchange_weak(n, n - 1)) {}
+    ReleaseClient(mIOClients);
     return kIOReturnSuccess;
 }
 
-/* Ask the host to schedule a rate change; it calls back into
- * PerformSampleRateChange once IO is quiesced. */
+/* Ask the host to schedule a rate change on the main device; it calls back
+ * into PerformDeviceConfigurationChange once IO is quiesced. */
 OSStatus OzzyHAL::RequestSampleRate(Float64 rate) {
     if (!mIsDynacord || !mSHM) return kAudioHardwareUnsupportedOperationError;
     if (rate == mCurrentStreamFormat.mSampleRate) return kAudioHardwareNoError;
@@ -747,11 +773,21 @@ OSStatus OzzyHAL::RequestSampleRate(Float64 rate) {
     return mHost->RequestDeviceConfigurationChange(mHost, kOzzyDeviceID, (UInt64)rate, nullptr);
 }
 
-/* Hand the rate to the engine (kext or daemon) and wait for it to restart the
- * stream at that rate in a new session, then pick up the new ring and timing
- * layout. */
-OSStatus OzzyHAL::PerformSampleRateChange(UInt64 rate) {
+/* On the main device: hand the rate to the engine (kext or daemon) and wait for
+ * it to restart the stream at that rate in a new session, pick up the new ring
+ * and timing layout, then schedule the same change on the mono devices, which
+ * share the engine. On a mono device the engine has already switched, so
+ * only its own timeline and rate are refreshed. */
+OSStatus OzzyHAL::PerformDeviceConfigurationChange(AudioObjectID device, UInt64 rate) {
     if (!mIsDynacord) return kAudioHardwareNoError;
+    const int index = DeviceIndex(device);
+    if (index < 0) return kAudioHardwareBadObjectError;
+    if (index > 0) {
+        mDevices[index].anchorSample = mDevices[index].anchorHost = 0;
+        mDevices[index].seed++;
+        NotifyDeviceChanged(device, kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal);
+        return kAudioHardwareNoError;
+    }
     // Counted as an IO client for the duration, so the monitor defers any
     // unmap until we return; and its session check stands aside meanwhile.
     struct Hold {
@@ -774,11 +810,14 @@ OSStatus OzzyHAL::PerformSampleRateChange(UInt64 rate) {
                 return kAudioHardwareUnspecifiedError;
             }
             mLastSessionID = mSHM->sessionID;
-            mLastAnchorSample = mLastAnchorHost = 0;
-            mTimestampSeed++;
+            // Every timeline restarts. A running mono device's IO thread owns its
+            // anchor: it sees the sample time go back and moves on by itself.
+            mDevices[0].anchorSample = mDevices[0].anchorHost = 0;
+            for (DeviceState& d : mDevices) d.seed++;
             LogOzzyHAL("rate changed to %{public}llu Hz", rate);
-            AudioObjectPropertyAddress a = { kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
-            mHost->PropertiesChanged(mHost, kOzzyDeviceID, 1, &a);
+            NotifyDeviceChanged(kOzzyDeviceID, kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal);
+            for (UInt32 i = 1; i < OzzyDeviceCount(true, mIsDynacord); i++)
+                mHost->RequestDeviceConfigurationChange(mHost, kOzzyDevices[i].device, rate, nullptr);
             return kAudioHardwareNoError;
         }
     }
@@ -787,7 +826,10 @@ OSStatus OzzyHAL::PerformSampleRateChange(UInt64 rate) {
 }
 
 HRESULT OzzyHAL::GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID, Float64* outSampleTime, UInt64* outHostTime, UInt64* outSeed) {
+    const int index = DeviceIndex(inDeviceObjectID);
+    if (index < 0) return kAudioHardwareBadObjectError;
     if (!mSHM || mMappingDead.load()) return kAudioHardwareNotRunningError;
+    DeviceState& dev = mDevices[index];
 
     auto& ts = mSHM->audio.timestamp;
     uint64_t sTime = 0, hTime = 0;
@@ -804,24 +846,24 @@ HRESULT OzzyHAL::GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioObje
     }
     if (!got) {
         // Never got a consistent read: serve the last anchor we had.
-        sTime = mLastAnchorSample;
-        hTime = mLastAnchorHost;
+        sTime = dev.anchorSample;
+        hTime = dev.anchorHost;
     }
 
     // No anchor ever published: never hand CoreAudio a (0, 0) anchor.
-    if (hTime == 0 && mLastAnchorHost == 0) return kAudioHardwareNotRunningError;
-    if (hTime == 0 && mLastAnchorHost != 0) {
+    if (hTime == 0 && dev.anchorHost == 0) return kAudioHardwareNotRunningError;
+    if (hTime == 0 && dev.anchorHost != 0) {
         // The engine is restarting and has no anchor yet: keep serving the last one.
-        sTime = mLastAnchorSample;
-        hTime = mLastAnchorHost;
+        sTime = dev.anchorSample;
+        hTime = dev.anchorHost;
     } else if (hTime != 0) {
-        if (sTime < mLastAnchorSample) mTimestampSeed++;   // a new timeline started
-        mLastAnchorSample = sTime;
-        mLastAnchorHost = hTime;
+        if (sTime < dev.anchorSample) dev.seed++;   // a new timeline started
+        dev.anchorSample = sTime;
+        dev.anchorHost = hTime;
     }
     if (outSampleTime) *outSampleTime = (Float64)sTime;
     if (outHostTime) *outHostTime = hTime;
-    if (outSeed) *outSeed = mTimestampSeed;
+    if (outSeed) *outSeed = dev.seed.load();
     
     return kAudioHardwareNoError;
 }
@@ -830,7 +872,7 @@ OSStatus OzzyHAL::ioOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID
     if (!mSHM || mMappingDead.load() || !mInputBufferAddr || !mOutputBufferAddr) return kAudioHardwareNoError;
 
     if (inOperationID == kAudioServerPlugInIOOperationWriteMix) {
-        if (mWriteOutput) {
+        if (mWriteOutput && inStreamObjectID == kOzzyOutputStreamID) {
             uint64_t sampleTime = (uint64_t)inIOCycleInfo->mOutputTime.mSampleTime;
             const float gain = mMuted.load() ? 0.0f : OzzyVolumeScalarToGain(mVolumeScalar.load());
             OzzyApplyGainRamp((float*)ioMainBuffer, inIOBufferFrameSize, mChannels, mAppliedGain, gain);
@@ -840,36 +882,57 @@ OSStatus OzzyHAL::ioOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID
         }
     }
     else if (inOperationID == kAudioServerPlugInIOOperationReadInput) {
-        if (mReadInput) {
-            uint64_t sampleTime = (uint64_t)inIOCycleInfo->mInputTime.mSampleTime;
+        const int index = DeviceIndex(inStreamObjectID);
+        uint64_t sampleTime = (uint64_t)inIOCycleInfo->mInputTime.mSampleTime;
+        if (index == 0 && mReadInput) {
             mReadInput((float*)ioMainBuffer, mInputBufferAddr, sampleTime, inIOBufferFrameSize, mRingSizeIn, mInputBytesPerFrame);
+        } else if (index > 0) {
+            // A rate change restarts the engine under a running mono device
+            // before the host gets to stop it: hand it silence meanwhile.
+            if (mRateChangeActive.load())
+                memset(ioMainBuffer, 0, (size_t)inIOBufferFrameSize * sizeof(float));
+            else
+                DynacordReadInputChannel((float*)ioMainBuffer, mInputBufferAddr, sampleTime, inIOBufferFrameSize, mRingSizeIn, mInputBytesPerFrame, kOzzyDevices[index].inputChannel);
         }
     }
     return kAudioHardwareNoError;
 }
 
-CFStringRef OzzyHAL::GetDeviceName() const { return mModelUID; }
+CFStringRef OzzyHAL::GetDeviceName(int device) const { return mDevices[device].name ? mDevices[device].name : mModelUID; }
 CFStringRef OzzyHAL::GetManufacturer() const { return mManufacturerUID; }
-CFStringRef OzzyHAL::GetDeviceUID() const { return mDeviceUID; }
-CFStringRef OzzyHAL::GetModelUID() const { return mModelUID; }
+CFStringRef OzzyHAL::GetDeviceUID(int device) const { return mDevices[device].uid; }
+CFStringRef OzzyHAL::GetModelUID(int device) const { return mDevices[device].model; }
 UInt32 OzzyHAL::GetTransportType() const { return kAudioDeviceTransportTypeUSB; }
 UInt32 OzzyHAL::GetClockDomain() const { return 0x504C4F59; }
 Float64 OzzyHAL::GetNominalSampleRate() const { return mCurrentStreamFormat.mSampleRate; }
-AudioBufferList* OzzyHAL::GetInputStreamConfiguration() const { return const_cast<AudioBufferList*>(&mInputConfig); }
-AudioBufferList* OzzyHAL::GetOutputStreamConfiguration() const { return const_cast<AudioBufferList*>(&mOutputConfig); }
-AudioObjectID OzzyHAL::GetInputStreamID() const { return kOzzyInputStreamID; }
-AudioObjectID OzzyHAL::GetOutputStreamID() const { return kOzzyOutputStreamID; }
-AudioStreamBasicDescription OzzyHAL::GetStreamFormat() const { return mCurrentStreamFormat; }
+AudioBufferList* OzzyHAL::GetInputStreamConfiguration(int device) const {
+    return const_cast<AudioBufferList*>(kOzzyDevices[device].inputChannel ? &mMonoInputConfig : &mInputConfig);
+}
+AudioBufferList* OzzyHAL::GetOutputStreamConfiguration(int device) const {
+    return const_cast<AudioBufferList*>(kOzzyDevices[device].outputStream ? &mOutputConfig : &mNoConfig);
+}
+AudioStreamBasicDescription OzzyHAL::GetStreamFormat(int device) const {
+    AudioStreamBasicDescription f = mCurrentStreamFormat;
+    f.mChannelsPerFrame = GetChannelCount(device);
+    f.mBytesPerFrame = f.mBytesPerPacket = 4 * f.mChannelsPerFrame;
+    return f;
+}
 UInt32 OzzyHAL::GetZeroTimestampPeriod() const { return mZeroTimestampPeriod; }
 
 /* The CMS 600-3 labels its first pair of each scope as speakers and the rest
- * by position; the Ploytec devices leave every channel unlabelled. */
-AudioChannelLayout* OzzyHAL::GetPreferredChannelLayout(AudioObjectPropertyScope inScope) {
-    AudioChannelLayout* layout = (AudioChannelLayout*)mChannelLayoutBuffer;
+ * by position, and its mono devices as mono; the Ploytec devices leave every
+ * channel unlabelled. */
+void OzzyHAL::FillPreferredChannelLayout(int device, AudioObjectPropertyScope inScope, AudioChannelLayout* layout) const {
+    const UInt32 channels = GetChannelCount(device);
     layout->mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
     layout->mChannelBitmap = 0;
-    layout->mNumberChannelDescriptions = mChannels;
-    for (UInt32 i = 0; i < mChannels; ++i) {
+    layout->mNumberChannelDescriptions = channels;
+    if (kOzzyDevices[device].inputChannel) {
+        layout->mChannelDescriptions[0].mChannelLabel = kAudioChannelLabel_Mono;
+        layout->mChannelDescriptions[0].mChannelFlags = kAudioChannelFlags_AllOff;
+        return;
+    }
+    for (UInt32 i = 0; i < channels; ++i) {
         AudioChannelLabel label = kAudioChannelLabel_Unknown;
         const OzzyChannelInfo* info = mIsDynacord ? OzzyDynacordChannel(IsOutputScope(inScope), i + 1) : nullptr;
         if (info) {
@@ -882,22 +945,26 @@ AudioChannelLayout* OzzyHAL::GetPreferredChannelLayout(AudioObjectPropertyScope 
         layout->mChannelDescriptions[i].mChannelLabel = label;
         layout->mChannelDescriptions[i].mChannelFlags = kAudioChannelFlags_AllOff;
     }
-    return layout;
 }
 
-UInt32 OzzyHAL::GetPreferredChannelLayoutSize(AudioObjectPropertyScope inScope) const {
-    return offsetof(AudioChannelLayout, mChannelDescriptions) + (mChannels * sizeof(AudioChannelDescription));
+UInt32 OzzyHAL::GetPreferredChannelLayoutSize(int device) const {
+    return offsetof(AudioChannelLayout, mChannelDescriptions) + (GetChannelCount(device) * sizeof(AudioChannelDescription));
 }
 
-/* A +1 name for a CMS 600-3 channel, or nullptr where the channel has none. */
-CFStringRef OzzyHAL::CopyChannelName(AudioObjectPropertyScope scope, AudioObjectPropertyElement element) const {
-    if (!mIsDynacord || element > mChannels) return nullptr;
+/* A +1 name for a CMS 600-3 channel, or nullptr where the channel has none.
+ * A mono device's only channel is input element 1, named after its source. */
+CFStringRef OzzyHAL::CopyChannelName(int device, AudioObjectPropertyScope scope, AudioObjectPropertyElement element) const {
+    if (!mIsDynacord || element < 1 || element > GetChannelCount(device)) return nullptr;
     if (scope != kAudioObjectPropertyScopeInput && scope != kAudioObjectPropertyScopeOutput) return nullptr;
-    const OzzyChannelInfo* info = OzzyDynacordChannel(scope == kAudioObjectPropertyScopeOutput, element);
+    const uint32_t source = kOzzyDevices[device].inputChannel;
+    if (source && scope != kAudioObjectPropertyScopeInput) return nullptr;
+    const OzzyChannelInfo* info = OzzyDynacordChannel(scope == kAudioObjectPropertyScopeOutput, source ? source : element);
     return info ? CFStringCreateWithCString(NULL, info->name, kCFStringEncodingUTF8) : nullptr;
 }
 
-OzzyStereoPair OzzyHAL::GetStereoPair(AudioObjectPropertyScope scope) const {
+/* A mono device offers its one channel as both sides of the pair. */
+OzzyStereoPair OzzyHAL::GetStereoPair(int device, AudioObjectPropertyScope scope) const {
+    if (kOzzyDevices[device].inputChannel) return { 1, 1 };
     const std::atomic<uint32_t>& stored = IsOutputScope(scope) ? mStereoPairOut : mStereoPairIn;
     return OzzyStereoPairFor(OzzyStereoPairUnpack(stored.load()), mChannels);
 }
@@ -908,7 +975,7 @@ OSStatus OzzyHAL::SetStereoPair(AudioObjectPropertyScope scope, OzzyStereoPair p
     std::atomic<uint32_t>& stored = output ? mStereoPairOut : mStereoPairIn;
     if (stored.exchange(OzzyStereoPairPack(pair)) == OzzyStereoPairPack(pair)) return kAudioHardwareNoError;
     LogOzzyHAL("%{public}s stereo pair %{public}u,%{public}u", output ? "output" : "input", pair.left, pair.right);
-    NotifyDeviceChanged(kAudioDevicePropertyPreferredChannelsForStereo, output ? kAudioObjectPropertyScopeOutput : kAudioObjectPropertyScopeInput);
+    NotifyDeviceChanged(kOzzyDeviceID, kAudioDevicePropertyPreferredChannelsForStereo, output ? kAudioObjectPropertyScopeOutput : kAudioObjectPropertyScopeInput);
     if (mHost) WriteStereoPairToStorage(mHost, output ? kOutputStereoPairStorageKey : kInputStereoPairStorageKey, pair);
     return kAudioHardwareNoError;
 }
@@ -922,9 +989,14 @@ extern "C" HRESULT OzzyCreateDevice(AudioServerPlugInDriverRef, CFDictionaryRef,
 extern "C" HRESULT OzzyDestroyDevice(AudioServerPlugInDriverRef, AudioObjectID) { return kAudioHardwareNoError; }
 extern "C" HRESULT OzzyAddDeviceClient(AudioServerPlugInDriverRef, AudioObjectID, const AudioServerPlugInClientInfo*) { return kAudioHardwareNoError; }
 extern "C" HRESULT OzzyRemoveDeviceClient(AudioServerPlugInDriverRef, AudioObjectID, const AudioServerPlugInClientInfo*) { return kAudioHardwareNoError; }
-extern "C" HRESULT OzzyPerformDeviceConfigurationChange(AudioServerPlugInDriverRef, AudioObjectID, UInt64 inChangeAction, void*) {
-    return OzzyHAL::Get().PerformSampleRateChange(inChangeAction);
+extern "C" HRESULT OzzyPerformDeviceConfigurationChange(AudioServerPlugInDriverRef, AudioObjectID inDeviceObjectID, UInt64 inChangeAction, void*) {
+    return OzzyHAL::Get().PerformDeviceConfigurationChange(inDeviceObjectID, inChangeAction);
 }
+
+/* The device an object belongs to, or -1: see OzzyHAL::DeviceIndex. */
+static int DeviceOf(AudioObjectID inObjectID) { return OzzyHAL::Get().DeviceIndex(inObjectID); }
+static bool IsDevice(AudioObjectID inObjectID) { return DeviceOf(inObjectID) >= 0 && !OzzyIsStream(inObjectID); }
+static bool IsStream(AudioObjectID inObjectID) { return DeviceOf(inObjectID) >= 0 && OzzyIsStream(inObjectID); }
 extern "C" HRESULT OzzyAbortDeviceConfigurationChange(AudioServerPlugInDriverRef, AudioObjectID, UInt64, void*) { return kAudioHardwareNoError; }
 
 extern "C" Boolean OzzyHasProperty(AudioServerPlugInDriverRef, AudioObjectID inObjectID, pid_t, const AudioObjectPropertyAddress* inAddress) {
@@ -937,7 +1009,7 @@ extern "C" Boolean OzzyHasProperty(AudioServerPlugInDriverRef, AudioObjectID inO
         }
         return false;
     }
-    if (inObjectID == kOzzyDeviceID) {
+    if (IsDevice(inObjectID)) {
         switch (inAddress->mSelector) {
             case kAudioObjectPropertyBaseClass: case kAudioObjectPropertyClass:
             case kAudioObjectPropertyName: case kAudioObjectPropertyManufacturer:
@@ -949,9 +1021,11 @@ extern "C" Boolean OzzyHasProperty(AudioServerPlugInDriverRef, AudioObjectID inO
             case kAudioDevicePropertyStreamConfiguration: case kAudioDevicePropertyLatency:
             case kAudioDevicePropertySafetyOffset: case kAudioDevicePropertyPreferredChannelLayout:
             case kAudioDevicePropertyZeroTimeStampPeriod: case kAudioObjectPropertyOwnedObjects:
-            case kAudioObjectPropertyControlList: case kAudioDevicePropertyPreferredChannelsForStereo: return true;
+            case kAudioObjectPropertyControlList: case kAudioDevicePropertyPreferredChannelsForStereo:
+            case kAudioDevicePropertyClockDomain: case kAudioDevicePropertyRelatedDevices:
+            case kAudioDevicePropertyDeviceCanBeDefaultDevice: case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: return true;
             case kAudioObjectPropertyElementName: {
-                CFStringRef name = OzzyHAL::Get().CopyChannelName(inAddress->mScope, inAddress->mElement);
+                CFStringRef name = OzzyHAL::Get().CopyChannelName(DeviceOf(inObjectID), inAddress->mScope, inAddress->mElement);
                 if (name) CFRelease(name);
                 return name != nullptr;
             }
@@ -974,7 +1048,7 @@ extern "C" Boolean OzzyHasProperty(AudioServerPlugInDriverRef, AudioObjectID inO
         }
         return inAddress->mSelector == kAudioBooleanControlPropertyValue;
     }
-    if (inObjectID == kOzzyOutputStreamID || inObjectID == kOzzyInputStreamID) {
+    if (IsStream(inObjectID)) {
         switch (inAddress->mSelector) {
             case kAudioObjectPropertyBaseClass: case kAudioObjectPropertyClass:
             case kAudioObjectPropertyName: case kAudioObjectPropertyOwner:
@@ -1008,21 +1082,26 @@ extern "C" HRESULT OzzyGetPropertyDataSize(AudioServerPlugInDriverRef, AudioObje
     if (inObjectID == kAudioObjectPlugInObject) {
         switch (inAddress->mSelector) {
             case kAudioPlugInPropertyDeviceList: case kAudioObjectPropertyOwnedObjects:
-                *outDataSize = OzzyHAL::Get().IsConnected() ? sizeof(AudioObjectID) : 0; return kAudioHardwareNoError;
+                *outDataSize = OzzyHAL::Get().PublishedDeviceCount() * sizeof(AudioObjectID); return kAudioHardwareNoError;
             case kAudioObjectPropertyControlList: *outDataSize = 0; return kAudioHardwareNoError;
             case kAudioObjectPropertyName: case kAudioObjectPropertyManufacturer: *outDataSize = sizeof(CFStringRef); return kAudioHardwareNoError;
             case kAudioObjectPropertyBaseClass: case kAudioObjectPropertyClass: *outDataSize = sizeof(AudioClassID); return kAudioHardwareNoError;
             default: return kAudioHardwareUnknownPropertyError;
         }
     }
-    if (inObjectID == kOzzyDeviceID) {
+    if (IsDevice(inObjectID)) {
+        const int dev = DeviceOf(inObjectID);
+        const bool main = inObjectID == kOzzyDeviceID;
         switch (inAddress->mSelector) {
             case kAudioObjectPropertyName: case kAudioObjectPropertyManufacturer:
             case kAudioDevicePropertyDeviceUID: case kAudioDevicePropertyModelUID:
                 *outDataSize = sizeof(CFStringRef); return kAudioHardwareNoError;
             case kAudioObjectPropertyControlList:
-                *outDataSize = IsOutputScope(inAddress->mScope) ? sizeof(kOzzyControls) : 0; return kAudioHardwareNoError;
-            case kAudioObjectPropertyOwnedObjects: *outDataSize = sizeof(kOzzyDeviceOwned); return kAudioHardwareNoError;
+                *outDataSize = main && IsOutputScope(inAddress->mScope) ? sizeof(kOzzyControls) : 0; return kAudioHardwareNoError;
+            case kAudioObjectPropertyOwnedObjects: *outDataSize = main ? sizeof(kOzzyDeviceOwned) : sizeof(AudioObjectID); return kAudioHardwareNoError;
+            case kAudioDevicePropertyRelatedDevices: *outDataSize = OzzyHAL::Get().PublishedDeviceCount() * sizeof(AudioObjectID); return kAudioHardwareNoError;
+            case kAudioDevicePropertyClockDomain: case kAudioDevicePropertyDeviceCanBeDefaultDevice:
+            case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: *outDataSize = sizeof(UInt32); return kAudioHardwareNoError;
             case kAudioObjectPropertyOwner: *outDataSize = sizeof(AudioObjectID); return kAudioHardwareNoError;
             case kAudioObjectPropertyBaseClass: case kAudioObjectPropertyClass: *outDataSize = sizeof(AudioClassID); return kAudioHardwareNoError;
             case kAudioDevicePropertyTransportType: case kAudioDevicePropertyIsHidden:
@@ -1032,18 +1111,18 @@ extern "C" HRESULT OzzyGetPropertyDataSize(AudioServerPlugInDriverRef, AudioObje
             case kAudioDevicePropertyAvailableNominalSampleRates: *outDataSize = OzzyHAL::Get().GetAvailableSampleRateCount() * sizeof(AudioValueRange); return kAudioHardwareNoError;
             case kAudioDevicePropertyStreams:
                 if (inAddress->mScope == kAudioObjectPropertyScopeInput) *outDataSize = sizeof(AudioObjectID);
-                else if (IsOutputScope(inAddress->mScope)) *outDataSize = sizeof(AudioObjectID);
-                else if (inAddress->mScope == kAudioObjectPropertyScopeGlobal) *outDataSize = 2 * sizeof(AudioObjectID);
+                else if (inAddress->mScope == kAudioObjectPropertyScopeOutput) *outDataSize = main ? sizeof(AudioObjectID) : 0;
+                else if (inAddress->mScope == kAudioObjectPropertyScopeGlobal) *outDataSize = (main ? 2 : 1) * sizeof(AudioObjectID);
                 else *outDataSize = 0;
                 return kAudioHardwareNoError;
             case kAudioDevicePropertyStreamConfiguration:
-                *outDataSize = GetAudioBufferListSize((IsOutputScope(inAddress->mScope) ? OzzyHAL::Get().GetOutputStreamConfiguration() : OzzyHAL::Get().GetInputStreamConfiguration())->mNumberBuffers);
+                *outDataSize = GetAudioBufferListSize((IsOutputScope(inAddress->mScope) ? OzzyHAL::Get().GetOutputStreamConfiguration(dev) : OzzyHAL::Get().GetInputStreamConfiguration(dev))->mNumberBuffers);
                 return kAudioHardwareNoError;
             case kAudioDevicePropertySafetyOffset: case kAudioDevicePropertyLatency: case kAudioDevicePropertyZeroTimeStampPeriod: *outDataSize = sizeof(UInt32); return kAudioHardwareNoError;
-            case kAudioDevicePropertyPreferredChannelLayout: *outDataSize = OzzyHAL::Get().GetPreferredChannelLayoutSize(inAddress->mScope); return kAudioHardwareNoError;
+            case kAudioDevicePropertyPreferredChannelLayout: *outDataSize = OzzyHAL::Get().GetPreferredChannelLayoutSize(dev); return kAudioHardwareNoError;
             case kAudioDevicePropertyPreferredChannelsForStereo: *outDataSize = 2 * sizeof(UInt32); return kAudioHardwareNoError;
             case kAudioObjectPropertyElementName: {
-                CFStringRef name = OzzyHAL::Get().CopyChannelName(inAddress->mScope, inAddress->mElement);
+                CFStringRef name = OzzyHAL::Get().CopyChannelName(dev, inAddress->mScope, inAddress->mElement);
                 if (!name) return kAudioHardwareUnknownPropertyError;
                 CFRelease(name);
                 *outDataSize = sizeof(CFStringRef); return kAudioHardwareNoError;
@@ -1051,7 +1130,7 @@ extern "C" HRESULT OzzyGetPropertyDataSize(AudioServerPlugInDriverRef, AudioObje
             default: return kAudioHardwareUnknownPropertyError;
         }
     }
-    if (inObjectID == kOzzyOutputStreamID || inObjectID == kOzzyInputStreamID) {
+    if (IsStream(inObjectID)) {
         switch (inAddress->mSelector) {
             case kAudioObjectPropertyBaseClass: case kAudioObjectPropertyClass: *outDataSize = sizeof(AudioClassID); return kAudioHardwareNoError;
             case kAudioObjectPropertyName: *outDataSize = sizeof(CFStringRef); return kAudioHardwareNoError;
@@ -1086,12 +1165,19 @@ extern "C" HRESULT OzzyGetPropertyDataSize(AudioServerPlugInDriverRef, AudioObje
     return kAudioHardwareBadObjectError;
 }
 
+/* The devices the attached hardware publishes, main device first. */
+static OSStatus WriteDeviceList(UInt32 inMax, UInt32* outSize, void* outData) {
+    AudioObjectID ids[kOzzyMaxDevices];
+    const UInt32 n = OzzyHAL::Get().PublishedDeviceCount();
+    for (UInt32 i = 0; i < n; i++) ids[i] = kOzzyDevices[i].device;
+    return WriteObjectIDs(inMax, outSize, outData, ids, n);
+}
+
 extern "C" HRESULT OzzyGetPropertyData(AudioServerPlugInDriverRef, AudioObjectID inObjectID, pid_t, const AudioObjectPropertyAddress* inAddress, UInt32, const void*, UInt32 inMax, UInt32* outSize, void* outData) {
     if (inObjectID == kAudioObjectPlugInObject) {
         switch (inAddress->mSelector) {
             case kAudioPlugInPropertyDeviceList: case kAudioObjectPropertyOwnedObjects:
-                if (!OzzyHAL::Get().IsConnected()) { if (outSize) *outSize = 0; return kAudioHardwareNoError; }
-                return WriteObjectID(inMax, outSize, outData, kOzzyDeviceID);
+                return WriteDeviceList(inMax, outSize, outData);
             case kAudioObjectPropertyControlList: if (outSize) *outSize = 0; return kAudioHardwareNoError;
             case kAudioObjectPropertyName: return WriteCFString(inMax, outSize, outData, CFSTR("Ozzy HAL"));
             case kAudioObjectPropertyManufacturer: return WriteCFString(inMax, outSize, outData, CFSTR("Ozzy"));
@@ -1100,22 +1186,30 @@ extern "C" HRESULT OzzyGetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
             default: return kAudioHardwareUnknownPropertyError;
         }
     }
-    if (inObjectID == kOzzyDeviceID) {
+    if (IsDevice(inObjectID)) {
+        const int dev = DeviceOf(inObjectID);
+        const bool main = inObjectID == kOzzyDeviceID;
+        const OzzyDeviceInfo& info = kOzzyDevices[dev];
         switch (inAddress->mSelector) {
             case kAudioObjectPropertyBaseClass: return WriteClassID(inMax, outSize, outData, kAudioObjectClassID);
             case kAudioObjectPropertyClass: return WriteClassID(inMax, outSize, outData, kAudioDeviceClassID);
             case kAudioObjectPropertyControlList:
-                if (!IsOutputScope(inAddress->mScope)) { if (outSize) *outSize = 0; return kAudioHardwareNoError; }
+                if (!main || !IsOutputScope(inAddress->mScope)) { if (outSize) *outSize = 0; return kAudioHardwareNoError; }
                 return WriteObjectIDs(inMax, outSize, outData, kOzzyControls, 2);
             case kAudioObjectPropertyOwner: return WriteObjectID(inMax, outSize, outData, kAudioObjectPlugInObject);
-            case kAudioObjectPropertyName: return WriteCFString(inMax, outSize, outData, OzzyHAL::Get().GetDeviceName());
+            case kAudioObjectPropertyName: return WriteCFString(inMax, outSize, outData, OzzyHAL::Get().GetDeviceName(dev));
             case kAudioObjectPropertyManufacturer: return WriteCFString(inMax, outSize, outData, OzzyHAL::Get().GetManufacturer());
-            case kAudioDevicePropertyDeviceUID: return WriteCFString(inMax, outSize, outData, OzzyHAL::Get().GetDeviceUID());
-            case kAudioDevicePropertyModelUID: return WriteCFString(inMax, outSize, outData, OzzyHAL::Get().GetModelUID());
+            case kAudioDevicePropertyDeviceUID: return WriteCFString(inMax, outSize, outData, OzzyHAL::Get().GetDeviceUID(dev));
+            case kAudioDevicePropertyModelUID: return WriteCFString(inMax, outSize, outData, OzzyHAL::Get().GetModelUID(dev));
             case kAudioDevicePropertyTransportType: return WriteUInt32(inMax, outSize, outData, OzzyHAL::Get().GetTransportType());
             case kAudioDevicePropertyIsHidden: return WriteUInt32(inMax, outSize, outData, 0);
             case kAudioDevicePropertyDeviceIsAlive: return WriteUInt32(inMax, outSize, outData, OzzyHAL::Get().IsConnected() ? 1 : 0);
-            case kAudioDevicePropertyDeviceIsRunning: case kAudioDevicePropertyDeviceIsRunningSomewhere: return WriteUInt32(inMax, outSize, outData, OzzyHAL::Get().IsRunning() ? 1 : 0);
+            case kAudioDevicePropertyDeviceIsRunning: case kAudioDevicePropertyDeviceIsRunningSomewhere: return WriteUInt32(inMax, outSize, outData, OzzyHAL::Get().IsRunning(dev) ? 1 : 0);
+            // A mono device is only ever an input, and never the alert device
+            case kAudioDevicePropertyDeviceCanBeDefaultDevice:
+                return WriteUInt32(inMax, outSize, outData, main || inAddress->mScope == kAudioObjectPropertyScopeInput ? 1 : 0);
+            case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice: return WriteUInt32(inMax, outSize, outData, main ? 1 : 0);
+            case kAudioDevicePropertyRelatedDevices: return WriteDeviceList(inMax, outSize, outData);
             case kAudioDevicePropertyNominalSampleRate: return WriteFloat64(inMax, outSize, outData, OzzyHAL::Get().GetNominalSampleRate());
             case kAudioDevicePropertyAvailableNominalSampleRates: {
                 UInt32 n = std::min<UInt32>(inMax / sizeof(AudioValueRange), OzzyHAL::Get().GetAvailableSampleRateCount());
@@ -1124,14 +1218,15 @@ extern "C" HRESULT OzzyGetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
                 return kAudioHardwareNoError;
             }
             case kAudioDevicePropertyStreams: {
-                UInt32 streamList[] = { kOzzyInputStreamID, kOzzyOutputStreamID };
-                if (inAddress->mScope == kAudioObjectPropertyScopeInput) return WriteObjectID(inMax, outSize, outData, kOzzyInputStreamID);
-                else if (inAddress->mScope == kAudioObjectPropertyScopeOutput) return WriteObjectID(inMax, outSize, outData, kOzzyOutputStreamID);
-                else { if (outData && inMax < sizeof(streamList)) return kAudioHardwareBadPropertySizeError; if (outData) memcpy(outData, streamList, sizeof(streamList)); if (outSize) *outSize = sizeof(streamList); return kAudioHardwareNoError; }
+                const AudioObjectID streamList[] = { info.inputStream, info.outputStream };
+                if (inAddress->mScope == kAudioObjectPropertyScopeInput) return WriteObjectID(inMax, outSize, outData, info.inputStream);
+                else if (inAddress->mScope == kAudioObjectPropertyScopeOutput) return WriteObjectIDs(inMax, outSize, outData, &streamList[1], main ? 1 : 0);
+                else return WriteObjectIDs(inMax, outSize, outData, streamList, main ? 2 : 1);
             }
-            case kAudioObjectPropertyOwnedObjects: return WriteObjectIDs(inMax, outSize, outData, kOzzyDeviceOwned, 4);
+            case kAudioObjectPropertyOwnedObjects:
+                return main ? WriteObjectIDs(inMax, outSize, outData, kOzzyDeviceOwned, 4) : WriteObjectID(inMax, outSize, outData, info.inputStream);
             case kAudioDevicePropertyStreamConfiguration: {
-                AudioBufferList* config = (inAddress->mScope == kAudioObjectPropertyScopeInput) ? OzzyHAL::Get().GetInputStreamConfiguration() : OzzyHAL::Get().GetOutputStreamConfiguration();
+                AudioBufferList* config = (inAddress->mScope == kAudioObjectPropertyScopeInput) ? OzzyHAL::Get().GetInputStreamConfiguration(dev) : OzzyHAL::Get().GetOutputStreamConfiguration(dev);
                 UInt32 actualSize = GetAudioBufferListSize(config->mNumberBuffers); if (outSize) *outSize = actualSize;
                 if (outData) { if (inMax < actualSize) return kAudioHardwareBadPropertySizeError; memcpy(outData, config, actualSize); } return kAudioHardwareNoError;
             }
@@ -1140,21 +1235,21 @@ extern "C" HRESULT OzzyGetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
             case kAudioDevicePropertySafetyOffset: return WriteUInt32(inMax, outSize, outData, OzzyHAL::Get().GetSafetyOffset(inAddress->mScope));
             case kAudioDevicePropertyZeroTimeStampPeriod: return WriteUInt32(inMax, outSize, outData, OzzyHAL::Get().GetZeroTimestampPeriod());
             case kAudioDevicePropertyPreferredChannelLayout: {
-                UInt32 size = OzzyHAL::Get().GetPreferredChannelLayoutSize(inAddress->mScope);
+                UInt32 size = OzzyHAL::Get().GetPreferredChannelLayoutSize(dev);
                 if (outSize) *outSize = size;
-                if (outData) { if (inMax < size) return kAudioHardwareBadPropertySizeError; memcpy(outData, OzzyHAL::Get().GetPreferredChannelLayout(inAddress->mScope), size); }
+                if (outData) { if (inMax < size) return kAudioHardwareBadPropertySizeError; OzzyHAL::Get().FillPreferredChannelLayout(dev, inAddress->mScope, (AudioChannelLayout*)outData); }
                 return kAudioHardwareNoError;
             }
             case kAudioDevicePropertyPreferredChannelsForStereo: {
                 if (outData && inMax < 2 * sizeof(UInt32)) return kAudioHardwareBadPropertySizeError;
-                const OzzyStereoPair pair = OzzyHAL::Get().GetStereoPair(inAddress->mScope);
+                const OzzyStereoPair pair = OzzyHAL::Get().GetStereoPair(dev, inAddress->mScope);
                 if (outData) { ((UInt32*)outData)[0] = pair.left; ((UInt32*)outData)[1] = pair.right; }
                 if (outSize) *outSize = 2 * sizeof(UInt32);
                 return kAudioHardwareNoError;
             }
             case kAudioObjectPropertyElementName: {
                 if (outData && inMax < sizeof(CFStringRef)) return kAudioHardwareBadPropertySizeError;
-                CFStringRef name = OzzyHAL::Get().CopyChannelName(inAddress->mScope, inAddress->mElement);
+                CFStringRef name = OzzyHAL::Get().CopyChannelName(dev, inAddress->mScope, inAddress->mElement);
                 if (!name) return kAudioHardwareUnknownPropertyError;
                 if (outData) *(CFStringRef*)outData = name; else CFRelease(name);
                 if (outSize) *outSize = sizeof(CFStringRef);
@@ -1163,26 +1258,28 @@ extern "C" HRESULT OzzyGetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
             default: return kAudioHardwareUnknownPropertyError;
         }
     }
-    if (inObjectID == kOzzyOutputStreamID || inObjectID == kOzzyInputStreamID) {
+    if (IsStream(inObjectID)) {
+        const int dev = DeviceOf(inObjectID);
+        const bool mono = kOzzyDevices[dev].inputChannel != 0;
         switch (inAddress->mSelector) {
             case kAudioObjectPropertyBaseClass: return WriteClassID(inMax, outSize, outData, kAudioObjectClassID);
             case kAudioObjectPropertyClass: return WriteClassID(inMax, outSize, outData, kAudioStreamClassID);
             case kAudioObjectPropertyName: return WriteCFString(inMax, outSize, outData, (inObjectID == kOzzyOutputStreamID ? CFSTR("Ozzy PCM Output Stream") : CFSTR("Ozzy PCM Input Stream")));
-            case kAudioObjectPropertyOwner: return WriteObjectID(inMax, outSize, outData, kOzzyDeviceID);
+            case kAudioObjectPropertyOwner: return WriteObjectID(inMax, outSize, outData, kOzzyDevices[dev].device);
             case kAudioStreamPropertyDirection: return WriteUInt32(inMax, outSize, outData, (inObjectID == kOzzyOutputStreamID ? 0 : 1));
-            case kAudioStreamPropertyTerminalType: return WriteUInt32(inMax, outSize, outData, kAudioStreamTerminalTypeSpeaker);
+            case kAudioStreamPropertyTerminalType: return WriteUInt32(inMax, outSize, outData, mono ? kAudioStreamTerminalTypeMicrophone : kAudioStreamTerminalTypeSpeaker);
             case kAudioStreamPropertyStartingChannel: return WriteUInt32(inMax, outSize, outData, 1);
             case kAudioStreamPropertyLatency: return WriteUInt32(inMax, outSize, outData, OzzyHAL::Get().GetLatency());
             case kAudioStreamPropertyVirtualFormat: case kAudioStreamPropertyPhysicalFormat:
                 if (outData && inMax < sizeof(AudioStreamBasicDescription)) return kAudioHardwareBadPropertySizeError;
-                if (outData) *(AudioStreamBasicDescription*)outData = OzzyHAL::Get().GetStreamFormat();
+                if (outData) *(AudioStreamBasicDescription*)outData = OzzyHAL::Get().GetStreamFormat(dev);
                 if (outSize) *outSize = sizeof(AudioStreamBasicDescription); return kAudioHardwareNoError;
             case kAudioStreamPropertyAvailableVirtualFormats: case kAudioStreamPropertyAvailablePhysicalFormats: {
                 UInt32 n = std::min<UInt32>(inMax / sizeof(AudioStreamRangedDescription), OzzyHAL::Get().GetAvailableSampleRateCount());
                 const AudioValueRange* rates = OzzyHAL::Get().GetAvailableSampleRateList();
                 AudioStreamRangedDescription* list = (AudioStreamRangedDescription*)outData;
                 for (UInt32 i = 0; list && i < n; i++) {
-                    list[i].mFormat = OzzyHAL::Get().GetStreamFormat();
+                    list[i].mFormat = OzzyHAL::Get().GetStreamFormat(dev);
                     list[i].mFormat.mSampleRate = rates[i].mMinimum;
                     list[i].mSampleRateRange = rates[i];
                 }
@@ -1253,10 +1350,10 @@ extern "C" HRESULT OzzySetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
     }
     return kAudioHardwareUnsupportedOperationError;
 }
-extern "C" HRESULT OzzyStartIO(AudioServerPlugInDriverRef, AudioObjectID, UInt32) { return OzzyHAL::Get().StartIO(); }
-extern "C" HRESULT OzzyStopIO(AudioServerPlugInDriverRef, AudioObjectID, UInt32) { return OzzyHAL::Get().StopIO(); }
+extern "C" HRESULT OzzyStartIO(AudioServerPlugInDriverRef, AudioObjectID inDeviceObjectID, UInt32) { return OzzyHAL::Get().StartIO(inDeviceObjectID); }
+extern "C" HRESULT OzzyStopIO(AudioServerPlugInDriverRef, AudioObjectID inDeviceObjectID, UInt32) { return OzzyHAL::Get().StopIO(inDeviceObjectID); }
 extern "C" HRESULT OzzyGetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID, Float64* outSampleTime, UInt64* outHostTime, UInt64* outSeed) { return OzzyHAL::Get().GetZeroTimeStamp(inDriver, inDeviceObjectID, inClientID, outSampleTime, outHostTime, outSeed); }
-extern "C" OSStatus OzzyWillDoIOOperation(AudioServerPlugInDriverRef, AudioObjectID, UInt32, UInt32 inOperationID, Boolean* outWillDo, Boolean* outWillDoInPlace) { bool willDo = false; bool willDoInPlace = true; switch (inOperationID) { case kAudioServerPlugInIOOperationWriteMix: case kAudioServerPlugInIOOperationReadInput: willDo = true; break; default: willDo = false; break; } if (outWillDo) *outWillDo = willDo; if (outWillDoInPlace) *outWillDoInPlace = willDoInPlace; return kAudioHardwareNoError; }
+extern "C" OSStatus OzzyWillDoIOOperation(AudioServerPlugInDriverRef, AudioObjectID inDeviceObjectID, UInt32, UInt32 inOperationID, Boolean* outWillDo, Boolean* outWillDoInPlace) { bool willDo = false; bool willDoInPlace = true; switch (inOperationID) { case kAudioServerPlugInIOOperationWriteMix: willDo = inDeviceObjectID == kOzzyDeviceID; break; case kAudioServerPlugInIOOperationReadInput: willDo = true; break; default: willDo = false; break; } if (outWillDo) *outWillDo = willDo; if (outWillDoInPlace) *outWillDoInPlace = willDoInPlace; return kAudioHardwareNoError; }
 extern "C" OSStatus OzzyBeginIOOperation(AudioServerPlugInDriverRef, AudioObjectID, UInt32, UInt32, UInt32, const AudioServerPlugInIOCycleInfo*) { return 0; }
 extern "C" OSStatus OzzyDoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inStreamObjectID, UInt32 inClientID, UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo, void* ioMainBuffer, void* ioSecondaryBuffer) { return OzzyHAL::Get().ioOperation(inDriver, inDeviceObjectID, inStreamObjectID, inClientID, inOperationID, inIOBufferFrameSize, inIOCycleInfo, ioMainBuffer, ioSecondaryBuffer); }
 extern "C" OSStatus OzzyEndIOOperation(AudioServerPlugInDriverRef, AudioObjectID, UInt32, UInt32, UInt32, const AudioServerPlugInIOCycleInfo*) { return 0; }

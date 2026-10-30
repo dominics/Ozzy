@@ -56,6 +56,31 @@ void test_codec_read_input_matches_shared_decoder()
 	}
 }
 
+/* Each channel pulled out alone matches its column of the 4-channel read,
+ * across the ring wrap; anything outside 1-4 reads as silence. */
+void test_codec_read_input_channel()
+{
+	const uint32_t ringFrames = 288;
+	std::vector<uint8_t> ring(ringFrames * kDynacordInFrameBytes);
+	std::srand(2);
+	for (uint8_t& b : ring)
+		b = (uint8_t)std::rand();
+	std::vector<float> all(10 * 4);
+	DynacordReadInput(all.data(), ring.data(), ringFrames - 4, 10, ringFrames, kDynacordInFrameBytes);
+	for (uint32_t c = 1; c <= 4; c++) {
+		std::vector<float> mono(10);
+		DynacordReadInputChannel(mono.data(), ring.data(), ringFrames - 4, 10, ringFrames, kDynacordInFrameBytes, c);
+		for (uint32_t f = 0; f < 10; f++)
+			CHECK(mono[f] == all[f * 4 + c - 1]);
+	}
+	for (uint32_t c : { 0u, 5u }) {
+		std::vector<float> mono(10, 1.0f);
+		DynacordReadInputChannel(mono.data(), ring.data(), 0, 10, ringFrames, kDynacordInFrameBytes, c);
+		for (float v : mono)
+			CHECK(v == 0.0f);
+	}
+}
+
 void test_codec_wrap_large_sample_time()
 {
 	const uint32_t ringFrames = kDynacordOutRingFrames;

@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include "../Shared/OzzySharedData.h"
 #include "OzzyChannels.h"
+#include "OzzyDevices.h"
 
 // Codec function pointer types for device-agnostic encoding/decoding
 typedef void (*PCMEncoderFunc)(uint8_t* dst, const float* src);
@@ -21,12 +22,6 @@ typedef void (*PCMDecoderFunc)(float* dst, const uint8_t* src);
 typedef void (*WriteOutputFunc)(uint8_t* ringBuffer, const float* srcFrames, uint64_t sampleTime, uint32_t frameCount, uint32_t ringSize, uint32_t bytesPerFrame);
 typedef void (*ReadInputFunc)(float* dstFrames, const uint8_t* ringBuffer, uint64_t sampleTime, uint32_t frameCount, uint32_t ringSize, uint32_t bytesPerFrame);
 typedef void (*ClearOutputFunc)(uint8_t* outputBuffer, uint32_t bufferSize);
-
-#define kOzzyDeviceID 100
-#define kOzzyInputStreamID 150
-#define kOzzyOutputStreamID 200
-#define kOzzyVolumeControlID 300
-#define kOzzyMuteControlID 301
 
 class OzzyHAL {
 public:
@@ -36,10 +31,15 @@ public:
     void Cleanup();
 
     bool IsConnected();
-    bool IsRunning() const { return mIOStarted; }
+    bool IsRunning(int device) const { return mDevices[device].clients.load() > 0; }
 
-    kern_return_t StartIO();
-    kern_return_t StopIO();
+    /* Index into kOzzyDevices of a device this plug-in answers for, or of one of
+     * its streams; -1 for anything else. */
+    int DeviceIndex(AudioObjectID object) const { return OzzyDeviceIndex(object, true, mIsDynacord); }
+    UInt32 PublishedDeviceCount() { return OzzyDeviceCount(IsConnected(), mIsDynacord); }
+
+    kern_return_t StartIO(AudioObjectID device);
+    kern_return_t StopIO(AudioObjectID device);
 
     HRESULT GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID, Float64* outSampleTime, UInt64* outHostTime, UInt64* outSeed);
     
@@ -48,18 +48,17 @@ public:
     UInt32 GetAvailableSampleRateCount() const { return mNumSampleRates; }
     const AudioValueRange* GetAvailableSampleRateList() const { return mSampleRateList; }
     OSStatus RequestSampleRate(Float64 rate);
-    OSStatus PerformSampleRateChange(UInt64 rate);
-    AudioBufferList* GetInputStreamConfiguration() const;
-    AudioBufferList* GetOutputStreamConfiguration() const;
-    CFStringRef GetDeviceName() const;
+    OSStatus PerformDeviceConfigurationChange(AudioObjectID device, UInt64 rate);
+    AudioBufferList* GetInputStreamConfiguration(int device) const;
+    AudioBufferList* GetOutputStreamConfiguration(int device) const;
+    CFStringRef GetDeviceName(int device) const;
     CFStringRef GetManufacturer() const;
-    CFStringRef GetDeviceUID() const;
-    CFStringRef GetModelUID() const;
+    CFStringRef GetDeviceUID(int device) const;
+    CFStringRef GetModelUID(int device) const;
     UInt32 GetTransportType() const;
     UInt32 GetClockDomain() const;
-    AudioObjectID GetInputStreamID() const;
-    AudioObjectID GetOutputStreamID() const;
-    AudioStreamBasicDescription GetStreamFormat() const;
+    UInt32 GetChannelCount(int device) const { return kOzzyDevices[device].inputChannel ? 1 : mChannels; }
+    AudioStreamBasicDescription GetStreamFormat(int device) const;
     
     UInt32 GetLatency() const { return 0; }
     UInt32 GetSafetyOffset(AudioObjectPropertyScope scope) const {
@@ -67,8 +66,8 @@ public:
     }
     UInt32 GetZeroTimestampPeriod() const;
     
-    AudioChannelLayout* GetPreferredChannelLayout(AudioObjectPropertyScope inScope);
-    UInt32 GetPreferredChannelLayoutSize(AudioObjectPropertyScope inScope) const;
+    void FillPreferredChannelLayout(int device, AudioObjectPropertyScope inScope, AudioChannelLayout* layout) const;
+    UInt32 GetPreferredChannelLayoutSize(int device) const;
     
     // Output volume and mute, applied to the mix before it is encoded
     Float32 GetVolumeScalar() const { return mVolumeScalar.load(); }
@@ -77,8 +76,8 @@ public:
     void SetMuted(bool muted);
 
     // Per-channel names, and the channels stereo clients use, for each scope
-    CFStringRef CopyChannelName(AudioObjectPropertyScope scope, AudioObjectPropertyElement element) const;
-    OzzyStereoPair GetStereoPair(AudioObjectPropertyScope scope) const;
+    CFStringRef CopyChannelName(int device, AudioObjectPropertyScope scope, AudioObjectPropertyElement element) const;
+    OzzyStereoPair GetStereoPair(int device, AudioObjectPropertyScope scope) const;
     OSStatus SetStereoPair(AudioObjectPropertyScope scope, OzzyStereoPair pair);
 
     OSStatus ioOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inStreamObjectID, UInt32 inClientID, UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo, void* ioMainBuffer, void* ioSecondaryBuffer);
@@ -90,6 +89,18 @@ private:
     CFStringRef mDeviceUID = nullptr;
     CFStringRef mModelUID = nullptr;
     CFStringRef mManufacturerUID = nullptr;
+
+    /* State kept for each entry of kOzzyDevices. */
+    struct DeviceState {
+        std::atomic<uint32_t> clients { 0 };   // StartIO calls minus StopIO calls on this device
+        std::atomic<uint64_t> seed { 1 };      // zero timestamp seed
+        // Last anchor served by GetZeroTimeStamp(), from this device's IO thread
+        uint64_t anchorSample = 0, anchorHost = 0;
+        // UID and model UID derived from mDeviceUID / mModelUID; the main device's are those
+        CFStringRef uid = nullptr, model = nullptr;
+        CFStringRef name = nullptr;   // fixed name, or nullptr for the product name (mModelUID)
+    };
+    DeviceState mDevices[kOzzyMaxDevices];
     
     uint32_t mZeroTimestampPeriod = 640;  // Updated dynamically: 2 URBs * framesPerPacket * 4
     uint8_t* mInputBufferAddr = nullptr;
@@ -111,16 +122,13 @@ private:
     // Set when the mapping must no longer be touched by the IO path but IO is
     // still running; the monitor unmaps once StopIO has been seen.
     std::atomic<bool> mMappingDead { false };
-    std::atomic<uint32_t> mIOClients { 0 };   // StartIO calls minus StopIO calls (one per client), plus a running rate change
+    std::atomic<uint32_t> mIOClients { 0 };   // StartIO calls minus StopIO calls on every device, plus a running rate change
     std::atomic<bool> mRateChangeActive { false };   // PerformSampleRateChange is waiting for the engine
 
     // Daemon liveness (layout v2 only)
     uint32_t mLastHeartbeat = 0;
     uint64_t mHeartbeatSeenAt = 0;       // mach_absolute_time of the last change
 
-    // Last anchor served by GetZeroTimeStamp()
-    uint64_t mLastAnchorSample = 0, mLastAnchorHost = 0;
-    
     // Codec function pointers (set based on device vendor/product ID)
     PCMEncoderFunc mEncode = nullptr;
     PCMDecoderFunc mDecode = nullptr;
@@ -131,17 +139,16 @@ private:
     AudioStreamBasicDescription mCurrentStreamFormat;
     AudioBufferList mInputConfig;
     AudioBufferList mOutputConfig;
+    AudioBufferList mMonoInputConfig;
+    AudioBufferList mNoConfig;   // an input-only device's output scope
     AudioValueRange mSampleRateList[3] = {};
     UInt32 mNumSampleRates = 1;
     
-    bool mIOStarted = false;
-
     std::atomic<Float32> mVolumeScalar { 1.0f };
     std::atomic<bool> mMuted { false };
     float mAppliedGain = 1.0f;   // IO thread only: the gain the last WriteMix ended on
     std::atomic<uint32_t> mStereoPairIn { OzzyStereoPairPack({}) };
     std::atomic<uint32_t> mStereoPairOut { OzzyStereoPairPack({}) };
-    uint32_t mTimestampSeed = 1;
 
     AudioServerPlugInHostRef mHost = nullptr;
     OzzySharedMemory* mSHM = nullptr;
@@ -161,13 +168,14 @@ private:
     std::atomic<bool> mMonitorRunning { false };
     bool mLastConnectedState = false;
     bool mLoggedWaitingForDriver = false;
-    alignas(16) uint8_t mChannelLayoutBuffer[0x50C];
 
     void MapSharedMemory();
     void UnmapSharedMemory();
     static void* MonitorEntry(void* arg);
     void MonitorLoop();
     void RebuildStreamConfigs();
+    void SetIdentity(const char* product, const char* manufacturer, const char* serial);
+    void RebuildDeviceStrings();
     bool ApplyPacketLayout();
     bool ApplyFrameLayout();
     bool FrameLayoutUnchanged() const;
@@ -177,7 +185,8 @@ private:
     void LoadControlState();
     void SaveControlState();
     void NotifyControlChanged(AudioObjectID control, const AudioObjectPropertySelector* selectors, UInt32 count);
-    void NotifyDeviceChanged(AudioObjectPropertySelector selector, AudioObjectPropertyScope scope);
+    void NotifyDeviceChanged(AudioObjectID device, AudioObjectPropertySelector selector, AudioObjectPropertyScope scope);
+    void NotifyAllDevicesChanged(AudioObjectPropertySelector selector);
 };
 
 #endif
