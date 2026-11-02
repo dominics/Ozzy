@@ -17,6 +17,45 @@
 #define FEEDBACK_DEAD_MS 1000   /* feedback without data this long: the device stopped streaming */
 #define ERROR_STREAK     3      /* failed completions in a row on a watched pipe: likewise */
 #define SEGMENT_STALE_MS 1000
+#define START_RATE       48000  /* a device's first start (the highest rate if it has no such rate) */
+#define RATES_KEPT       16
+
+/*
+ * The rate the user last set on each device (by location), for its next drive: a replug, a
+ * handover or a retry starts it at that rate, so a running client gets no rate switch. For the
+ * daemon's lifetime; control thread only.
+ */
+static struct {
+	uint32_t location_id;
+	uint32_t rate;
+} kept_rates[RATES_KEPT];
+static unsigned int kept_next;
+
+static uint32_t kept_rate(uint32_t location_id)
+{
+	unsigned int i;
+
+	for (i = 0; i < RATES_KEPT; i++) {
+		if (kept_rates[i].rate && kept_rates[i].location_id == location_id)
+			return kept_rates[i].rate;
+	}
+	return START_RATE;
+}
+
+static void keep_rate(uint32_t location_id, uint32_t rate)
+{
+	unsigned int i;
+
+	for (i = 0; i < RATES_KEPT; i++) {
+		if (kept_rates[i].rate && kept_rates[i].location_id == location_id) {
+			kept_rates[i].rate = rate;
+			return;
+		}
+	}
+	kept_rates[kept_next].location_id = location_id;
+	kept_rates[kept_next].rate = rate;
+	kept_next = (kept_next + 1) % RATES_KEPT;
+}
 
 /* A registry string of the device ("USB Product Name"...) into @dst */
 static void registry_string(io_service_t service, const char *key, volatile char *dst, size_t size)
@@ -113,7 +152,10 @@ static IOReturn set_rate_locked(struct daemon_device *d, uint32_t rate)
 	change = ozzy_engine_change_rate(d->engine, rate);
 	if (change == OZZY_SETTING_INVALID)
 		return kIOReturnBadArgument;
-	return change == OZZY_SETTING_RESTART ? restart_locked(d) : kIOReturnSuccess;
+	if (change == OZZY_SETTING_RESTART && restart_locked(d) != kIOReturnSuccess)
+		return kIOReturnIOError;
+	keep_rate(d->location_id, rate);
+	return kIOReturnSuccess;
 }
 
 static void poll_fired(CFRunLoopTimerRef timer, void *info)
@@ -380,6 +422,7 @@ enum handover_start device_drive(struct daemon_device *d)
 	ozzy_engine_set_usb_speed(d->engine, ubus_speed(&d->bus));
 	ozzy_engine_set_driver_version(d->engine, OZZY_GIT_VERSION);
 	ozzy_engine_set_anchors(d->engine, true);   /* OzzyHAL's zero timestamps */
+	ozzy_engine_set_rate(d->engine, kept_rate(d->location_id));
 	if (!engine_start(d)) {
 		ozzy_log("  engine start failed");
 		ozzy_engine_stop(d->engine);

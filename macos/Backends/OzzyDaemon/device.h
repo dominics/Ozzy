@@ -49,8 +49,8 @@ struct daemon_device {
 struct daemon_device *device_new(io_service_t service, const struct ozzy_device *model);
 
 /*
- * device_drive - Open the device and drive it: segment, configuration, engine start, timers on
- * the current run loop. HANDOVER_BUSY when another driver or process holds the device or its
+ * device_drive - Open the device and drive it: segment, configuration, engine start (at the
+ * rate last set on a device at its location, else 48 kHz), timers on the current run loop. HANDOVER_BUSY when another driver or process holds the device or its
  * segment, logged only if d->busy_logged is clear (and then set). HANDOVER_UNSUPPORTED for a
  * device it can't drive at all (class compliant, no engine). Anything else that fails is logged
  * and HANDOVER_FAILED. On anything but HANDOVER_STARTED the device is left closed.
