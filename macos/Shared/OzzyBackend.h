@@ -14,6 +14,10 @@
  * trailer is valid; once it isn't, the plug-in unmaps and opens the name again on a later scan.
  * A mailbox call stops the heartbeat while the daemon restarts its engine (about a second, the
  * handshake): while one is in flight, the call's own timeout watches the daemon instead.
+ *
+ * The segment is world-writable by name (the daemon creates it 0666, so coreaudiod and
+ * MIDIServer can map it), so any local user could create it first. The plug-ins only map one
+ * owned by the console user (OzzyConsoleUser), whose daemon is the one that drives the device.
  */
 
 #ifndef OzzyBackend_h
@@ -21,6 +25,7 @@
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
+#include <SystemConfiguration/SystemConfiguration.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -39,6 +44,44 @@ enum class OzzyBackendKind : uint8_t {
 
 /* How long a daemon's heartbeat may stand still before the daemon counts as gone */
 static const uint64_t kOzzyDaemonHeartbeatTimeoutNs = 1000000000ull;
+
+/* The console user, whose daemon drives the devices, into @uid; false if the system won't say */
+static inline bool OzzyConsoleUser(uid_t* uid) {
+    CFStringRef name = SCDynamicStoreCopyConsoleUser(NULL, uid, NULL);
+    if (!name) return false;
+    CFRelease(name);
+    return true;
+}
+
+/* Why OpenDaemon refused a segment that is there (the plug-ins log each new one once) */
+enum class OzzyDaemonRefusal : uint8_t {
+    None,
+    Owner,      // not owned by the owner asked for: value is the segment's uid
+    Version,    // a trailer this plug-in doesn't understand: value is its version
+};
+
+/* The refusals a plug-in has logged, per device location, so a scan each 250 ms logs each once */
+struct OzzyDaemonRefusalLog {
+    static const unsigned int kSize = 8;
+    struct Entry { uint32_t locationID; OzzyDaemonRefusal reason; uint32_t value; } entries[kSize] = {};
+    unsigned int next = 0;
+
+    /* Whether @why / @value for @location is new since the last call for that location (then
+     * remember it). A location that opens again (None) is forgotten, so a later refusal logs. */
+    bool IsNew(uint32_t location, OzzyDaemonRefusal why, uint32_t value) {
+        Entry* e = nullptr;
+        for (unsigned int i = 0; i < kSize && !e; i++)
+            if (entries[i].locationID == location && entries[i].reason != OzzyDaemonRefusal::None) e = &entries[i];
+        if (why == OzzyDaemonRefusal::None) {
+            if (e) *e = Entry {};
+            return false;
+        }
+        if (e && e->reason == why && e->value == value) return false;
+        if (!e) e = &entries[next++ % kSize];
+        *e = Entry { location, why, value };
+        return true;
+    }
+};
 
 struct OzzyBackend {
     OzzyBackendKind kind = OzzyBackendKind::None;
@@ -59,6 +102,10 @@ struct OzzyBackend {
     uint64_t heartbeatSeenNs = 0;
     uint32_t callInFlight = 0;
     uint64_t callEndedNs = 0;
+
+    // Why the last OpenDaemon refused a segment that was there, and the uid or version
+    OzzyDaemonRefusal refusal = OzzyDaemonRefusal::None;
+    uint32_t refusalValue = 0;
 
     bool IsOpen() const { return kind != OzzyBackendKind::None; }
 
@@ -81,24 +128,43 @@ struct OzzyBackend {
     }
 
     /*
-     * Map the daemon segment for the device at @locationID. False (and nothing held) if there is
-     * none, which is the normal state while no daemon drives the device, or it isn't one a
-     * daemon this plug-in understands has set up.
+     * Map the daemon segment for the device at @locationID if user @owner owns it (the plug-ins:
+     * the console user). False (and nothing held) if there is none, which is the normal state
+     * while no daemon drives the device, or it isn't one a daemon this plug-in understands has
+     * set up; refusal says why when a segment was there but refused.
      */
-    bool OpenDaemon(uint32_t locationID) {
+    bool OpenDaemonOwnedBy(uint32_t locationID, uid_t owner) { return MapDaemon(locationID, true, owner); }
+
+    /* Map the daemon segment for the device at @locationID whoever owns it (the daemon's tools,
+     * which serve their own) */
+    bool OpenDaemon(uint32_t locationID) { return MapDaemon(locationID, false, 0); }
+
+    /* OpenDaemonOwnedBy (@checkOwner) or OpenDaemon */
+    bool MapDaemon(uint32_t locationID, bool checkOwner, uid_t owner) {
         char name[OZZY_DAEMON_SEGMENT_NAME_MAX];
         uint64_t need = ozzy_daemon_segment_size(sizeof(ozzy_shared_memory));
         struct stat sb;
 
+        refusal = OzzyDaemonRefusal::None;
+        refusalValue = 0;
         ozzy_daemon_segment_name(name, locationID);
         int fd = shm_open(name, O_RDWR, 0);
         if (fd < 0) return false;
         bool sized = fstat(fd, &sb) == 0 && (uint64_t)sb.st_size >= need;
-        void* p = sized ? mmap(nullptr, (size_t)need, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
+        bool owned = sized && (!checkOwner || sb.st_uid == owner);
+        if (sized && !owned) {
+            refusal = OzzyDaemonRefusal::Owner;
+            refusalValue = (uint32_t)sb.st_uid;
+        }
+        void* p = owned ? mmap(nullptr, (size_t)need, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
         close(fd);
         if (p == MAP_FAILED) return false;
         ozzy_daemon_trailer* t = ozzy_daemon_trailer_at(p, sizeof(ozzy_shared_memory));
         if (!ozzy_daemon_trailer_valid(t)) {
+            if (__atomic_load_n(&t->magic, __ATOMIC_ACQUIRE) == OZZY_DAEMON_MAGIC && t->version != OZZY_DAEMON_VERSION) {
+                refusal = OzzyDaemonRefusal::Version;
+                refusalValue = t->version;
+            }
             munmap(p, (size_t)need);
             return false;
         }

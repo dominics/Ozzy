@@ -38,6 +38,9 @@ struct ubus_pipe {
 	uint64_t last_done;       /* host time of the last completion (watchdog) */
 	uint64_t last_data;       /* host time of the last isochronous IN packet with data */
 	uint32_t error_streak;    /* failed completions in a row */
+	uint32_t late;            /* isochronous submits since the last watch reset that found the
+				     pipe's queue run dry (next_frame passed) */
+	uint32_t refused;         /* submits refused since the last abort: transfers the engine lost */
 	bool submitted;           /* something was submitted since the last watch reset */
 };
 
@@ -128,6 +131,13 @@ bool ubus_pipe_stalled(struct user_bus *b, uint8_t address, uint64_t now, uint64
 bool ubus_pipe_no_data(struct user_bus *b, uint8_t address, uint64_t now, uint64_t ticks);
 /* Pipe @address: failed completions in a row */
 uint32_t ubus_pipe_errors(struct user_bus *b, uint8_t address);
+/* Pipe @address (isochronous): submits since the last reset that came after its queue ran dry */
+uint32_t ubus_pipe_late(struct user_bus *b, uint8_t address);
+/*
+ * Pipe @address: submits refused since the last abort (the engine's start, restart or suspend
+ * aborts first), each a transfer the engine won't submit again
+ */
+uint32_t ubus_pipe_refused(struct user_bus *b, uint8_t address);
 
 /* Host clock ticks for @ms */
 uint64_t ubus_ms_to_ticks(const struct user_bus *b, uint64_t ms);

@@ -3,12 +3,12 @@
 #   make           build/ozzy-daemon (this machine's architecture)
 #   make UNIVERSAL=1   arm64 + x86_64
 #   make check     host tests (no device needed)
-#   make OZZY_VERSION=1.0.0   stamp a release version (default: git describe of the checkout)
+#   make OZZY_VERSION=1.0.0   stamp a release version (default: macos/packaging/version.sh)
 CC       ?= cc
 CXX      ?= c++
 OZZY     := ../../..
 BUILD    := build
-OZZY_VERSION ?= $(shell git -C $(OZZY) describe --always --dirty 2>/dev/null || echo unknown)
+OZZY_VERSION ?= $(shell $(OZZY)/macos/packaging/version.sh 2>/dev/null || echo unknown)
 VERSION  := $(OZZY_VERSION)
 BUNDLE_VERSION := $(firstword $(subst -, ,$(subst +, ,$(VERSION))))
 ARCHS    := $(if $(UNIVERSAL),-arch arm64 -arch x86_64,)

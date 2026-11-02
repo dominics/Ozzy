@@ -281,6 +281,10 @@ void ozzy_engine_stats_recovery(struct ozzy_engine *e, bool streaming)
 bool ozzy_engine_start(struct ozzy_engine *e)
 {
 	memset(&e->report, 0, sizeof(e->report));
+	/* Input in the shared memory starts as silence: the HAL reads it by sample time, and a
+	 * new run's clock starts again at 0, over the previous run's input */
+	if (e->mem.pcm_in_ring)
+		memset(e->mem.pcm_in_ring, 0, e->mem.pcm_in_ring_bytes);
 	if (!e->ops->start(e))
 		return false;
 	e->starts++;
@@ -552,7 +556,7 @@ bool ozzy_engine_alloc_memory(struct ozzy_engine *e, const struct ozzy_allocator
 	if (out->transfer_type == 1 && out->max_packet_size) {
 		/* One OUT transfer: at most a packet per microframe, each at most the bytes per interval */
 		m->isoc_out_size = OZZY_DMA_ROUND(OZZY_MAX_ISOC_PACKETS * out->max_packet_size);
-		for (i = 0; i < ISOC_OUT_TRANSFERS; i++)
+		for (i = 0; i < ozzy_engine_isoc_out_transfers(e); i++)
 			m->isoc_out[i] = alloc_zeroed(a, m->isoc_out_size, &ok);
 	}
 	m->isoc_in_size = ISOC_FB_TRANSFERS * OZZY_DMA_ROUND(OZZY_MAX_ISOC_PACKETS * fb_bytes);
@@ -578,7 +582,7 @@ void ozzy_engine_free_memory(struct ozzy_engine *e)
 		if (m->pcm_in[i])
 			a->free(a->ctx, m->pcm_in[i]);
 	}
-	for (i = 0; i < ISOC_OUT_TRANSFERS; i++)
+	for (i = 0; i < ISOC_OUT_TRANSFERS_MAX; i++)
 		if (m->isoc_out[i])
 			a->free(a->ctx, m->isoc_out[i]);
 	if (m->isoc_in)

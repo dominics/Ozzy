@@ -123,3 +123,21 @@ void isoc_plan_times(struct ozzy_isoc_packet *packets, uint32_t count, const str
 			? frame_clock_time(fc, start_uframe + (uint64_t)(p + 1) * uframes_per_packet)
 			: 0;
 }
+
+bool isoc_schedule(uint64_t *next_frame, uint64_t now_frame, uint64_t frames, uint32_t lead, uint64_t *first,
+		   uint64_t *behind)
+{
+	bool late = false;
+
+	*behind = 0;
+	if (*next_frame <= now_frame) {
+		if (*next_frame) {
+			late = true;
+			*behind = now_frame - *next_frame;
+		}
+		*next_frame = now_frame + lead;
+	}
+	*first = *next_frame;
+	*next_frame += frames;
+	return late;
+}

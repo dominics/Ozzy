@@ -448,6 +448,24 @@ static void update_timestamp(struct ploytec_engine *pe)
 	ozzy_timestamp_write(&shm->audio.timestamp, pe->hw_sample_time, anchor_time);
 }
 
+/*
+ * clear_sent - Where the HAL writes the transfers itself (no ring platform): silence in sent
+ * transfer @t's frames, so a HAL that stops (its process gone) leaves silence a lap later, not
+ * the ring played again. The MIDI and sync bytes stay. The HAL writes at most the queued
+ * transfers plus one IO buffer ahead of the clock, well short of a lap, so these frames are
+ * behind it.
+ */
+static void clear_sent(struct ploytec_engine *pe, uint32_t t)
+{
+	uint8_t *packet = ozzy_engine_pcm_out_slot(&pe->base, t);
+	uint32_t f;
+
+	if (ozzy_engine_ring_platform(&pe->base))
+		return;   /* encode_pcm_out writes each transfer before it goes out */
+	for (f = 0; f < pe->out_frames; f++)
+		memset(packet + ploytec_out_frame_offset(pe->out_layout, f), 0, PLOYTEC_OUT_FRAME_SIZE);
+}
+
 static void ploytec_complete(struct ozzy_engine *e, uint8_t pipe, void *xfer, int status, uint32_t bytes)
 {
 	struct ploytec_engine *pe = to_ploytec(e);
@@ -464,6 +482,7 @@ static void ploytec_complete(struct ozzy_engine *e, uint8_t pipe, void *xfer, in
 			ozzy_engine_stats_short(e, OZZY_PCM_OUT);
 		next = ploytec_pcm_next(finished, pe->out_queue, e->mem.pcm_out_slots);
 		update_timestamp(pe);
+		clear_sent(pe, finished);
 		midi_out(pe, next);
 		cport_out(pe, next);
 		encode_pcm_out(pe, next);

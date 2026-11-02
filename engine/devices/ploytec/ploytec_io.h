@@ -115,7 +115,8 @@ static inline void ploytec_midi_in_to_ring(const struct ploytec_midi *midi, vola
 /*
  * PCM in into the attached ring (ploytec_io.c): the @frames frames of completed IN transfer @t,
  * decoded straight from the shared memory into the ring with the input routing. A short (or
- * failed, @bytes 0) transfer leaves silence, so the ring keeps the device's clock.
+ * failed, @bytes 0) transfer leaves silence, so the ring keeps the device's clock; the frames
+ * it didn't bring are zeroed in its slot too, with or without a ring.
  */
 void ploytec_decode_pcm_in(struct ozzy_engine *e, ploytec_frame_fn decode, uint32_t frames, uint32_t t, uint32_t bytes);
 

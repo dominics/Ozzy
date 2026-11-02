@@ -13,10 +13,49 @@
 #define POLL_MS          5      /* the mailbox */
 #define WATCH_MS         250    /* the watchdog's period, as the kext's */
 #define WATCH_DEAD_MS    500    /* a PCM pipe with no completion this long has stalled */
-#define WATCH_RECOVER_S  10     /* between recoveries: not forever on a dead device */
+#define WATCH_RECOVER_MS 1000   /* between recoveries: not back to back on a device that fails again at once */
 #define FEEDBACK_DEAD_MS 1000   /* feedback without data this long: the device stopped streaming */
-#define ERROR_STREAK     200    /* failed PCM out completions in a row: likewise */
+#define ERROR_STREAK     3      /* failed completions in a row on a watched pipe: likewise */
 #define SEGMENT_STALE_MS 1000
+#define START_RATE       48000  /* a device's first start (the highest rate if it has no such rate) */
+#define RATES_KEPT       16
+
+/*
+ * The rate the user last set on each device (by location), for its next drive: a replug, a
+ * handover or a retry starts it at that rate, so a running client gets no rate switch. For the
+ * daemon's lifetime; control thread only.
+ */
+static struct {
+	uint32_t location_id;
+	uint32_t rate;
+} kept_rates[RATES_KEPT];
+static unsigned int kept_next;
+
+static uint32_t kept_rate(uint32_t location_id)
+{
+	unsigned int i;
+
+	for (i = 0; i < RATES_KEPT; i++) {
+		if (kept_rates[i].rate && kept_rates[i].location_id == location_id)
+			return kept_rates[i].rate;
+	}
+	return START_RATE;
+}
+
+static void keep_rate(uint32_t location_id, uint32_t rate)
+{
+	unsigned int i;
+
+	for (i = 0; i < RATES_KEPT; i++) {
+		if (kept_rates[i].rate && kept_rates[i].location_id == location_id) {
+			kept_rates[i].rate = rate;
+			return;
+		}
+	}
+	kept_rates[kept_next].location_id = location_id;
+	kept_rates[kept_next].rate = rate;
+	kept_next = (kept_next + 1) % RATES_KEPT;
+}
 
 /* A registry string of the device ("USB Product Name"...) into @dst */
 static void registry_string(io_service_t service, const char *key, volatile char *dst, size_t size)
@@ -76,14 +115,17 @@ static bool engine_restart(struct daemon_device *d)
 
 /* --- Settings and rate (the mailbox) --- */
 
-/* Restart with the settings the engine holds now; on failure the HAL drops the device */
+/*
+ * Restart with the settings the engine holds now. On failure the HAL drops the device and the
+ * caller has it released and retried (on_lost), as after a failed watchdog recovery.
+ */
 static IOReturn restart_locked(struct daemon_device *d)
 {
 	if (engine_restart(d)) {
 		ubus_watch_reset(&d->bus);
 		return kIOReturnSuccess;
 	}
-	d->running = false;
+	d->running = false;   /* the engine is stopped */
 	return kIOReturnIOError;
 }
 
@@ -110,13 +152,17 @@ static IOReturn set_rate_locked(struct daemon_device *d, uint32_t rate)
 	change = ozzy_engine_change_rate(d->engine, rate);
 	if (change == OZZY_SETTING_INVALID)
 		return kIOReturnBadArgument;
-	return change == OZZY_SETTING_RESTART ? restart_locked(d) : kIOReturnSuccess;
+	if (change == OZZY_SETTING_RESTART && restart_locked(d) != kIOReturnSuccess)
+		return kIOReturnIOError;
+	keep_rate(d->location_id, rate);
+	return kIOReturnSuccess;
 }
 
 static void poll_fired(CFRunLoopTimerRef timer, void *info)
 {
 	struct daemon_device *d = info;
 	uint32_t seq, method, args[2];
+	bool lost;
 
 	(void)timer;
 	if (!ozzy_daemon_take_request(d->seg.trailer, &seq, &method, args)) {
@@ -130,6 +176,7 @@ static void poll_fired(CFRunLoopTimerRef timer, void *info)
 		return;
 	}
 	pthread_mutex_lock(&d->lock);
+	bool was_running = d->running;
 	IOReturn status;
 	switch (method) {
 	case OZZY_METHOD_APPLY_SETTING:
@@ -142,11 +189,15 @@ static void poll_fired(CFRunLoopTimerRef timer, void *info)
 		status = kIOReturnUnsupported;
 		break;
 	}
+	lost = was_running && !d->running;
 	pthread_mutex_unlock(&d->lock);
 	if (status != kIOReturnSuccess)
 		ozzy_log("request %u (%u, %u) failed: 0x%x", method, args[0], args[1], (unsigned int)status);
 	/* After the restart has rewritten the shared memory: the HAL reads it on return */
 	ozzy_daemon_ack(d->seg.trailer, seq, status);
+	/* The restart failed: release the device and its segment, and try it again later */
+	if (lost && d->on_lost)
+		d->on_lost(d);
 }
 
 /* --- Watchdog --- */
@@ -154,15 +205,21 @@ static void poll_fired(CFRunLoopTimerRef timer, void *info)
 /*
  * As OzzyKext::WatchLocked: a PCM pipe that stopped completing gets the device a reselect and a
  * new start, counted in the stats. Also a device that keeps completing but stopped streaming:
- * its feedback without data, or PCM out failing in a row. A bulk PCM IN pipe isn't watched for
- * completions: a bulk read completes when the device has data, and the CMS 600-3's 0x86 goes
- * quiet for over 500 ms after a switch to 96 kHz and now and then while idle, then carries on.
- * Its feedback going silent is what says the device stopped. True if the restart failed: the
- * caller has the device released (on_lost).
+ * its feedback without data, or PCM out, feedback, PCM in or MIDI in failing in a row (one
+ * failure now and then carries on by itself). A transfer of theirs the bus refused to submit
+ * is gone for good until a new start, so that recovers it too. And PCM out late: its queue ran
+ * dry, which halts the CMS 600-3's streaming until a new start, with no error to show for it
+ * (isochronous OUT has no handshake). A bulk PCM IN pipe isn't watched for completions: a bulk
+ * read completes when the device has data, and the CMS 600-3's 0x86 goes quiet for over 500 ms
+ * after a switch to 96 kHz and now and then while idle, then carries on. Its feedback going
+ * silent is what says the device stopped. True if the restart failed: the caller has the
+ * device released (on_lost).
  */
 static bool watch_locked(struct daemon_device *d)
 {
 	static const enum ozzy_pipe_role roles[] = { OZZY_PIPE_PCM_OUT, OZZY_PIPE_PCM_IN };
+	static const enum ozzy_pipe_role streams[] = { OZZY_PIPE_PCM_OUT, OZZY_PIPE_FEEDBACK, OZZY_PIPE_PCM_IN,
+						       OZZY_PIPE_MIDI_IN };
 	uint64_t now = mach_absolute_time();
 	const char *why = NULL;
 	uint8_t pipe = 0, fb, out;
@@ -184,11 +241,20 @@ static bool watch_locked(struct daemon_device *d)
 		pipe = fb;
 		why = "no feedback";
 	}
-	if (!why && out && ubus_pipe_errors(&d->bus, out) >= ERROR_STREAK) {
-		pipe = out;
-		why = "failing";
+	for (i = 0; i < sizeof(streams) / sizeof(streams[0]) && !why; i++) {
+		pipe = d->engine->pipe[streams[i]].address;
+		if (!pipe)
+			continue;
+		if (ubus_pipe_errors(&d->bus, pipe) >= ERROR_STREAK)
+			why = "failing";
+		else if (ubus_pipe_refused(&d->bus, pipe))
+			why = "a transfer was refused";
 	}
-	if (!why || (d->recovered_at && now - d->recovered_at < ubus_ms_to_ticks(&d->bus, WATCH_RECOVER_S * 1000ull)))
+	if (!why && out && ubus_pipe_late(&d->bus, out)) {
+		pipe = out;
+		why = "ran dry";
+	}
+	if (!why || (d->recovered_at && now - d->recovered_at < ubus_ms_to_ticks(&d->bus, WATCH_RECOVER_MS)))
 		return false;
 
 	d->recovered_at = now;
@@ -292,6 +358,7 @@ enum handover_start device_drive(struct daemon_device *d)
 	const struct ozzy_device *model = d->model;
 	char name[OZZY_DAEMON_SEGMENT_NAME_MAX], why[160];
 	enum segment_result made;
+	bool io, configured;
 	size_t size;
 	IOReturn kr;
 
@@ -309,7 +376,7 @@ enum handover_start device_drive(struct daemon_device *d)
 	}
 	if (model->family != OZZY_FAMILY_USB_MIDI && ubus_class_compliant(&d->bus)) {
 		ozzy_log("  class compliant (interface 0 is Audio class): leaving it to the class driver");
-		goto fail;
+		goto unsupported;
 	}
 
 	size = ozzy_engine_size(model);
@@ -317,7 +384,7 @@ enum handover_start device_drive(struct daemon_device *d)
 	d->engine = d->engine_mem ? ozzy_engine_init(d->engine_mem, model) : NULL;
 	if (!d->engine) {
 		ozzy_log("  no engine for this device");
-		goto fail;
+		goto unsupported;
 	}
 
 	ozzy_daemon_segment_name(name, d->location_id);
@@ -340,10 +407,14 @@ enum handover_start device_drive(struct daemon_device *d)
 	registry_string(d->service, kUSBSerialNumberString, d->seg.shm->serial_number,
 			sizeof(d->seg.shm->serial_number));
 
-	if (!ubus_start_io(&d->bus))
-		goto fail_config;
-	if (!ubus_configure(&d->bus, d->engine)) {
-		if (d->bus.busy)
+	/* Its settle times (0.5 s after setting the configuration, 50 ms per alternate setting) hold
+	 * up the control thread too: the heartbeat moves through them as through the start */
+	segment_hold(&d->seg);
+	io = ubus_start_io(&d->bus);
+	configured = io && ubus_configure(&d->bus, d->engine);
+	segment_release(&d->seg);
+	if (!configured) {
+		if (io && d->bus.busy)
 			return busy(d, "an interface is held by another driver or process");
 		goto fail_config;
 	}
@@ -356,6 +427,7 @@ enum handover_start device_drive(struct daemon_device *d)
 	ozzy_engine_set_usb_speed(d->engine, ubus_speed(&d->bus));
 	ozzy_engine_set_driver_version(d->engine, OZZY_GIT_VERSION);
 	ozzy_engine_set_anchors(d->engine, true);   /* OzzyHAL's zero timestamps */
+	ozzy_engine_set_rate(d->engine, kept_rate(d->location_id));
 	if (!engine_start(d)) {
 		ozzy_log("  engine start failed");
 		ozzy_engine_stop(d->engine);
@@ -371,12 +443,16 @@ enum handover_start device_drive(struct daemon_device *d)
 	ozzy_log("  driver ready (segment %s)", name);
 	return HANDOVER_STARTED;
 
+unsupported:
+	close_device(d);
+	d->busy_logged = false;
+	return HANDOVER_UNSUPPORTED;
+
 fail_config:
 	ozzy_log("  configuration failed");
 fail:
 	close_device(d);
 	d->busy_logged = false;
-	d->slow_logged = false;
 	return HANDOVER_FAILED;
 }
 
@@ -434,6 +510,8 @@ void device_sleep(struct daemon_device *d)
  * the kext's setPowerState) */
 void device_wake(struct daemon_device *d)
 {
+	bool lost = false;
+
 	pthread_mutex_lock(&d->lock);
 	if (d->sleeping) {
 		d->sleeping = false;
@@ -445,8 +523,11 @@ void device_wake(struct daemon_device *d)
 				ozzy_log("start after wake failed");
 				ozzy_engine_stop(d->engine);
 				d->running = false;
+				lost = true;
 			}
 		}
 	}
 	pthread_mutex_unlock(&d->lock);
+	if (lost && d->on_lost)
+		d->on_lost(d);
 }

@@ -6,7 +6,14 @@
  * kOzzyObjectMonoDevice + 2i and + 2i + 1 of the main device's slot (OzzyHALExtras.h). It
  * shares the main device's engine, clock, rate and timing, and reads its channel from the
  * shared input ring (OzzyHALDevice::ReadInputChannel). Setting its rate changes the main
- * device's. Its IO doesn't count as the main device's.
+ * device's. Its IO doesn't count as the main device's, and it has a timeline of its own
+ * (OzzyTimeline.h) on the main device's clock.
+ *
+ * A configuration change of the main device (a rate or device setting, or a new layout from the
+ * driver) restarts the engine under a running mono device, which CoreAudio doesn't stop for it:
+ * the mono device reads silence from the start of the main device's change, which then asks
+ * CoreAudio for one on each mono device; when that comes (IO stopped), its timeline starts over
+ * on the new layout.
  *
  * Templates over the device class, so the dispatch can use OzzyHALDevice's own getters; included
  * by OzzyHAL.mm only. C++ (OzzyHAL).
@@ -20,11 +27,8 @@
 #include <string.h>
 #include "OzzyHALExtras.h"
 
-static inline bool OzzyIsMonoDevice(uint32_t kind) { return OzzyMonoIndex((int)kind) >= 0 && (kind - kOzzyObjectMonoDevice) % 2 == 0; }
-static inline bool OzzyIsMonoObject(uint32_t kind) { return OzzyMonoIndex(kind) >= 0; }
-
 /* A mono input device's ID or its stream's, for the main device @device */
-static inline AudioObjectID OzzyMonoDeviceID(AudioObjectID device, int i) { return device + kOzzyObjectMonoDevice + 2 * i; }
+static inline AudioObjectID OzzyMonoDeviceID(AudioObjectID device, int i) { return device + OzzyMonoDeviceKind((unsigned int)i); }
 static inline AudioObjectID OzzyMonoStreamID(AudioObjectID device, int i) { return OzzyMonoDeviceID(device, i) + 1; }
 
 /* The mono devices to add to the plug-in's device list after @dev's, into @out (null: count) */
@@ -40,6 +44,8 @@ static UInt32 OzzyMonoDeviceList(Device* dev, AudioObjectID* out, UInt32 max) {
 template <class Device>
 static void OzzyMonoNotify(Device* dev, AudioServerPlugInHostRef host) {
     if (!host) return;
+    AudioObjectPropertyAddress related = { kAudioDevicePropertyRelatedDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    if (dev->IsConnected()) host->PropertiesChanged(host, dev->GetDeviceID(), 1, &related);
     for (unsigned int i = 0; i < dev->Extras().MonoCount(); i++) {
         AudioObjectID id = OzzyMonoDeviceID(dev->GetDeviceID(), (int)i);
         if (!dev->IsConnected()) {
@@ -47,20 +53,56 @@ static void OzzyMonoNotify(Device* dev, AudioServerPlugInHostRef host) {
             host->PropertiesChanged(host, id, 1, &alive);
             continue;
         }
-        AudioObjectPropertyAddress addr[7] = {
+        AudioObjectPropertyAddress addr[8] = {
             { kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
             { kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
             { kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
             { kAudioDevicePropertyAvailableNominalSampleRates, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
             { kAudioDevicePropertySafetyOffset, kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain },
             { kAudioDevicePropertyZeroTimeStampPeriod, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
-            { kAudioDevicePropertyLatency, kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain } };
-        host->PropertiesChanged(host, id, 7, addr);
+            { kAudioDevicePropertyLatency, kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain },
+            related };
+        host->PropertiesChanged(host, id, 8, addr);
         AudioObjectPropertyAddress fmt[2] = {
             { kAudioStreamPropertyVirtualFormat, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
             { kAudioStreamPropertyPhysicalFormat, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain } };
         host->PropertiesChanged(host, id + 1, 2, fmt);
     }
+}
+
+/* The main device's configuration change starts: its mono devices read silence until theirs */
+template <class Device>
+static void OzzyMonoChangeBegins(Device* dev) {
+    for (unsigned int i = 0; i < dev->Extras().MonoCount(); i++) dev->Extras().mMonoChanging[i].store(true);
+}
+
+/* The main device's configuration change @action is done: ask CoreAudio for one on each mono device */
+template <class Device>
+static void OzzyMonoRequestChange(Device* dev, AudioServerPlugInHostRef host, UInt64 action) {
+    for (unsigned int i = 0; i < dev->Extras().MonoCount(); i++) {
+        if (host && dev->IsConnected() &&
+            host->RequestDeviceConfigurationChange(host, OzzyMonoDeviceID(dev->GetDeviceID(), (int)i), action, nullptr) ==
+                kAudioHardwareNoError)
+            continue;
+        dev->Extras().mMonoChanging[i].store(false);
+        ozzy_timeline_restart(&dev->Extras().mMonoTimeline[i]);
+    }
+}
+
+/* CoreAudio stopped the mono device's IO for its change (or aborted it): the engine has switched
+ * already, so only its timeline starts over, and its rate and format are new */
+template <class Device>
+static OSStatus OzzyMonoPerformConfigurationChange(Device* dev, AudioServerPlugInHostRef host, uint32_t kind) {
+    int i = OzzyMonoIndex(kind);
+    if (!dev->Extras().Mono(i) || !OzzyIsMonoDevice(kind)) return kAudioHardwareBadObjectError;
+    ozzy_timeline_restart(&dev->Extras().mMonoTimeline[i]);
+    dev->Extras().mMonoChanging[i].store(false);
+    if (host) {
+        AudioObjectID id = OzzyMonoDeviceID(dev->GetDeviceID(), i);
+        AudioObjectPropertyAddress rate = { kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+        host->PropertiesChanged(host, id, 1, &rate);
+    }
+    return kAudioHardwareNoError;
 }
 
 /* The mono device's stream format: the main device's input format with one channel */
@@ -72,7 +114,7 @@ static AudioStreamBasicDescription OzzyMonoFormat(Device* dev) {
     return f;
 }
 
-/* "<main name> <mono name>", or the main UID / model UID with the suffix; the caller releases it */
+/* The main UID / model UID with the suffix; the caller releases it */
 static inline CFStringRef OzzyMonoCopyString(CFStringRef base, const char* sep, const char* add) {
     return CFStringCreateWithFormat(NULL, NULL, CFSTR("%@%s%s"), base ? base : CFSTR("Ozzy"), sep, add);
 }
@@ -102,7 +144,8 @@ static Boolean OzzyMonoHasProperty(Device* dev, uint32_t kind, const AudioObject
             case kAudioDevicePropertyStreams: case kAudioDevicePropertyStreamConfiguration:
             case kAudioDevicePropertyLatency: case kAudioDevicePropertySafetyOffset:
             case kAudioDevicePropertyPreferredChannelLayout: case kAudioDevicePropertyPreferredChannelsForStereo:
-            case kAudioDevicePropertyZeroTimeStampPeriod: case kAudioDevicePropertyClockDomain: return true;
+            case kAudioDevicePropertyZeroTimeStampPeriod: case kAudioDevicePropertyClockDomain:
+            case kAudioDevicePropertyRelatedDevices: return true;
             case kAudioObjectPropertyElementName:
                 return a->mScope == kAudioObjectPropertyScopeInput && a->mElement == 1;
         }
@@ -157,7 +200,7 @@ static OSStatus OzzyMonoGetPropertyData(Device* dev, uint32_t kind, const AudioO
             if (!outData) return kAudioHardwareNoError;
             switch (a->mSelector) {   // the caller releases it
                 case kAudioObjectPropertyName:
-                    str = OzzyIsMonoDevice(kind) ? OzzyMonoCopyString(dev->GetDeviceName(), " ", mono->name)
+                    str = OzzyIsMonoDevice(kind) ? CFStringCreateWithCString(NULL, mono->device_name, kCFStringEncodingUTF8)
                                                  : CFStringCreateWithFormat(NULL, NULL, CFSTR("Ozzy %s Input Stream"), mono->name);
                     break;
                 case kAudioObjectPropertyManufacturer:
@@ -202,6 +245,11 @@ static OSStatus OzzyMonoGetPropertyData(Device* dev, uint32_t kind, const AudioO
         case kAudioDevicePropertySafetyOffset: u32 = dev->GetSafetyOffset(kAudioObjectPropertyScopeInput); break;
         case kAudioDevicePropertyZeroTimeStampPeriod: u32 = dev->GetZeroTimestampPeriod(); break;
         case kAudioDevicePropertyClockDomain: u32 = dev->GetClockDomain(); break;   // the main device's clock
+        case kAudioDevicePropertyRelatedDevices: {
+            AudioObjectID related[1 + OZZY_MAX_MONO_INPUTS];
+            UInt32 n = dev->Extras().RelatedDevices(related);
+            return OzzyMonoWrite(inMax, outSize, outData, related, n * sizeof(AudioObjectID));
+        }
         case kAudioDevicePropertyPreferredChannelLayout: {
             AudioChannelLayout layout = {};
             layout.mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;
@@ -249,13 +297,14 @@ static OSStatus OzzyMonoSetPropertyData(Device* dev, AudioServerPlugInHostRef ho
     return dev->SetSampleRate(host, ((const AudioStreamBasicDescription*)data)->mSampleRate);
 }
 
-/* IO, counted per mono device: its timeline restarts at each start, like the main device's */
+/* IO, counted per mono device: its timeline restarts when its IO starts and stops, like the main
+ * device's, and only then: the main device's IO doesn't touch it */
 template <class Device>
 static OSStatus OzzyMonoStartIO(Device* dev, uint32_t kind) {
     int i = OzzyMonoIndex(kind);
     if (!dev->Extras().Mono(i)) return kAudioHardwareBadObjectError;
     if (!dev->IsConnected()) return kAudioHardwareNotRunningError;
-    if (dev->Extras().mMonoIO[i].fetch_add(1) == 0) dev->Extras().mMonoSeed[i].fetch_add(1);
+    if (dev->Extras().mMonoIO[i].fetch_add(1) == 0) ozzy_timeline_restart(&dev->Extras().mMonoTimeline[i]);
     return kAudioHardwareNoError;
 }
 
@@ -265,19 +314,23 @@ static OSStatus OzzyMonoStopIO(Device* dev, uint32_t kind) {
     if (!dev->Extras().Mono(i)) return kAudioHardwareBadObjectError;
     int io = dev->Extras().mMonoIO[i].load();
     while (io > 0 && !dev->Extras().mMonoIO[i].compare_exchange_weak(io, io - 1)) {}
-    if (io == 1) dev->Extras().mMonoSeed[i].fetch_add(1);
+    if (io == 1) ozzy_timeline_restart(&dev->Extras().mMonoTimeline[i]);
     return kAudioHardwareNoError;
 }
 
-/* The main device's clock, with the mono device's own seed */
+/* The main device's clock, on the mono device's own timeline (its IO thread's anchor and seed) */
 template <class Device>
 static OSStatus OzzyMonoGetZeroTimeStamp(Device* dev, uint32_t kind, Float64* sampleTime, UInt64* hostTime, UInt64* seed) {
     int i = OzzyMonoIndex(kind);
     if (!dev->Extras().Mono(i)) return kAudioHardwareBadObjectError;
-    UInt64 mainSeed = 0;
-    OSStatus st = dev->GetZeroTimeStamp(sampleTime, hostTime, &mainSeed);
-    if (seed) *seed = dev->Extras().mMonoSeed[i].load() + mainSeed;   // either one restarting restarts it
-    return st;
+    uint64_t s = 0, h = 0, n = 0;
+    bool got = false;
+    if (!dev->ReadClock(&got, &s, &h) || !ozzy_timeline_anchor(&dev->Extras().mMonoTimeline[i], got, &s, &h, &n))
+        return kAudioHardwareNotRunningError;
+    if (sampleTime) *sampleTime = (Float64)s;
+    if (hostTime) *hostTime = h;
+    if (seed) *seed = n;
+    return kAudioHardwareNoError;
 }
 
 template <class Device>
@@ -287,6 +340,10 @@ static OSStatus OzzyMonoDoIOOperation(Device* dev, uint32_t kind, UInt32 operati
     const struct ozzy_mono_input* mono = dev->Extras().Mono(i);
     if (!mono) return kAudioHardwareBadObjectError;
     if (operation != kAudioServerPlugInIOOperationReadInput) return kAudioHardwareNoError;
+    if (dev->Extras().mMonoChanging[i].load(std::memory_order_relaxed)) {
+        memset(buffer, 0, frames * sizeof(float));
+        return kAudioHardwareNoError;
+    }
     dev->ReadInputChannel(mono->channel, frames, cycle, (float*)buffer, dev->Extras().mMonoScratch[i],
                           kOzzyMonoChunkFrames);
     return kAudioHardwareNoError;

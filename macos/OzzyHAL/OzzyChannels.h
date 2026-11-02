@@ -85,7 +85,8 @@ static inline const struct ozzy_channel_info *ozzy_channel(const struct ozzy_dev
  */
 struct ozzy_mono_input {
 	const char *key;            /* struct ozzy_device.key */
-	const char *name;           /* after the main device's name, e.g. "Dynacord CMS 600-3 MON" */
+	const char *name;           /* its channel's and stream's, e.g. "MON" */
+	const char *device_name;    /* the device's, e.g. "CMS 600-3 MON" */
 	const char *uid_suffix;
 	uint8_t channel;            /* the main device's 1-based input channel */
 };
@@ -93,8 +94,8 @@ struct ozzy_mono_input {
 #define OZZY_MAX_MONO_INPUTS 2   /* per model */
 
 static const struct ozzy_mono_input ozzy_mono_inputs[] = {
-	{ "DynacordCMS600", "MON", ":MON", 4 },
-	{ "DynacordCMS600", "AUX", ":AUX", 3 },
+	{ "DynacordCMS600", "MON", "CMS 600-3 MON", ":MON", 4 },
+	{ "DynacordCMS600", "AUX", "CMS 600-3 AUX", ":AUX", 3 },
 };
 
 /* @model's mono input devices into @out (OZZY_MAX_MONO_INPUTS); returns how many */
@@ -108,6 +109,39 @@ static inline unsigned int ozzy_mono_inputs_for(const struct ozzy_device *model,
 		    ozzy_mono_inputs[i].channel >= 1 && ozzy_mono_inputs[i].channel <= model->in_channels)
 			out[n++] = &ozzy_mono_inputs[i];
 	return n;
+}
+
+/* The most channels a device may have for its mono inputs to be read (the decode buffer's width) */
+#define OZZY_MONO_MAX_CHANNELS 16
+
+/* A codec's reader: @frame_count frames of the device's input from @sample_time, interleaved */
+typedef void (*ozzy_mono_reader_fn)(float *dst, const uint8_t *ring, uint64_t sample_time, uint32_t frame_count,
+				    uint32_t ring_frames);
+
+/*
+ * A mono input device's samples: input @channel (1-based) of @channels from @sample_time,
+ * @frames of them into @out, decoded by @read from @ring (@ring_frames) @chunk frames at a time
+ * through @scratch (@chunk x OZZY_MONO_MAX_CHANNELS floats). Silence if there is no ring or
+ * reader, or no such channel.
+ */
+static inline void ozzy_mono_read(ozzy_mono_reader_fn read, const uint8_t *ring, uint32_t ring_frames,
+				  uint32_t channels, uint32_t channel, uint64_t sample_time, uint32_t frames,
+				  float *out, float *scratch, uint32_t chunk)
+{
+	uint32_t done, k;
+
+	if (!read || !ring || !chunk || channel < 1 || channel > channels || channels > OZZY_MONO_MAX_CHANNELS) {
+		memset(out, 0, frames * sizeof(float));
+		return;
+	}
+	for (done = 0; done < frames;) {
+		uint32_t n = frames - done < chunk ? frames - done : chunk;
+
+		read(scratch, ring, sample_time + done, n, ring_frames);
+		for (k = 0; k < n; k++)
+			out[done + k] = scratch[k * channels + channel - 1];
+		done += n;
+	}
 }
 
 /* The two 1-based channels a stereo client plays to or records from */

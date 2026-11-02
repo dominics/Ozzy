@@ -8,6 +8,8 @@
  * - mono input devices next to the main one (the CMS 600-3's MON and AUX, OzzyChannels.h), as
  *   each device's objects from kOzzyObjectMonoDevice: their state here, their properties and
  *   IO in OzzyHALMono.h
+ * - the related devices (kAudioDevicePropertyRelatedDevices) of the main and mono devices: all
+ *   of them, so an aggregate of them needs no resampling
  * Volume, mute and the stereo pairs are kept in CoreAudio's plug-in storage per device UID, like
  * the device settings. C++ (OzzyHAL).
  */
@@ -18,36 +20,52 @@
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <atomic>
+#include <string.h>
 #include "OzzyChannels.h"
+#include "OzzyHALObjects.h"
 #include "OzzyVolume.h"
-
-/* A device's objects after upstream's device, streams and clock control (OzzyHAL.mm's
- * OzzyObjectKind); kOzzyObjectsPerDevice leaves room for them */
-enum OzzyExtraObjectKind : uint32_t {
-    kOzzyObjectVolumeControl = 4,
-    kOzzyObjectMuteControl = 5,
-    kOzzyObjectMonoDevice = 6,     // mono input i: its device at 6 + 2i, its stream at 7 + 2i
-    kOzzyObjectKinds = kOzzyObjectMonoDevice + 2 * OZZY_MAX_MONO_INPUTS,   // the objects a device has
-};
+#include "OzzyTimeline.h"
+#include "../../engine/shared/ozzy_shared_data.h"
 
 /* Frames a mono input device decodes at a time (OzzyHALMono.h) */
 static const uint32_t kOzzyMonoChunkFrames = 256;
-static const uint32_t kOzzyMonoMaxChannels = 16;
-
-/* The mono input index of an object kind, or -1 */
-static inline int OzzyMonoIndex(uint32_t kind) {
-    return kind >= kOzzyObjectMonoDevice && kind < kOzzyObjectKinds ? (int)(kind - kOzzyObjectMonoDevice) / 2 : -1;
-}
+static const uint32_t kOzzyMonoMaxChannels = OZZY_MONO_MAX_CHANNELS;
 
 /* The controls each device has, in its control list after the clock source */
 static const UInt32 kOzzyExtraControls = 2;
 
-static inline bool OzzyIsExtraControl(uint32_t kind) {
-    return kind == kOzzyObjectVolumeControl || kind == kOzzyObjectMuteControl;
-}
+/*
+ * The driver's layout as the device last applied it (ApplyDeviceConfig), as the shared memory
+ * had it: the rate, the rings, the clock spacing and the safety offsets. The monitor compares
+ * the shared memory with it, so a layout the driver published late (a rate change that outlived
+ * the mailbox's timeout) is applied too.
+ */
+struct OzzyLayout {
+    uint32_t rate, outRingFrames, inRingFrames, timestampFrames, safetyOffset, inputSafetyOffset;
+
+    static OzzyLayout Of(const ozzy_shared_memory* shm) {
+        return OzzyLayout { shm->audio.sample_rate.load(std::memory_order_relaxed), shm->audio.output_ring_frames,
+                            shm->audio.input_ring_frames, shm->audio.timestamp_frames,
+                            shm->audio.safety_offset_frames, shm->audio.input_safety_offset_frames };
+    }
+    bool operator==(const OzzyLayout& o) const {
+        return rate == o.rate && outRingFrames == o.outRingFrames && inRingFrames == o.inRingFrames &&
+               timestampFrames == o.timestampFrames && safetyOffset == o.safetyOffset &&
+               inputSafetyOffset == o.inputSafetyOffset;
+    }
+    bool operator!=(const OzzyLayout& o) const { return !(*this == o); }
+};
 
 class OzzyHALExtras {
 public:
+    /* The main device's object ID (OzzyHALDevice::Init) */
+    void SetDevice(AudioObjectID device) { mDevice = device; }
+
+    /* The main device and its mono devices into @out; returns how many */
+    UInt32 RelatedDevices(AudioObjectID out[1 + OZZY_MAX_MONO_INPUTS]) const {
+        return ozzy_related_devices(mDevice, mMonoCount, out);
+    }
+
     /* The device's model and channels, from ApplyDeviceConfig */
     void Configure(const struct ozzy_device* model, uint32_t inputs, uint32_t outputs) {
         mModel = model;
@@ -63,9 +81,16 @@ public:
         return i >= 0 && (unsigned int)i < mMonoCount ? mMono[i] : nullptr;
     }
     unsigned int MonoCount() const { return mMonoCount; }
-    /* Its IO: clients that started it, and its timeline's seed */
+    /* Its IO: clients that started it, and its own timeline (OzzyTimeline.h) */
     std::atomic<int> mMonoIO[OZZY_MAX_MONO_INPUTS] = {};
-    std::atomic<uint64_t> mMonoSeed[OZZY_MAX_MONO_INPUTS] = {};
+    struct ozzy_timeline mMonoTimeline[OZZY_MAX_MONO_INPUTS] = {};
+    /* A configuration change of the main device restarted the engine under it, and its own
+     * change hasn't come yet: its IO reads silence (OzzyHALMono.h) */
+    std::atomic<bool> mMonoChanging[OZZY_MAX_MONO_INPUTS] = {};
+    /* Any thread: the mono devices' timelines start over (the driver went away) */
+    void RestartMonoTimelines() {
+        for (unsigned int i = 0; i < OZZY_MAX_MONO_INPUTS; i++) ozzy_timeline_restart(&mMonoTimeline[i]);
+    }
     /* Its IO thread's decode buffer (each device has an IO thread of its own) */
     float mMonoScratch[OZZY_MAX_MONO_INPUTS][kOzzyMonoChunkFrames * kOzzyMonoMaxChannels];
 
@@ -77,11 +102,11 @@ public:
         bool muted = false;
         uint32_t pairs[2] = { kDefaultPair, kDefaultPair };
         CFPropertyListRef v;
-        if ((v = Copy(host, kVolumeKey))) {
+        if ((v = CopyOrMigrate(host, kVolumeKey, kLegacyVolumeKey))) {
             if (CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)v, kCFNumberFloat32Type, &volume);
             CFRelease(v);
         }
-        if ((v = Copy(host, kMuteKey))) {
+        if ((v = CopyOrMigrate(host, kMuteKey, kLegacyMuteKey))) {
             if (CFGetTypeID(v) == CFBooleanGetTypeID()) muted = CFBooleanGetValue((CFBooleanRef)v);
             CFRelease(v);
         }
@@ -94,8 +119,9 @@ public:
         }
         for (unsigned int i = 0; i < OZZY_MAX_MONO_INPUTS; i++) {
             mMonoIO[i].store(0);
-            mMonoSeed[i].fetch_add(1);
+            mMonoChanging[i].store(false);
         }
+        RestartMonoTimelines();
         mVolume.store(ozzy_volume_clamp(volume));
         mMuted.store(muted);
         mPairIn.store(pairs[0]);
@@ -123,7 +149,8 @@ public:
     // --- The device's own properties (OzzyHAL.mm asks here first; false: not one of ours) ---
 
     bool HasDeviceProperty(const AudioObjectPropertyAddress* a, Boolean* has) const {
-        if (a->mSelector == kAudioDevicePropertyPreferredChannelsForStereo) {
+        if (a->mSelector == kAudioDevicePropertyPreferredChannelsForStereo ||
+            a->mSelector == kAudioDevicePropertyRelatedDevices) {
             *has = true;
             return true;
         }
@@ -144,6 +171,11 @@ public:
             *status = kAudioHardwareNoError;
             return true;
         }
+        if (a->mSelector == kAudioDevicePropertyRelatedDevices) {
+            *size = (1 + mMonoCount) * sizeof(AudioObjectID);
+            *status = kAudioHardwareNoError;
+            return true;
+        }
         if (a->mSelector == kAudioObjectPropertyElementName) {
             *size = sizeof(CFStringRef);
             *status = ChannelName(a) ? kAudioHardwareNoError : kAudioHardwareUnknownPropertyError;
@@ -161,6 +193,17 @@ public:
             else {
                 if (outData) { ((UInt32*)outData)[0] = p.left; ((UInt32*)outData)[1] = p.right; }
                 if (outSize) *outSize = 2 * sizeof(UInt32);
+            }
+            return true;
+        }
+        if (a->mSelector == kAudioDevicePropertyRelatedDevices) {
+            AudioObjectID related[1 + OZZY_MAX_MONO_INPUTS];
+            UInt32 size = RelatedDevices(related) * sizeof(AudioObjectID);
+            *status = kAudioHardwareNoError;
+            if (outData && inMax < size) *status = kAudioHardwareBadPropertySizeError;
+            else {
+                if (outData) memcpy(outData, related, size);
+                if (outSize) *outSize = size;
             }
             return true;
         }
@@ -300,7 +343,12 @@ private:
     static constexpr const char* kMuteKey = "Output Mute";
     static constexpr const char* kInPairKey = "Input Stereo Pair";
     static constexpr const char* kOutPairKey = "Output Stereo Pair";
+    // Ozzy 0.3.0's keys, one per plug-in (it drove one device): read for a device that has none of
+    // its own yet
+    static constexpr const char* kLegacyVolumeKey = "output volume";
+    static constexpr const char* kLegacyMuteKey = "output mute";
 
+    AudioObjectID mDevice = kAudioObjectUnknown;
     const struct ozzy_device* mModel = nullptr;
     uint32_t mInputs = 0, mOutputs = 0;
     const struct ozzy_mono_input* mMono[OZZY_MAX_MONO_INPUTS] = {};
@@ -338,6 +386,18 @@ private:
         CFPropertyListRef v = nullptr;
         if (host && key && host->CopyFromStorage(host, key, &v) != kAudioHardwareNoError) v = nullptr;
         if (key) CFRelease(key);
+        return v;
+    }
+
+    /* What storage has under @what, or else under the plug-in-wide @legacy key, which is then
+     * stored under @what so the device has its own from now on */
+    CFPropertyListRef CopyOrMigrate(AudioServerPlugInHostRef host, const char* what, const char* legacy) const {
+        CFPropertyListRef v = Copy(host, what);
+        if (v || !host) return v;
+        CFStringRef key = CFStringCreateWithCString(NULL, legacy, kCFStringEncodingUTF8);
+        if (key && host->CopyFromStorage(host, key, &v) != kAudioHardwareNoError) v = nullptr;
+        if (key) CFRelease(key);
+        if (v) Store(host, what, CFRetain(v));
         return v;
     }
 

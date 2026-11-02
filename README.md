@@ -25,6 +25,8 @@ Uninstall: `brew uninstall --cask ozzy-cms600`, `macos/uninstall-userspace.comma
 
 **Power-cycle quirk**: the mixer only enumerates if it is powered on with the USB cable already plugged in. If it does not show up, power it off, plug in the cable, then power it on.
 
+More on how it behaves (several users, sleep, latency, logs, security): [macos/USERSPACE.md](macos/USERSPACE.md). Open follow-ups: [TODO.md](TODO.md).
+
 ---
 <!-- /fork -->
 
@@ -87,7 +89,7 @@ These use the same Ploytec chip. Their channels, rates and setup requests come f
 | **Allen & Heath MixWizard WZ4 USB** | 16 / 2 | 44.1–96 kHz |  |
 | **Alesis MultiMix 8 / 8 FX / 16 USB 2.0** | 10 / 2 | 44.1/48 kHz | Channels from a MultiMix 8; the 16 may have more inputs |
 | **Allen & Heath Xone:2D** | 8 / 8 | 44.1–96 kHz |  |
-| **Dynacord CMS 600-3** (Ploytec revision) | 4 / 4 | 44.1/48/96 kHz | First MIDI port (DIN) only. The later class-compliant revision needs no driver; on Windows, don't install Ozzy for it |
+| **Dynacord CMS 600-3** (Ploytec revision) | 4 / 4 | 44.1/48/96 kHz | Both MIDI ports (DIN and SystemCtrl) on Linux and with this fork's macOS userspace driver; the kext and Windows drivers have the first (DIN) only. The later class-compliant revision needs no driver; on Windows, don't install Ozzy for it |
 | **ESI ESU1808** | 16 / 8 | 44.1–96 kHz | S/PDIF out mirrors outputs 1/2 |
 | **ESI U86 XT** | 8 / 6 | 44.1–96 kHz |  |
 | **ESI U108 PRE** | 10 / 8 | 44.1–96 kHz |  |

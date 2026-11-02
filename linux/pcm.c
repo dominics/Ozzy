@@ -45,8 +45,12 @@ static int ozzy_pcm_open(struct snd_pcm_substream *substream)
 	unsigned int channels = dir == OZZY_PCM_OUT ? model->out_channels : model->in_channels;
 	uint32_t rates[OZZY_MAX_RATES];
 	unsigned int n = ozzy_device_rates(model, rates), i, packet_bytes;
+	bool running;
 
-	if (!chip->running)
+	mutex_lock(&chip->lock);
+	running = ozzy_chip_revive(chip);
+	mutex_unlock(&chip->lock);
+	if (!running)
 		return -ENODEV;
 
 	runtime->hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BLOCK_TRANSFER |
@@ -101,13 +105,13 @@ static int ozzy_pcm_prepare(struct snd_pcm_substream *substream)
 		return -EINVAL;
 
 	mutex_lock(&chip->lock);
-	if (!chip->running) {
+	if (!ozzy_chip_revive(chip)) {
 		ret = -ENODEV;
 	} else {
 		change = ozzy_engine_change_rate(chip->engine, runtime->rate);
 		if (change == OZZY_SETTING_INVALID)
 			ret = -EINVAL;
-		else if (change == OZZY_SETTING_RESTART)
+		else if (change == OZZY_SETTING_RESTART || READ_ONCE(chip->stalled))
 			ret = ozzy_chip_restart(chip);
 	}
 	mutex_unlock(&chip->lock);
@@ -211,6 +215,30 @@ void ozzy_pcm_progress(struct ozzy_chip *chip, enum ozzy_pcm_dir dir, uint64_t f
 	spin_unlock_irqrestore(&st->lock, flags);
 	if (elapsed)
 		snd_pcm_period_elapsed(substream);
+}
+
+/*
+ * ozzy_pcm_stalled - Completion path: the device stopped streaming (its feedback went silent,
+ * ozzy_bus_ops.pcm_stalled). The running streams stop with an xrun instead of playing into
+ * nothing; their next prepare restarts the engine, whose handshake brings the device back.
+ */
+void ozzy_pcm_stalled(struct ozzy_chip *chip)
+{
+	unsigned int dir;
+
+	WRITE_ONCE(chip->stalled, true);
+	for (dir = 0; dir < OZZY_PCM_DIRS; dir++) {
+		struct ozzy_pcm_stream *st = &chip->stream[dir];
+		struct snd_pcm_substream *substream;
+		unsigned long flags;
+
+		/* Under the lock, as ozzy_pcm_progress reads it */
+		spin_lock_irqsave(&st->lock, flags);
+		substream = st->attached ? st->substream : NULL;
+		spin_unlock_irqrestore(&st->lock, flags);
+		if (substream)
+			snd_pcm_stop_xrun(substream);
+	}
 }
 
 /* Process context: stop running streams with an xrun (a restart is coming) */

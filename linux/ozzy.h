@@ -27,7 +27,7 @@
 
 #define OZZY_MAX_INTERFACES  4
 #define OZZY_MAX_PIPES        OZZY_PIPE_ROLES
-#define OZZY_URBS_PER_PIPE             8     /* per pipe: more than any engine keeps in flight (4) */
+#define OZZY_URBS_PER_PIPE             8     /* per pipe: more than any engine keeps in flight (6) */
 
 #define chip_log(chip, fmt, ...)  dev_info(&(chip)->dev->dev, "[ozzy] " fmt "\n", ##__VA_ARGS__)
 #define chip_err(chip, fmt, ...)  dev_err(&(chip)->dev->dev, "[ozzy] " fmt "\n", ##__VA_ARGS__)
@@ -118,6 +118,7 @@ struct ozzy_chip {
 	struct mutex lock;
 	bool running;                      /* engine started, device present */
 	bool gone;                         /* disconnected */
+	bool stalled;                      /* the device stopped streaming (ozzy_pcm_stalled) */
 	struct snd_pcm *pcm;
 	struct ozzy_pcm_stream stream[OZZY_PCM_DIRS];
 	struct ozzy_midi midi;
@@ -135,11 +136,13 @@ void ozzy_urb_free(struct ozzy_urb_bus *bus);
 
 /* core.c */
 int ozzy_chip_restart(struct ozzy_chip *chip);
+bool ozzy_chip_revive(struct ozzy_chip *chip);
 
 /* pcm.c */
 int ozzy_pcm_init(struct ozzy_chip *chip);
 void ozzy_pcm_progress(struct ozzy_chip *chip, enum ozzy_pcm_dir dir, uint64_t frames);
 void ozzy_pcm_stop_streams(struct ozzy_chip *chip);
+void ozzy_pcm_stalled(struct ozzy_chip *chip);
 
 /* midi.c */
 void ozzy_midi_attach(struct ozzy_chip *chip);

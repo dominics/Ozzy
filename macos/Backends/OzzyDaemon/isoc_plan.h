@@ -41,6 +41,16 @@ bool isoc_plan_make(struct isoc_plan *plan, uint8_t *buf, uint32_t buf_size, con
 void isoc_plan_scatter(const struct isoc_plan *plan, uint8_t *buf, uint32_t buf_size,
 		       const struct ozzy_isoc_packet *packets, uint32_t count);
 
+/*
+ * isoc_schedule - The 1 ms bus frame a pipe's next transfer, @frames long, starts at (@first).
+ * *@next_frame is where its previous one ended, 0 for none since the start or an abort: then
+ * the transfer starts @lead frames after @now_frame. So it does if *@next_frame has already
+ * passed (at or before @now_frame): the pipe's whole queue ran dry, and the transfer is late;
+ * @behind gets how many frames ago. *@next_frame moves on past the transfer. True if late.
+ */
+bool isoc_schedule(uint64_t *next_frame, uint64_t now_frame, uint64_t frames, uint32_t lead, uint64_t *first,
+		   uint64_t *behind);
+
 #define FRAME_CLOCK_SAMPLES 32
 
 /*

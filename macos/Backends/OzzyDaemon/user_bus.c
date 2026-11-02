@@ -111,6 +111,13 @@ static void note_completion(struct ubus_pipe *p, int status, bool has_data)
 		__atomic_fetch_add(&p->error_streak, 1u, __ATOMIC_RELAXED);
 }
 
+/* A submit that won't happen: counted for the watchdog (ubus_pipe_refused) */
+static bool refuse(struct ubus_pipe *p)
+{
+	__atomic_fetch_add(&p->refused, 1u, __ATOMIC_RELAXED);
+	return false;
+}
+
 /* --- Bulk and interrupt --- */
 
 static void bulk_done(void *refcon, IOReturn result, void *arg0)
@@ -144,7 +151,7 @@ static bool ubus_submit(void *ctx, uint8_t pipe, void *buf, uint32_t size, void 
 	r = acquire(b);
 	if (!r) {
 		ozzy_log("pipe 0x%02x: no free request", pipe);
-		return false;
+		return refuse(p);
 	}
 	r->pipe = p;
 	r->xfer = xfer;
@@ -158,7 +165,7 @@ static bool ubus_submit(void *ctx, uint8_t pipe, void *buf, uint32_t size, void 
 		__atomic_fetch_sub(&b->pending, 1, __ATOMIC_RELEASE);
 		release(b, r);
 		ozzy_log("pipe 0x%02x submit failed: 0x%x", pipe, (unsigned int)kr);
-		return false;
+		return refuse(p);
 	}
 	__atomic_store_n(&p->submitted, true, __ATOMIC_RELAXED);
 	return true;
@@ -218,7 +225,9 @@ static void isoc_done(void *refcon, IOReturn result, void *arg0)
 /*
  * As KextBus::SubmitIsoc, with the frame io(): the frame list goes back to back from one
  * buffer (isoc_plan). Each transfer starts where the pipe's previous one ended, the first
- * ISOC_LEAD_FRAMES ahead of the bus.
+ * ISOC_LEAD_FRAMES ahead of the bus. A transfer whose start has already passed means the
+ * pipe's whole queue ran dry: it starts ISOC_LEAD_FRAMES out instead and is counted as late
+ * (ubus_pipe_late), since the device has had a hole in the stream.
  */
 static bool ubus_submit_isoc(void *ctx, uint8_t pipe, void *buf, uint32_t buf_size, struct ozzy_isoc_packet *packets,
 			     uint32_t count, void *xfer)
@@ -227,22 +236,24 @@ static bool ubus_submit_isoc(void *ctx, uint8_t pipe, void *buf, uint32_t buf_si
 	struct ubus_pipe *p = find_pipe(b, pipe);
 	struct ubus_request *r;
 	ubus_interface_t intf;
-	uint64_t uframe = 0, host = 0, first, frames;
-	bool in = pipe & 0x80, have_clock;
+	uint64_t uframe = 0, host = 0, first, frames, behind;
+	bool in = pipe & 0x80, have_clock, late;
 	IOReturn kr;
 	uint32_t i;
 
-	if (!p || p->type != kUSBIsoc || count == 0 || count > OZZY_MAX_ISOC_PACKETS)
+	if (!p)
 		return false;
+	if (p->type != kUSBIsoc || count == 0 || count > OZZY_MAX_ISOC_PACKETS)
+		return refuse(p);
 	r = acquire(b);
 	if (!r) {
 		ozzy_log("isoc pipe 0x%02x: no free request", pipe);
-		return false;
+		return refuse(p);
 	}
 	if (!isoc_plan_make(&r->plan, buf, buf_size, packets, count, r->bounce, b->bounce_size, !in)) {
 		release(b, r);
 		ozzy_log("isoc pipe 0x%02x: %u packets don't fit the bounce buffer", pipe, count);
-		return false;
+		return refuse(p);
 	}
 	for (i = 0; i < count; i++) {
 		r->frames[i].frStatus = kIOReturnSuccess;
@@ -261,10 +272,7 @@ static bool ubus_submit_isoc(void *ctx, uint8_t pipe, void *buf, uint32_t buf_si
 	os_unfair_lock_lock(&b->lock);
 	if (have_clock)
 		frame_clock_sample(&b->clock, uframe, host);
-	if (p->next_frame <= uframe / 8)
-		p->next_frame = uframe / 8 + ISOC_LEAD_FRAMES;
-	first = p->next_frame;
-	p->next_frame += frames;
+	late = isoc_schedule(&p->next_frame, uframe / 8, frames, ISOC_LEAD_FRAMES, &first, &behind);
 	r->start_uframe = first * 8;
 	isoc_plan_times(packets, count, &b->clock, r->start_uframe, p->uframes_per_packet);
 	os_unfair_lock_unlock(&b->lock);
@@ -281,9 +289,14 @@ static bool ubus_submit_isoc(void *ctx, uint8_t pipe, void *buf, uint32_t buf_si
 		release(b, r);
 		ozzy_log("isoc pipe 0x%02x submit failed: 0x%x (frame %llu, bus %llu)", pipe, (unsigned int)kr,
 			 (unsigned long long)first, (unsigned long long)(uframe / 8));
-		return false;
+		return refuse(p);
 	}
 	__atomic_store_n(&p->submitted, true, __ATOMIC_RELAXED);
+	if (late) {
+		__atomic_fetch_add(&p->late, 1u, __ATOMIC_RELAXED);
+		ozzy_log("isoc pipe 0x%02x: late, its queue ran dry %llu frame(s) ago; resumed at frame %llu", pipe,
+			 (unsigned long long)behind, (unsigned long long)first);
+	}
 	return true;
 }
 
@@ -538,8 +551,10 @@ static void ubus_abort(void *ctx)
 			ozzy_log("%d transfers still pending after abort", __atomic_load_n(&b->pending, __ATOMIC_ACQUIRE));
 	}
 	os_unfair_lock_lock(&b->lock);
-	for (i = 0; i < UBUS_PIPE_SLOTS; i++)
+	for (i = 0; i < UBUS_PIPE_SLOTS; i++) {
 		b->pipes[i].next_frame = 0;
+		__atomic_store_n(&b->pipes[i].refused, 0u, __ATOMIC_RELAXED);
+	}
 	os_unfair_lock_unlock(&b->lock);
 }
 
@@ -796,6 +811,7 @@ void ubus_watch_reset(struct user_bus *b)
 		__atomic_store_n(&b->pipes[i].last_done, now, __ATOMIC_RELAXED);
 		__atomic_store_n(&b->pipes[i].last_data, now, __ATOMIC_RELAXED);
 		__atomic_store_n(&b->pipes[i].error_streak, 0u, __ATOMIC_RELAXED);
+		__atomic_store_n(&b->pipes[i].late, 0u, __ATOMIC_RELAXED);
 		__atomic_store_n(&b->pipes[i].submitted, false, __ATOMIC_RELAXED);
 	}
 }
@@ -821,6 +837,20 @@ uint32_t ubus_pipe_errors(struct user_bus *b, uint8_t address)
 	struct ubus_pipe *p = find_pipe(b, address);
 
 	return p ? __atomic_load_n(&p->error_streak, __ATOMIC_RELAXED) : 0;
+}
+
+uint32_t ubus_pipe_late(struct user_bus *b, uint8_t address)
+{
+	struct ubus_pipe *p = find_pipe(b, address);
+
+	return p ? __atomic_load_n(&p->late, __ATOMIC_RELAXED) : 0;
+}
+
+uint32_t ubus_pipe_refused(struct user_bus *b, uint8_t address)
+{
+	struct ubus_pipe *p = find_pipe(b, address);
+
+	return p ? __atomic_load_n(&p->refused, __ATOMIC_RELAXED) : 0;
 }
 
 void ubus_close(struct user_bus *b)

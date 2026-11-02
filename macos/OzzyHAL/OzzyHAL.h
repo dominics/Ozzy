@@ -15,6 +15,7 @@
 #include "PloytecCodec.h"   // the codec function pointer types
 #include "../Shared/OzzyBackend.h"
 #include "OzzyHALExtras.h"
+#include "OzzyTimeline.h"
 
 /* The macOS 12 SDK renamed kAudioObjectPropertyElementMaster; older SDKs only have that name */
 #ifndef __MAC_12_0
@@ -29,6 +30,7 @@
 #define kOzzyMaxDevices         8
 #define kOzzyObjectIDBase       100
 #define kOzzyObjectsPerDevice   16
+static_assert(kOzzyObjectKinds <= kOzzyObjectsPerDevice, "a device's objects (OzzyHALObjects.h) fit its slot");
 
 class OzzyHALDevice {
 public:
@@ -63,6 +65,8 @@ public:
     // OZZY_PROPERTY_CLIENTS's data: a new CFArray of the clients doing IO
     CFArrayRef CopyClientsArray() const;
     HRESULT GetZeroTimeStamp(Float64* outSampleTime, UInt64* outHostTime, UInt64* outSeed);
+    // The engine's clock (struct ozzy_timestamp): false while unmapped; *got: the read succeeded
+    bool ReadClock(bool* got, uint64_t* sampleTime, uint64_t* hostTime);
     OSStatus ioOperation(UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo, void* ioMainBuffer);
 
     Float64 GetNominalSampleRate() const;
@@ -119,6 +123,10 @@ public:
     // CoreAudio stopped IO for a setting or rate change: send it to the kext, re-read the
     // format, keep it
     OSStatus PerformConfigurationChange(AudioServerPlugInHostRef host, UInt64 action);
+    void AbortConfigurationChange(UInt64 action);
+    // The monitor thread: if the driver's layout is no longer the one applied (and no change is
+    // under way), ask CoreAudio for a configuration change that applies it
+    void CheckLayout(AudioServerPlugInHostRef host);
 
     AudioChannelLayout* GetPreferredChannelLayout(AudioObjectPropertyScope inScope);
     UInt32 GetPreferredChannelLayoutSize(AudioObjectPropertyScope inScope) const;
@@ -192,9 +200,8 @@ private:
     kern_return_t StartDeviceIO();
     void StopDeviceIO();
     void NotifyClients(AudioServerPlugInHostRef host);
-    uint32_t mTimestampSeed = 1;
-    // The last real anchor GetZeroTimeStamp handed out (host time 0: none since IO started)
-    uint64_t mAnchorSample = 0, mAnchorHost = 0;
+    // GetZeroTimeStamp's anchors and seed (OzzyTimeline.h)
+    struct ozzy_timeline mTimeline = { 1, 0, 0, 0, 0 };
 
     // Kext connection. The monitor thread maps and unmaps; CoreAudio's threads use the
     // mapping between AcquireSHM and ReleaseSHM, and Unmap waits for them to finish.
@@ -211,6 +218,14 @@ private:
     ozzy_shared_memory* AcquireSHM();
     void ReleaseSHM();
     void ApplyDeviceConfig();
+    // ApplyDeviceConfig, keeping the layout it applies (mLayout); with the mapping held
+    void ApplyLayout(const ozzy_shared_memory* shm);
+    OzzyLayout mLayout = {};           // the layout ApplyLayout applied last (mLayoutLock)
+    std::mutex mLayoutLock;
+    std::atomic<bool> mChanging { false };            // PerformConfigurationChange is running
+    std::atomic<bool> mRelayoutRequested { false };   // CheckLayout asked CoreAudio for a change
+    bool mLayoutDiffers = false;       // CheckLayout's last poll saw mDifferentLayout (monitor thread)
+    OzzyLayout mDifferentLayout = {};
     kern_return_t CallSetRate(uint32_t rate);
     kern_return_t CallApplySetting(unsigned int id, uint32_t value);
     CFStringRef CopySettingKey(unsigned int id) const;

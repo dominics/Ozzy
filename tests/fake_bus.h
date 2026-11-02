@@ -2,7 +2,8 @@
 /*
  * A fake USB bus for host tests of engine/: transfers queue up and complete when the test
  * says so, control requests answer like a Ploytec device (the rate read returns the rate last
- * set), and everything the engine does can be traced, one line per call.
+ * set), and everything the engine does can be traced, one line per call. A test can make the
+ * rate read answer another rate and control requests fail.
  *
  * Copyright (C) 2024 Marcel Bierling <marcel@hackerman.art>
  */
@@ -31,10 +32,14 @@ struct fake_bus {
 	unsigned int head, tail;
 	uint8_t rate[3];                   /* last UAC1 SET_CUR rate */
 	uint8_t i_reg[4];                  /* what an 'I' read of wIndex 0-3 answers (0 by default) */
+	uint32_t rate_reads;               /* nonzero: the rate read answers this rate, not the last set */
+	unsigned int control_fails;        /* the next this many control requests fail */
+	unsigned int controls;             /* control requests made */
 	uint64_t ticks;
 	uint64_t hz;                       /* 0: the clock ticks once per call; else it reads @now */
 	uint64_t now;                      /* the clock, in @hz ticks a second, as the test sets it */
 	unsigned int stats_changed;        /* stats_changed calls */
+	unsigned int pcm_stalled;          /* pcm_stalled calls */
 	bool timer_on;
 	uint64_t progress[OZZY_PCM_DIRS];  /* last pcm_progress */
 	bool rings;                        /* has pcm_progress (a ring platform) */

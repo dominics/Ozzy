@@ -11,6 +11,38 @@
 #include "check.h"
 #include <string.h>
 
+/*
+ * Indices past the ring, as another process sharing the memory could write them: push and
+ * pop stay inside the buffer, store masked indices, and pop ends.
+ */
+static void check_corrupt_indices(void)
+{
+	static struct {
+		struct ozzy_midi_buffer ring;
+		uint8_t guard[4096];
+	} g;
+	static const uint32_t bad[][2] = { { 0xFFFFFFF0u, 5000 }, { 5000, 0xFFFFFFF0u }, { 0x80000400u, 0x400 } };
+	uint8_t bytes[2048], out[2048];
+	uint32_t i, k, pushed, popped;
+
+	for (i = 0; i < sizeof(bytes); i++)
+		bytes[i] = (uint8_t)(i + 1);
+	for (k = 0; k < sizeof(bad) / sizeof(bad[0]); k++) {
+		memset(&g, 0xA5, sizeof(g));
+		g.ring.write_index = bad[k][0];
+		g.ring.read_index = bad[k][1];
+		pushed = ozzy_midi_ring_push(&g.ring, bytes, sizeof(bytes));
+		CHECK(pushed < OZZY_MIDI_RING_SIZE && g.ring.write_index <= OZZY_MIDI_RING_MASK,
+		      "case %u: pushed %u, write index %u", k, pushed, (unsigned int)g.ring.write_index);
+		popped = ozzy_midi_ring_pop(&g.ring, out, sizeof(out));
+		CHECK(popped < OZZY_MIDI_RING_SIZE && g.ring.read_index <= OZZY_MIDI_RING_MASK,
+		      "case %u: popped %u, read index %u", k, popped, (unsigned int)g.ring.read_index);
+		for (i = 0; i < sizeof(g.guard) && g.guard[i] == 0xA5; i++)
+			;
+		CHECK(i == sizeof(g.guard), "case %u: wrote past the ring at byte %u", k, i);
+	}
+}
+
 int main(void)
 {
 	static struct ozzy_midi_buffer ring;
@@ -41,5 +73,7 @@ int main(void)
 	/* Empty queue, room in the ring: straight through, nothing queued */
 	moved = ozzy_midi_queue_write(&ring, &q, data, 10);
 	CHECK(moved == 10 && !ozzy_midi_queue_pending(&q), "direct write moved %u", moved);
+
+	check_corrupt_indices();
 	return CHECK_DONE("midi queue");
 }
