@@ -130,6 +130,10 @@ public:
 
     // The fork's volume, mute, channel names and stereo pairs (OzzyHALExtras.h)
     OzzyHALExtras& Extras() { return mExtras; }
+    // IO thread of a mono input device (OzzyHALMono.h): device input @channel (1-based) of the
+    // cycle into @out, decoded @chunk frames at a time through @scratch (@chunk x 16 floats)
+    void ReadInputChannel(uint32_t channel, UInt32 frames, const AudioServerPlugInIOCycleInfo* cycle, float* out,
+                          float* scratch, uint32_t chunk);
 
 private:
     uint32_t mSlot = 0;

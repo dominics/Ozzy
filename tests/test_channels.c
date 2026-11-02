@@ -2,8 +2,8 @@
 /*
  * OzzyHAL's channel names and stereo pairs (macos/OzzyHAL/OzzyChannels.h): the CMS 600-3's
  * names and roles by 1-based element, nothing out of range or for unlisted models, and the
- * stereo pair's checks, fallback and packing. Every channel map's key is a device-table model
- * with that many channels.
+ * stereo pair's checks, fallback and packing, and the CMS 600-3's MON and AUX mono inputs.
+ * Every channel map's key is a device-table model with that many channels.
  */
 
 #include "macos/OzzyHAL/OzzyChannels.h"
@@ -47,6 +47,23 @@ int main(void)
 				model = &ozzy_devices[k];
 		CHECK(model && model->in_channels == m->inputs && model->out_channels == m->outputs,
 		      "channel map %s: not a device-table model with %u in / %u out", m->key, m->inputs, m->outputs);
+	}
+
+	{
+		const struct ozzy_mono_input *mono[OZZY_MAX_MONO_INPUTS];
+
+		CHECK(ozzy_mono_inputs_for(cms, mono) == 2 && strcmp(mono[0]->name, "MON") == 0 && mono[0]->channel == 4 &&
+		      strcmp(mono[1]->name, "AUX") == 0 && mono[1]->channel == 3, "CMS 600-3: MON on 4, AUX on 3");
+		CHECK(strcmp(mono[0]->uid_suffix, mono[1]->uid_suffix) != 0, "MON and AUX share a UID");
+		CHECK(ozzy_mono_inputs_for(db4, mono) == 0 && ozzy_mono_inputs_for(NULL, mono) == 0, "mono inputs elsewhere");
+	}
+	for (i = 0; i < sizeof(ozzy_mono_inputs) / sizeof(ozzy_mono_inputs[0]); i++) {
+		const struct ozzy_mono_input *m = &ozzy_mono_inputs[i];
+		unsigned int k, found = 0;
+
+		for (k = 0; k < OZZY_NUM_DEVICES; k++)
+			found |= strcmp(ozzy_devices[k].key, m->key) == 0 && m->channel >= 1 && m->channel <= ozzy_devices[k].in_channels;
+		CHECK(found, "mono input %s %s: not a channel of a device-table model", m->key, m->name);
 	}
 
 	CHECK(ozzy_stereo_pair_valid(a, 4) && ozzy_stereo_pair_valid(b, 4) && ozzy_stereo_pair_valid(c, 4), "valid pairs");

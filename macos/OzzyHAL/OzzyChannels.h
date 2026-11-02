@@ -2,7 +2,8 @@
 /*
  * What a device's channels carry, per device-table model (common/ozzy_devices.def key), for
  * OzzyHAL's channel names (kAudioObjectPropertyElementName), its preferred channel layout and
- * its preferred stereo pair. Models not listed here keep unnamed, unlabelled channels. C,
+ * its preferred stereo pair, and the mono input devices it publishes next to a model's main
+ * device. Models not listed here keep unnamed, unlabelled channels. C,
  * usable from C++ (OzzyHAL) and the host tests (tests/test_channels.c).
  */
 
@@ -75,6 +76,38 @@ static inline const struct ozzy_channel_info *ozzy_channel(const struct ozzy_dev
 	if (!m || element < 1 || element > (output ? m->outputs : m->inputs))
 		return NULL;
 	return output ? &m->out[element - 1] : &m->in[element - 1];
+}
+
+/*
+ * A one-channel input device OzzyHAL publishes next to a model's main device, for apps that only
+ * record channels 1-2: the CMS 600-3's AUX and MON sends. It shares the main device's engine,
+ * clock and rate; its UID is the main device's with @uid_suffix.
+ */
+struct ozzy_mono_input {
+	const char *key;            /* struct ozzy_device.key */
+	const char *name;           /* after the main device's name, e.g. "Dynacord CMS 600-3 MON" */
+	const char *uid_suffix;
+	uint8_t channel;            /* the main device's 1-based input channel */
+};
+
+#define OZZY_MAX_MONO_INPUTS 2   /* per model */
+
+static const struct ozzy_mono_input ozzy_mono_inputs[] = {
+	{ "DynacordCMS600", "MON", ":MON", 4 },
+	{ "DynacordCMS600", "AUX", ":AUX", 3 },
+};
+
+/* @model's mono input devices into @out (OZZY_MAX_MONO_INPUTS); returns how many */
+static inline unsigned int ozzy_mono_inputs_for(const struct ozzy_device *model,
+						const struct ozzy_mono_input *out[OZZY_MAX_MONO_INPUTS])
+{
+	unsigned int i, n = 0;
+
+	for (i = 0; model && i < sizeof(ozzy_mono_inputs) / sizeof(ozzy_mono_inputs[0]); i++)
+		if (strcmp(ozzy_mono_inputs[i].key, model->key) == 0 && n < OZZY_MAX_MONO_INPUTS &&
+		    ozzy_mono_inputs[i].channel >= 1 && ozzy_mono_inputs[i].channel <= model->in_channels)
+			out[n++] = &ozzy_mono_inputs[i];
+	return n;
 }
 
 /* The two 1-based channels a stereo client plays to or records from */

@@ -1,4 +1,5 @@
 #include "OzzyHAL.h"
+#include "OzzyHALMono.h"
 #include "../../common/devices/ploytec/ploytec_protocol.h"
 #include "../Shared/OzzyLog.h"
 #include "../Shared/OzzyKextClient.h"
@@ -550,6 +551,7 @@ void OzzyHALDevice::NotifyDeviceChanged(AudioServerPlugInHostRef host) {
         AudioObjectPropertyAddress aliveAddr = { kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
         host->PropertiesChanged(host, dev, 1, &aliveAddr);
     }
+    OzzyMonoNotify(this, host);
 }
 
 /* Publish the device once the engine is up, withdraw it when it goes down */
@@ -740,6 +742,26 @@ OSStatus OzzyHALDevice::ioOperation(UInt32 inOperationID, UInt32 inIOBufferFrame
     return kAudioHardwareNoError;
 }
 
+void OzzyHALDevice::ReadInputChannel(uint32_t channel, UInt32 frames, const AudioServerPlugInIOCycleInfo* cycle, float* out,
+                                     float* scratch, uint32_t chunk) {
+    ozzy_shared_memory* shm = AcquireSHM();
+    uint32_t channels = mInputChannels;
+    if (!shm || !mReadInput || channel < 1 || channel > channels || channels > kOzzyMonoMaxChannels) {
+        memset(out, 0, frames * sizeof(float));
+        ReleaseSHM();
+        return;
+    }
+    // The device's channel, before the capture routing (the routes are the main device's)
+    uint64_t sampleTime = (uint64_t)cycle->mInputTime.mSampleTime;
+    for (UInt32 done = 0; done < frames;) {
+        UInt32 n = frames - done < chunk ? frames - done : chunk;
+        mReadInput(scratch, shm->audio.input_buffer, sampleTime + done, n, mInRingFrames);
+        for (UInt32 k = 0; k < n; k++) out[done + k] = scratch[k * channels + channel - 1];
+        done += n;
+    }
+    ReleaseSHM();
+}
+
 CFStringRef OzzyHALDevice::GetDeviceName() const { return mModelUID; }
 CFStringRef OzzyHALDevice::GetManufacturer() const { return mManufacturerUID; }
 CFStringRef OzzyHALDevice::GetDeviceUID() const { return mDeviceUID; }
@@ -836,6 +858,9 @@ UInt32 OzzyHAL::GetDeviceList(AudioObjectID* outIDs, UInt32 maxIDs) const {
         if (!mDevices[i].IsConnected()) continue;
         if (outIDs && count < maxIDs) outIDs[count] = mDevices[i].GetDeviceID();
         count++;
+        OzzyHALDevice* dev = const_cast<OzzyHALDevice*>(&mDevices[i]);
+        count += OzzyMonoDeviceList(dev, outIDs ? outIDs + (count < maxIDs ? count : maxIDs) : nullptr,
+                                    count < maxIDs ? maxIDs - count : 0);
     }
     return count;
 }
@@ -962,7 +987,7 @@ void OzzyHAL::MonitorLoop() {
 // AudioServerPlugIn entry points
 // ============================================================================
 
-enum OzzyObjectKind { kOzzyObjectDevice = 0, kOzzyObjectInputStream = 1, kOzzyObjectOutputStream = 2,
+enum OzzyObjectKind : uint32_t { kOzzyObjectDevice = 0, kOzzyObjectInputStream = 1, kOzzyObjectOutputStream = 2,
                      kOzzyObjectClockControl = 3 };
 
 static OzzyObjectKind ObjectKind(AudioObjectID objectID) {
@@ -978,12 +1003,12 @@ extern "C" HRESULT OzzyCreateDevice(AudioServerPlugInDriverRef, CFDictionaryRef,
 extern "C" HRESULT OzzyDestroyDevice(AudioServerPlugInDriverRef, AudioObjectID) { return kAudioHardwareNoError; }
 extern "C" HRESULT OzzyAddDeviceClient(AudioServerPlugInDriverRef, AudioObjectID inDeviceObjectID, const AudioServerPlugInClientInfo* inClientInfo) {
     OzzyHALDevice* dev = OzzyHAL::Get().DeviceForObject(inDeviceObjectID);
-    if (dev) dev->AddClient(inClientInfo);
+    if (dev && !OzzyIsMonoObject(ObjectKind(inDeviceObjectID))) dev->AddClient(inClientInfo);
     return kAudioHardwareNoError;
 }
 extern "C" HRESULT OzzyRemoveDeviceClient(AudioServerPlugInDriverRef, AudioObjectID inDeviceObjectID, const AudioServerPlugInClientInfo* inClientInfo) {
     OzzyHALDevice* dev = OzzyHAL::Get().DeviceForObject(inDeviceObjectID);
-    if (dev && inClientInfo) dev->RemoveClient(inClientInfo->mClientID);
+    if (dev && inClientInfo && !OzzyIsMonoObject(ObjectKind(inDeviceObjectID))) dev->RemoveClient(inClientInfo->mClientID);
     return kAudioHardwareNoError;
 }
 extern "C" HRESULT OzzyPerformDeviceConfigurationChange(AudioServerPlugInDriverRef, AudioObjectID inDeviceObjectID, UInt64 inChangeAction, void*) {
@@ -1004,6 +1029,7 @@ extern "C" Boolean OzzyHasProperty(AudioServerPlugInDriverRef, AudioObjectID inO
     }
     OzzyHALDevice* dev = OzzyHAL::Get().DeviceForObject(inObjectID);
     if (!dev) return false;
+    if (OzzyIsMonoObject(ObjectKind(inObjectID))) return OzzyMonoHasProperty(dev, ObjectKind(inObjectID), inAddress);
     if (OzzyIsExtraControl(ObjectKind(inObjectID))) return OzzyHALExtras::HasControlProperty(ObjectKind(inObjectID), inAddress);
     if (ObjectKind(inObjectID) == kOzzyObjectClockControl) {
         if (!dev->HasSetting(OZZY_SETTING_CLOCK_SOURCE)) return false;
@@ -1052,6 +1078,11 @@ extern "C" Boolean OzzyHasProperty(AudioServerPlugInDriverRef, AudioObjectID inO
 
 extern "C" HRESULT OzzyIsPropertySettable(AudioServerPlugInDriverRef, AudioObjectID inObjectID, pid_t, const AudioObjectPropertyAddress* inAddress, Boolean* outIsSettable) {
     OzzyHALDevice* dev = OzzyHAL::Get().DeviceForObject(inObjectID);
+    if (dev && OzzyIsMonoObject(ObjectKind(inObjectID))) {
+        *outIsSettable = dev->Extras().Mono(OzzyMonoIndex(ObjectKind(inObjectID))) &&
+                         OzzyMonoIsPropertySettable(ObjectKind(inObjectID), inAddress);
+        return kAudioHardwareNoError;
+    }
     *outIsSettable = dev && ((ObjectKind(inObjectID) == kOzzyObjectClockControl &&
                               dev->HasSetting(OZZY_SETTING_CLOCK_SOURCE) &&
                               inAddress->mSelector == kAudioSelectorControlPropertyCurrentItem) ||
@@ -1084,6 +1115,8 @@ extern "C" HRESULT OzzyGetPropertyDataSize(AudioServerPlugInDriverRef, AudioObje
     OzzyHALDevice* dev = OzzyHAL::Get().DeviceForObject(inObjectID);
     if (!dev) return kAudioHardwareBadObjectError;
     UInt32 controls = dev->HasSetting(OZZY_SETTING_CLOCK_SOURCE) ? 1 : 0;
+    if (OzzyIsMonoObject(ObjectKind(inObjectID)))
+        return OzzyMonoGetPropertyData(dev, ObjectKind(inObjectID), inAddress, 0, outDataSize, nullptr);
     if (OzzyIsExtraControl(ObjectKind(inObjectID)))
         return OzzyHALExtras::GetControlPropertyDataSize(ObjectKind(inObjectID), inAddress, outDataSize);
     OSStatus extraStatus;
@@ -1172,6 +1205,8 @@ extern "C" HRESULT OzzyGetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
     OzzyHALDevice* dev = OzzyHAL::Get().DeviceForObject(inObjectID);
     if (!dev) return kAudioHardwareBadObjectError;
     bool hasClock = dev->HasSetting(OZZY_SETTING_CLOCK_SOURCE);
+    if (OzzyIsMonoObject(ObjectKind(inObjectID)))
+        return OzzyMonoGetPropertyData(dev, ObjectKind(inObjectID), inAddress, inMax, outSize, outData);
     if (OzzyIsExtraControl(ObjectKind(inObjectID)))
         return dev->Extras().GetControlPropertyData(dev->GetDeviceID(), ObjectKind(inObjectID), inAddress, inMax, outSize, outData);
     OSStatus extraStatus;
@@ -1345,6 +1380,8 @@ extern "C" HRESULT OzzyGetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
 extern "C" HRESULT OzzySetPropertyData(AudioServerPlugInDriverRef, AudioObjectID inObjectID, pid_t, const AudioObjectPropertyAddress* inAddress, UInt32, const void*, UInt32 inDataSize, const void* inData) {
     OzzyHALDevice* dev = OzzyHAL::Get().DeviceForObject(inObjectID);
     if (!dev) return kAudioHardwareBadObjectError;
+    if (OzzyIsMonoObject(ObjectKind(inObjectID)))
+        return OzzyMonoSetPropertyData(dev, OzzyHAL::Get().GetHost(), ObjectKind(inObjectID), inAddress, inDataSize, inData);
     if (OzzyIsExtraControl(ObjectKind(inObjectID)))
         return dev->Extras().SetControlPropertyData(OzzyHAL::Get().GetHost(), dev->GetDeviceID(), ObjectKind(inObjectID),
                                                     inAddress, inDataSize, inData);
@@ -1375,20 +1412,28 @@ extern "C" HRESULT OzzySetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
 }
 extern "C" HRESULT OzzyStartIO(AudioServerPlugInDriverRef, AudioObjectID inDeviceObjectID, UInt32 inClientID) {
     OzzyHALDevice* dev = OzzyHAL::Get().DeviceForObject(inDeviceObjectID);
+    if (dev && OzzyIsMonoObject(ObjectKind(inDeviceObjectID))) return OzzyMonoStartIO(dev, ObjectKind(inDeviceObjectID));
     return dev ? dev->StartIO(OzzyHAL::Get().GetHost(), inClientID) : kAudioHardwareBadObjectError;
 }
 extern "C" HRESULT OzzyStopIO(AudioServerPlugInDriverRef, AudioObjectID inDeviceObjectID, UInt32 inClientID) {
     OzzyHALDevice* dev = OzzyHAL::Get().DeviceForObject(inDeviceObjectID);
+    if (dev && OzzyIsMonoObject(ObjectKind(inDeviceObjectID))) return OzzyMonoStopIO(dev, ObjectKind(inDeviceObjectID));
     return dev ? dev->StopIO(OzzyHAL::Get().GetHost(), inClientID) : kAudioHardwareBadObjectError;
 }
 extern "C" HRESULT OzzyGetZeroTimeStamp(AudioServerPlugInDriverRef, AudioObjectID inDeviceObjectID, UInt32, Float64* outSampleTime, UInt64* outHostTime, UInt64* outSeed) {
     OzzyHALDevice* dev = OzzyHAL::Get().DeviceForObject(inDeviceObjectID);
+    if (dev && OzzyIsMonoObject(ObjectKind(inDeviceObjectID)))
+        return OzzyMonoGetZeroTimeStamp(dev, ObjectKind(inDeviceObjectID), outSampleTime, outHostTime, outSeed);
     return dev ? dev->GetZeroTimeStamp(outSampleTime, outHostTime, outSeed) : kAudioHardwareBadObjectError;
 }
-extern "C" OSStatus OzzyWillDoIOOperation(AudioServerPlugInDriverRef, AudioObjectID, UInt32, UInt32 inOperationID, Boolean* outWillDo, Boolean* outWillDoInPlace) { bool willDo = false; bool willDoInPlace = true; switch (inOperationID) { case kAudioServerPlugInIOOperationWriteMix: case kAudioServerPlugInIOOperationReadInput: willDo = true; break; default: willDo = false; break; } if (outWillDo) *outWillDo = willDo; if (outWillDoInPlace) *outWillDoInPlace = willDoInPlace; return kAudioHardwareNoError; }
+extern "C" OSStatus OzzyWillDoIOOperation(AudioServerPlugInDriverRef, AudioObjectID inDeviceObjectID, UInt32, UInt32 inOperationID, Boolean* outWillDo, Boolean* outWillDoInPlace) { bool willDo = false; bool willDoInPlace = true; switch (inOperationID) { case kAudioServerPlugInIOOperationWriteMix: case kAudioServerPlugInIOOperationReadInput: willDo = true; break; default: willDo = false; break; }
+    // A mono input device only reads
+    if (inDeviceObjectID >= kOzzyObjectIDBase && OzzyIsMonoObject(ObjectKind(inDeviceObjectID))) willDo = inOperationID == kAudioServerPlugInIOOperationReadInput; if (outWillDo) *outWillDo = willDo; if (outWillDoInPlace) *outWillDoInPlace = willDoInPlace; return kAudioHardwareNoError; }
 extern "C" OSStatus OzzyBeginIOOperation(AudioServerPlugInDriverRef, AudioObjectID, UInt32, UInt32, UInt32, const AudioServerPlugInIOCycleInfo*) { return 0; }
 extern "C" OSStatus OzzyDoIOOperation(AudioServerPlugInDriverRef, AudioObjectID inDeviceObjectID, UInt32, UInt32, UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo, void* ioMainBuffer, void*) {
     OzzyHALDevice* dev = OzzyHAL::Get().DeviceForObject(inDeviceObjectID);
+    if (dev && OzzyIsMonoObject(ObjectKind(inDeviceObjectID)))
+        return OzzyMonoDoIOOperation(dev, ObjectKind(inDeviceObjectID), inOperationID, inIOBufferFrameSize, inIOCycleInfo, ioMainBuffer);
     return dev ? dev->ioOperation(inOperationID, inIOBufferFrameSize, inIOCycleInfo, ioMainBuffer) : kAudioHardwareBadObjectError;
 }
 extern "C" OSStatus OzzyEndIOOperation(AudioServerPlugInDriverRef, AudioObjectID, UInt32, UInt32, UInt32, const AudioServerPlugInIOCycleInfo*) { return 0; }

@@ -5,6 +5,9 @@
  *   ring, as each device's objects kOzzyObjectVolumeControl and kOzzyObjectMuteControl
  * - channel names (kAudioObjectPropertyElementName), speaker labels in the preferred channel
  *   layout and a preferred stereo pair per direction, per device-table model (OzzyChannels.h)
+ * - mono input devices next to the main one (the CMS 600-3's MON and AUX, OzzyChannels.h), as
+ *   each device's objects from kOzzyObjectMonoDevice: their state here, their properties and
+ *   IO in OzzyHALMono.h
  * Volume, mute and the stereo pairs are kept in CoreAudio's plug-in storage per device UID, like
  * the device settings. C++ (OzzyHAL).
  */
@@ -23,8 +26,18 @@
 enum OzzyExtraObjectKind : uint32_t {
     kOzzyObjectVolumeControl = 4,
     kOzzyObjectMuteControl = 5,
-    kOzzyObjectKinds = 6,          // the objects a device has, upstream's and these
+    kOzzyObjectMonoDevice = 6,     // mono input i: its device at 6 + 2i, its stream at 7 + 2i
+    kOzzyObjectKinds = kOzzyObjectMonoDevice + 2 * OZZY_MAX_MONO_INPUTS,   // the objects a device has
 };
+
+/* Frames a mono input device decodes at a time (OzzyHALMono.h) */
+static const uint32_t kOzzyMonoChunkFrames = 256;
+static const uint32_t kOzzyMonoMaxChannels = 16;
+
+/* The mono input index of an object kind, or -1 */
+static inline int OzzyMonoIndex(uint32_t kind) {
+    return kind >= kOzzyObjectMonoDevice && kind < kOzzyObjectKinds ? (int)(kind - kOzzyObjectMonoDevice) / 2 : -1;
+}
 
 /* The controls each device has, in its control list after the clock source */
 static const UInt32 kOzzyExtraControls = 2;
@@ -40,7 +53,21 @@ public:
         mModel = model;
         mInputs = inputs;
         mOutputs = outputs;
+        mMonoCount = inputs <= kOzzyMonoMaxChannels ? ozzy_mono_inputs_for(model, mMono) : 0;
     }
+
+    // --- Mono input devices (OzzyHALMono.h) ---
+
+    /* Mono input @i, or null if the device has none at that index */
+    const struct ozzy_mono_input* Mono(int i) const {
+        return i >= 0 && (unsigned int)i < mMonoCount ? mMono[i] : nullptr;
+    }
+    unsigned int MonoCount() const { return mMonoCount; }
+    /* Its IO: clients that started it, and its timeline's seed */
+    std::atomic<int> mMonoIO[OZZY_MAX_MONO_INPUTS] = {};
+    std::atomic<uint64_t> mMonoSeed[OZZY_MAX_MONO_INPUTS] = {};
+    /* Its IO thread's decode buffer (each device has an IO thread of its own) */
+    float mMonoScratch[OZZY_MAX_MONO_INPUTS][kOzzyMonoChunkFrames * kOzzyMonoMaxChannels];
 
     /* The device came up as @uid: what storage has for it (defaults where it has nothing) */
     void Restore(AudioServerPlugInHostRef host, CFStringRef uid) {
@@ -64,6 +91,10 @@ public:
             if (CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)v, kCFNumberSInt32Type, &n))
                 pairs[out] = (uint32_t)n;
             CFRelease(v);
+        }
+        for (unsigned int i = 0; i < OZZY_MAX_MONO_INPUTS; i++) {
+            mMonoIO[i].store(0);
+            mMonoSeed[i].fetch_add(1);
         }
         mVolume.store(ozzy_volume_clamp(volume));
         mMuted.store(muted);
@@ -272,6 +303,8 @@ private:
 
     const struct ozzy_device* mModel = nullptr;
     uint32_t mInputs = 0, mOutputs = 0;
+    const struct ozzy_mono_input* mMono[OZZY_MAX_MONO_INPUTS] = {};
+    unsigned int mMonoCount = 0;
     CFStringRef mUID = nullptr;
     std::atomic<float> mVolume { 1.0f };
     std::atomic<bool> mMuted { false };
