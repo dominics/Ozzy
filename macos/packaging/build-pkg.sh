@@ -34,8 +34,8 @@ xc() {
 		GCC_PREPROCESSOR_DEFINITIONS="\$(inherited) OZZY_GIT_VERSION=\\\"$VERSION\\\"" \
 		OTHER_LDFLAGS="$2" build
 }
-xc OzzyHAL "-framework IOKit -framework CoreFoundation"
-xc OzzyMIDI "-framework IOKit -framework CoreFoundation -framework CoreMIDI"
+xc OzzyHAL "\$(inherited) -framework IOKit -framework CoreFoundation"
+xc OzzyMIDI "\$(inherited) -framework IOKit -framework CoreFoundation -framework CoreMIDI"
 PRODUCTS="$WORK/dd/Build/Products/Release"
 
 make -s -C Backends/OzzyDaemon clean
