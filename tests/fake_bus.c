@@ -49,11 +49,20 @@ static bool fb_control(void *ctx, uint8_t type, uint8_t req, uint16_t val, uint1
 
 	if (fb->trace)
 		fprintf(fb->trace, "control %02x %02x %04x %04x %u\n", type, req, val, idx, len);
+	fb->controls++;
+	if (fb->control_fails) {
+		fb->control_fails--;
+		return false;
+	}
 	if (type == 0x22 && req == 0x01 && len >= 3) {
 		memcpy(fb->rate, data, 3);
 	} else if ((type & 0x80) && len) {
 		memset(data, 0, len);
-		if (type == 0xA2 && req == 0x81 && len >= 3)
+		if (type == 0xA2 && req == 0x81 && len >= 3 && fb->rate_reads) {
+			((uint8_t *)data)[0] = (uint8_t)fb->rate_reads;   /* UAC1: 3 bytes, little-endian */
+			((uint8_t *)data)[1] = (uint8_t)(fb->rate_reads >> 8);
+			((uint8_t *)data)[2] = (uint8_t)(fb->rate_reads >> 16);
+		} else if (type == 0xA2 && req == 0x81 && len >= 3)
 			memcpy(data, fb->rate, 3);
 		else if (type == 0xC0 && req == 0x49 && idx < sizeof(fb->i_reg))
 			*(uint8_t *)data = fb->i_reg[idx];
