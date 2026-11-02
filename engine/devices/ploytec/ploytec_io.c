@@ -10,14 +10,16 @@
 void ploytec_decode_pcm_in(struct ozzy_engine *e, ploytec_frame_fn decode, uint32_t frames, uint32_t t, uint32_t bytes)
 {
 	const struct ozzy_pcm_ring *ring = ozzy_engine_take_pcm_ring(e, OZZY_PCM_IN);
-	const uint8_t *packet;
-	uint32_t frame_bytes, got, r, f;
+	uint8_t *packet = ozzy_engine_pcm_in_slot(e, t);
+	uint32_t frame_bytes, got = bytes / PLOYTEC_IN_FRAME_SIZE, r, f;
 
+	/* A short or failed read: the frames it didn't bring are silence in the slot too, which
+	 * the HAL reads where no ring is attached (macOS), not the slot's previous lap */
+	if (got < frames)
+		memset(packet + got * PLOYTEC_IN_FRAME_SIZE, 0, (frames - got) * PLOYTEC_IN_FRAME_SIZE);
 	if (!ring || !decode)
 		return;
-	packet = ozzy_engine_pcm_in_slot(e, t);
 	frame_bytes = ring->channels * 3;
-	got = bytes / PLOYTEC_IN_FRAME_SIZE;
 	r = ozzy_mod_u64(e->pcm_pos[OZZY_PCM_IN], ring->frames);
 	for (f = 0; f < frames; f++) {
 		uint8_t *dst = ring->base + r * frame_bytes;
