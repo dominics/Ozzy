@@ -37,12 +37,12 @@ pkgutil --forget com.ozzy.userspace >/dev/null 2>&1 || true
 # without the plug-ins); SIGKILL only if it is still there after 5 s.
 pid="$(pgrep -x coreaudiod || true)"
 if [ -n "$pid" ]; then
-	kill -TERM $pid 2>/dev/null || true
+	kill -TERM "$pid" 2>/dev/null || true
 	for _ in $(seq 50); do
-		kill -0 $pid 2>/dev/null || break
+		kill -0 "$pid" 2>/dev/null || break
 		sleep 0.1
 	done
-	kill -KILL $pid 2>/dev/null || true
+	kill -KILL "$pid" 2>/dev/null || true
 fi
 killall MIDIServer 2>/dev/null || true
 echo "Ozzy userspace driver removed."
