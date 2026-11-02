@@ -64,6 +64,8 @@ extern "C" {
 /* Transfers in flight, as the official Ploytec driver queues them (both platforms) */
 #define ISOC_TRANSFER_UFRAMES    32     /* microframes per isochronous transfer (4 ms) */
 #define ISOC_OUT_TRANSFERS       3      /* OUT transfers in flight */
+#define ISOC_OUT_TRANSFERS_DEEP  6      /* OUT transfers in flight for OZZY_QUIRK_DEEP_OUT_QUEUE (24 ms) */
+#define ISOC_OUT_TRANSFERS_MAX   6      /* the most OUT transfers any device keeps in flight */
 #define ISOC_FB_TRANSFERS        2      /* feedback transfers in flight */
 
 enum isoc_fb_format {

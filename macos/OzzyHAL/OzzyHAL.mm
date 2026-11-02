@@ -14,6 +14,13 @@ static CFStringRef SafeCreateString(const char* str) {
     return s;
 }
 
+/* Clamp @frames to @max frames; false if it didn't fit */
+static bool FitFrames(uint32_t* frames, uint32_t max) {
+    if (*frames <= max) return true;
+    *frames = max;
+    return false;
+}
+
 static UInt32 GetAudioBufferListSize(UInt32 numBuffers) {
     return (UInt32)(offsetof(AudioBufferList, mBuffers) + (numBuffers * sizeof(AudioBuffer)));
 }
@@ -122,8 +129,9 @@ void OzzyHALDevice::RebuildStreamConfigs() {
  * macOS does for other serial-less USB audio devices; moving the device to another port
  * makes it a new device to CoreAudio. */
 void OzzyHALDevice::MakeDeviceUID(const ozzy_shared_memory* shm, uint32_t locationID, char* buf, size_t size) {
-    bool hasSerial = shm->serial_number[0] != 0 && strcmp(shm->serial_number, "no serial number") != 0;
-    if (hasSerial) snprintf(buf, size, "OzzyHAL.%s", shm->serial_number);
+    char serial[sizeof(shm->serial_number) + 1];
+    bool hasSerial = OzzyCopyName(serial, shm->serial_number, nullptr) && strcmp(serial, "no serial number") != 0;
+    if (hasSerial) snprintf(buf, size, "OzzyHAL.%s", serial);
     else snprintf(buf, size, "OzzyHAL.%04X:%04X.%08X", shm->vendor_id, shm->product_id, locationID);
 }
 
@@ -233,6 +241,16 @@ void OzzyHALDevice::ApplyDeviceConfig() {
         mReadInput = plainIn ? PloytecPlainInputReader(8) : PloytecInputReader(8);
     }
     mClearOutput = plain ? PloytecClearOutputPlain : isBulk ? PloytecClearOutputBulk : PloytecClearOutputInterrupt;
+    // The codecs index the rings by frame: they must fit the shared memory's buffers in the
+    // layout picked above, and the clock spacing the output ring, whatever was published
+    uint32_t outMax = plain ? OZZY_PCM_RING_BYTES / (mOutputChannels * 3)
+        : OZZY_PCM_RING_BYTES / ploytec_out_subpkt_size(isBulk ? PLOYTEC_OUT_LAYOUT_BULK : PLOYTEC_OUT_LAYOUT_INT) *
+          PLOYTEC_FRAMES_PER_OUT_SUBPKT;
+    uint32_t inMax = OZZY_PCM_RING_BYTES / (plainIn ? mInputChannels * 3 : PLOYTEC_IN_FRAME_SIZE);
+    bool fits = FitFrames(&mOutRingFrames, outMax) & FitFrames(&mInRingFrames, inMax);
+    if (!(FitFrames(&mTimestampFrames, mOutRingFrames) & fits))
+        LogOzzyHALError("device %{public}u: the driver's ring layout doesn't fit its buffers, cut to %{public}u out / %{public}u in frames, anchors every %{public}u",
+                        mSlot, mOutRingFrames, mInRingFrames, mTimestampFrames);
     RebuildStreamConfigs();
     LogOzzyHAL("device %{public}u: Ploytec codec (%{public}s output, %{public}s input, %{public}u in / %{public}u out) for VID:0x%{public}04X",
                mSlot, plain ? "plain" : isBulk ? "bulk" : "interrupt", plainIn ? "plain" : "Ploytec", mInputChannels,
@@ -539,13 +557,14 @@ OSStatus OzzyHALDevice::PerformConfigurationChange(AudioServerPlugInHostRef host
 
 void OzzyHALDevice::UpdateMetadata() {
     ozzy_shared_memory* shm = mSHM.load(std::memory_order_relaxed);
-    if (shm->product_name[0] != 0) {
+    char name[sizeof(shm->product_name) + 1];
+    if (OzzyCopyName(name, shm->product_name, nullptr)) {
         if (mModelUID) CFRelease(mModelUID);
-        mModelUID = SafeCreateString(shm->product_name);
+        mModelUID = SafeCreateString(name);
     }
-    if (shm->manufacturer_name[0] != 0) {
+    if (OzzyCopyName(name, shm->manufacturer_name, nullptr)) {
         if (mManufacturerUID) CFRelease(mManufacturerUID);
-        mManufacturerUID = SafeCreateString(shm->manufacturer_name);
+        mManufacturerUID = SafeCreateString(name);
     }
     char uid[128];
     MakeDeviceUID(shm, mLocationID, uid, sizeof(uid));

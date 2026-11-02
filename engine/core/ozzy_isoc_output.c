@@ -95,6 +95,8 @@ bool ozzy_isoc_output_start(struct ozzy_isoc_output *out, const struct ozzy_bus 
 		ozzy_log("isoc: feedback bInterval %u not supported, PCM out runs at the nominal rate",
 			 config->fb_interval);
 
+	out->out_transfers = !config->out_transfers ? ISOC_OUT_TRANSFERS :
+			     config->out_transfers < ISOC_OUT_TRANSFERS_MAX ? config->out_transfers : ISOC_OUT_TRANSFERS_MAX;
 	out->out_uframes = isoc_fb_interval_uframes(config->out_interval);
 	out->out_max_frames = config->out_max_packet / config->frame_bytes;
 	if (out->out_max_frames < isoc_fb_max_frames(config->rate, out->out_uframes))
@@ -108,12 +110,14 @@ bool ozzy_isoc_output_start(struct ozzy_isoc_output *out, const struct ozzy_bus 
 	out->out_frame = 0;
 	out->played_frames = 0;
 	out->next_anchor = config->anchor_frames;
+	out->fb_valid_time = 0;
+	out->fb_stalled = false;
 	out->fb_logged = false;
 	out->running = true;
 
 	for (i = 0; fb_fits && i < ISOC_FB_TRANSFERS; i++)
 		submit_feedback(out, i);
-	for (i = 0; i < ISOC_OUT_TRANSFERS; i++)
+	for (i = 0; i < out->out_transfers; i++)
 		submit_out(out, i);
 	return true;
 }
@@ -138,6 +142,48 @@ static void publish_timestamps(struct ozzy_isoc_output *out, const struct ozzy_i
 	}
 }
 
+/*
+ * clear_sent - In the frame ring, silence where completed OUT transfer @t read, so a writer
+ * that stops (the HAL's process gone) leaves silence a lap later, not the ring played again.
+ * The writer is never that far ahead: it writes at most the queued transfers plus one IO
+ * buffer past the clock, well short of a lap, so these frames are behind it.
+ */
+static void clear_sent(struct ozzy_isoc_output *out, const struct ozzy_isoc_output_xfer *t)
+{
+	const struct ozzy_isoc_output_config *c = &out->config;
+	uint32_t ring_bytes = c->ring_frames * c->frame_bytes;
+	uint32_t p;
+
+	for (p = 0; p < t->count; p++) {
+		uint32_t at = t->packets[p].offset, len = t->packets[p].length;
+		uint32_t first = len < ring_bytes - at ? len : ring_bytes - at;   /* a packet may wrap */
+
+		memset(c->ring + at, 0, first);
+		memset(c->ring, 0, len - first);
+	}
+}
+
+/*
+ * check_stall - At an OUT completion: valid feedback missing for OZZY_FB_STALL_MS after some
+ * came means the device stopped streaming (a Ploytec firmware halts for good when its OUT
+ * buffer runs dry, and its feedback goes empty), while isochronous OUT, which has no
+ * handshake, still completes. Tell the bus once.
+ */
+static void check_stall(struct ozzy_isoc_output *out)
+{
+	uint64_t hz = ozzy_bus_time_hz(out->bus);
+	uint64_t now;
+
+	if (out->fb_stalled || !out->fb_valid_time || !hz)
+		return;
+	now = ozzy_bus_time(out->bus);
+	if (now - out->fb_valid_time <= ozzy_div_u64(hz * OZZY_FB_STALL_MS, 1000))
+		return;
+	out->fb_stalled = true;
+	ozzy_log("isoc: no feedback for %u ms: the device stopped streaming", OZZY_FB_STALL_MS);
+	ozzy_bus_pcm_stalled(out->bus);
+}
+
 bool ozzy_isoc_output_complete(struct ozzy_isoc_output *out, uint8_t pipe, void *xfer, int status,
 			       struct ozzy_isoc_packet *packets, uint32_t count)
 {
@@ -148,6 +194,9 @@ bool ozzy_isoc_output_complete(struct ozzy_isoc_output *out, uint8_t pipe, void 
 		if (!out->running || status == OZZY_STATUS_ABORTED)
 			return true;
 		publish_timestamps(out, &out->out[i]);
+		check_stall(out);
+		if (!out->config.xfer[0])
+			clear_sent(out, &out->out[i]);
 		submit_out(out, i);
 		return true;
 	}
@@ -165,6 +214,8 @@ bool ozzy_isoc_output_complete(struct ozzy_isoc_output *out, uint8_t pipe, void 
 			if (isoc_fb_packet(&out->fb, pkt, len))
 				ozzy_log("isoc: more than %u feedback packets were not %u bytes long, PCM out runs at the nominal rate",
 					 out->fb.cfg.max_errors, out->fb.cfg.packet_size);
+			if (out->fb.uframes && len == out->fb.cfg.packet_size)
+				out->fb_valid_time = packets[p].time ? packets[p].time : ozzy_bus_time(out->bus);
 		}
 		submit_feedback(out, i);
 		return true;

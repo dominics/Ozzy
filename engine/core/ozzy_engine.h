@@ -101,7 +101,7 @@ static inline uint32_t ozzy_pcm_boundaries(uint64_t *next, uint64_t pos, uint32_
  *                    bytes, a place each (at least the transfers in flight, 4)
  * @isoc_out:         NULL: isochronous OUT packets point into the shared memory's frame ring,
  *                    which the HAL writes; else one buffer per OUT transfer
- *                    (ISOC_OUT_TRANSFERS, @isoc_out_size bytes each), filled at submit
+ *                    (ozzy_engine_isoc_out_transfers, @isoc_out_size bytes each), filled at submit
  * @isoc_in:          the feedback transfers (@isoc_in_size bytes)
  * @midi_in:          MIDI IN transfers, OZZY_MIDI_IN_SIZE bytes (OZZY_DMA_ALIGN aligned)
  * @midi_out:         one MIDI OUT transfer, OZZY_MIDI_OUT_SIZE bytes
@@ -122,7 +122,7 @@ struct ozzy_engine_memory {
 	uint8_t *pcm_in[OZZY_PCM_OWN_SLOTS];
 	uint32_t pcm_out_slots;
 	uint32_t pcm_in_slots;
-	uint8_t *isoc_out[ISOC_OUT_TRANSFERS];
+	uint8_t *isoc_out[ISOC_OUT_TRANSFERS_MAX];
 	uint32_t isoc_out_size;
 	uint8_t *isoc_in;
 	uint32_t isoc_in_size;
@@ -528,6 +528,12 @@ static inline uint32_t ozzy_engine_transfer_frames(const struct ozzy_engine *e, 
 	if (e->ops->transfer_frames)
 		return e->ops->transfer_frames(e, dir);
 	return 0;
+}
+
+/* Isochronous PCM OUT transfers the engine keeps in flight for its device */
+static inline uint32_t ozzy_engine_isoc_out_transfers(const struct ozzy_engine *e)
+{
+	return (e->model->quirks & OZZY_QUIRK_DEEP_OUT_QUEUE) ? ISOC_OUT_TRANSFERS_DEEP : ISOC_OUT_TRANSFERS;
 }
 
 /* Whether the platform attaches PCM rings (without one attached, PCM out is silence) */

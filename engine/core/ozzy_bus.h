@@ -79,6 +79,9 @@ enum ozzy_pcm_dir {
  *                stalled request asked again. Interfaces at 0 are left alone. A restart's start
  *                does it before its handshake (ozzy_engine_reselect). Process context, nothing
  *                in flight. Optional.
+ * @pcm_stalled:  the device stopped streaming: its feedback went silent while PCM out kept
+ *                going (OZZY_FB_STALL_MS). Stop the streams; a restart (the handshake) is what
+ *                brings it back. Once per start, from the completion path. Optional.
  */
 struct ozzy_bus_ops {
 	bool (*submit)(void *ctx, uint8_t pipe, void *buf, uint32_t size, void *xfer);
@@ -96,6 +99,7 @@ struct ozzy_bus_ops {
 	uint64_t (*time_hz)(void *ctx);
 	void (*stats_changed)(void *ctx);
 	bool (*reselect)(void *ctx, const uint8_t alt_settings[4]);
+	void (*pcm_stalled)(void *ctx);
 };
 
 struct ozzy_bus {
@@ -151,6 +155,12 @@ static inline void ozzy_bus_stats_changed(const struct ozzy_bus *bus)
 {
 	if (bus->ops->stats_changed)
 		bus->ops->stats_changed(bus->ctx);
+}
+
+static inline void ozzy_bus_pcm_stalled(const struct ozzy_bus *bus)
+{
+	if (bus->ops->pcm_stalled)
+		bus->ops->pcm_stalled(bus->ctx);
 }
 
 #ifdef __cplusplus
