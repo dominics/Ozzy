@@ -197,8 +197,8 @@ static void pump_midi_out(struct ploytec_us3xx_engine *ue)
 		if (ozzy_xchg_acquire_bool(&ue->midi_out_busy, true))
 			return;
 
-		r = shm->midi_out.read_index;
-		w = ozzy_load_acquire_u32(&shm->midi_out.write_index);
+		r = shm->midi_out.read_index & OZZY_MIDI_RING_MASK;
+		w = ozzy_load_acquire_u32(&shm->midi_out.write_index) & OZZY_MIDI_RING_MASK;
 		while (r != w && n < max) {
 			uint8_t byte = shm->midi_out.buffer[r];
 
@@ -215,7 +215,7 @@ static void pump_midi_out(struct ploytec_us3xx_engine *ue)
 		ozzy_store_release_bool(&ue->midi_out_busy, false);
 
 		/* A kick that came in while we held midi_out_busy returned early; pick up its bytes */
-		if (ozzy_load_acquire_u32(&shm->midi_out.write_index) == r)
+		if ((ozzy_load_acquire_u32(&shm->midi_out.write_index) & OZZY_MIDI_RING_MASK) == r)
 			return;
 	}
 }
