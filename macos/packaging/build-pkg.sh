@@ -10,15 +10,11 @@ cd "$MACOS"
 
 if [ $# -ge 1 ]; then
 	VERSION="$1"
-elif tag="$(git describe --tags --match 'v*' 2>/dev/null)"; then
-	VERSION="${tag#v}"
-elif sha="$(git rev-parse --short HEAD 2>/dev/null)"; then
-	VERSION="0.0.0-dev+$sha"
 else
-	VERSION="0.0.0-dev"
+	VERSION="$("$PKGDIR/version.sh")"
 fi
 BUNDLE_VERSION="${VERSION%%[-+]*}"
-BUILD_NUMBER="$(git rev-list --count HEAD 2>/dev/null || echo 0)"
+BUILD_NUMBER="$("$PKGDIR/version.sh" --build-number)"
 OUT="$MACOS/build/pkg"
 WORK="$OUT/work"
 rm -rf "$OUT"
