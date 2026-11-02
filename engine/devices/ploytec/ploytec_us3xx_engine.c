@@ -285,7 +285,8 @@ static bool us3xx_start(struct ozzy_engine *e)
 	e->report.in_flight[OZZY_PIPE_MIDI_OUT] = ue->midi_out_addr ? 1 : 0;
 
 	ozzy_store_release_bool(&shm->audio.hardware_present, true);
-	shm->audio.timestamp.sample_time = 0;
+	if (e->anchors)   /* no anchor until the first new one */
+		ozzy_timestamp_write(&shm->audio.timestamp, 0, 0);
 	memset(&ue->encoder, 0, sizeof(ue->encoder));
 	ozzy_store_release_bool(&ue->midi_out_busy, false);
 	ue->running = true;

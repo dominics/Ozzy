@@ -133,7 +133,8 @@ static bool isoc_start(struct ozzy_engine *e)
 			       PLOYTEC_MIDI_XFER_NS7 : PLOYTEC_MIDI_XFER_M4_C1);
 
 	ozzy_store_release_bool(&shm->audio.hardware_present, true);
-	shm->audio.timestamp.sample_time = 0;
+	if (e->anchors)   /* no anchor until the first new one */
+		ozzy_timestamp_write(&shm->audio.timestamp, 0, 0);
 	ozzy_store_release_bool(&pe->midi_out_busy, false);
 	pe->running = true;
 	pe->streamed = true;
