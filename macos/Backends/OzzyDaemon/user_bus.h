@@ -85,6 +85,7 @@ struct user_bus {
 
 	uint64_t host_hz;
 	mach_timebase_info_data_t timebase;
+	bool busy;                             /* an interface was held by another driver or process */
 
 	pthread_t io_thread;
 	CFRunLoopRef io_loop;
@@ -114,7 +115,8 @@ bool ubus_start_io(struct user_bus *b);
 /*
  * ubus_configure - Configuration 1, the @engine profile's interfaces opened with their
  * alternate settings, the endpoints bound (ozzy_engine_bind_endpoints) and the pipes and
- * requests set up. As OzzyKext::ConfigureHardware.
+ * requests set up. As OzzyKext::ConfigureHardware. On failure b->busy says whether an
+ * interface was held by another driver or process (worth a retry).
  */
 bool ubus_configure(struct user_bus *b, struct ozzy_engine *engine);
 

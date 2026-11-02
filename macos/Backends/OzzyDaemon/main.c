@@ -1,13 +1,17 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * ozzy-daemon: drives the listed devices it is allowed to (the CMS 600-3 unless told otherwise)
- * from user space, one segment per device, for OzzyHAL and OzzyMIDI. A LaunchAgent: one per
- * logged-in user. The main thread is the control thread: device matching and termination,
- * system sleep and wake, and each device's mailbox and watchdog timers.
+ * from user space, one segment per device, for OzzyHAL and OzzyMIDI. A LaunchAgent in each GUI
+ * session: only the console user's daemon drives a device, the others release it and its
+ * segment (handover.h). A device someone else holds (another user's daemon, a kext) is retried
+ * until it lets go. The main thread is the control thread: device matching and termination,
+ * console changes, system sleep and wake, retries, and each device's mailbox and watchdog
+ * timers.
  */
 
 #include <IOKit/IOMessage.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
+#include <SystemConfiguration/SystemConfiguration.h>
 #include <dispatch/dispatch.h>
 #include <errno.h>
 #include <signal.h>
@@ -29,6 +33,7 @@ static unsigned int allowed_count = 1;
 static bool allow_all;
 static struct daemon_device *devices;
 static io_connect_t power_port;
+static uid_t console_uid = HANDOVER_NO_CONSOLE;
 
 static bool is_allowed(const struct ozzy_device *model)
 {
@@ -42,6 +47,129 @@ static bool is_allowed(const struct ozzy_device *model)
 	}
 	return false;
 }
+
+/* --- Handover: doing what handover.h decides --- */
+
+static void apply(struct daemon_device *d, enum handover_action action);
+
+static void retry_fired(CFRunLoopTimerRef timer, void *info)
+{
+	struct daemon_device *d = info;
+
+	(void)timer;
+	CFRelease(d->retry);   /* a one-shot timer: already invalidated */
+	d->retry = NULL;
+	apply(d, handover_retry(&d->handover));
+}
+
+static void retry_after(struct daemon_device *d, unsigned int ms)
+{
+	CFRunLoopTimerContext ctx = { 0, d, NULL, NULL, NULL };
+
+	if (d->retry) {
+		CFRunLoopTimerInvalidate(d->retry);
+		CFRelease(d->retry);
+	}
+	d->retry = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + ms / 1000.0, 0, 0, 0, retry_fired, &ctx);
+	CFRunLoopAddTimer(CFRunLoopGetMain(), d->retry, kCFRunLoopDefaultMode);
+}
+
+static void apply(struct daemon_device *d, enum handover_action action)
+{
+	switch (action) {
+	case HANDOVER_NONE:
+		break;
+	case HANDOVER_START:
+		apply(d, handover_started(&d->handover, device_drive(d)));
+		break;
+	case HANDOVER_STOP:
+		device_release(d);
+		break;
+	case HANDOVER_RETRY_SOON:
+		retry_after(d, HANDOVER_SOON_MS);
+		break;
+	case HANDOVER_RETRY_SLOWLY:
+		if (!d->slow_logged) {
+			ozzy_log("%s at 0x%08x still held; trying again each %u s", d->model->name, d->location_id,
+				 HANDOVER_SLOW_MS / 1000);
+			d->slow_logged = true;
+		}
+		retry_after(d, HANDOVER_SLOW_MS);
+		break;
+	case HANDOVER_GIVE_UP:
+		ozzy_log("%s at 0x%08x: not driving it until a replug or a user switch", d->model->name, d->location_id);
+		break;
+	}
+}
+
+static void log_console(void)
+{
+	if (console_uid == HANDOVER_NO_CONSOLE)
+		ozzy_log("console: the login window");
+	else
+		ozzy_log("console: uid %u%s", (unsigned int)console_uid, console_uid == getuid() ? " (us)" : "");
+}
+
+/* The console user as the handover counts it: nobody at the login window */
+static uid_t read_console_uid(SCDynamicStoreRef store)
+{
+	uid_t uid = 0;
+	CFStringRef name = SCDynamicStoreCopyConsoleUser(store, &uid, NULL);
+	bool login_window;
+
+	if (!name)
+		return HANDOVER_NO_CONSOLE;
+	login_window = CFEqual(name, CFSTR("loginwindow"));
+	CFRelease(name);
+	return login_window ? HANDOVER_NO_CONSOLE : uid;
+}
+
+static void console_changed(SCDynamicStoreRef store, CFArrayRef keys, void *info)
+{
+	uid_t uid = read_console_uid(store);
+	struct daemon_device *d;
+
+	(void)keys;
+	(void)info;
+	if (uid == console_uid)
+		return;
+	console_uid = uid;
+	log_console();
+	for (d = devices; d; d = d->next) {
+		d->busy_logged = false;
+		d->slow_logged = false;
+		apply(d, handover_console(&d->handover, uid));
+	}
+}
+
+/* Follow the console user; false if the system won't say (then this daemon counts as in front) */
+static bool watch_console(void)
+{
+	SCDynamicStoreRef store = SCDynamicStoreCreate(NULL, CFSTR("ozzy-daemon"), console_changed, NULL);
+	CFStringRef key;
+	CFArrayRef keys;
+	CFRunLoopSourceRef source;
+
+	if (!store)
+		return false;
+	key = SCDynamicStoreKeyCreateConsoleUser(NULL);
+	keys = CFArrayCreate(NULL, (const void **)&key, 1, &kCFTypeArrayCallBacks);
+	if (!SCDynamicStoreSetNotificationKeys(store, keys, NULL)) {
+		CFRelease(keys);
+		CFRelease(key);
+		CFRelease(store);
+		return false;
+	}
+	CFRelease(keys);
+	CFRelease(key);
+	source = SCDynamicStoreCreateRunLoopSource(NULL, store, 0);
+	CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopDefaultMode);
+	CFRelease(source);
+	console_uid = read_console_uid(store);
+	return true;
+}
+
+/* --- Devices --- */
 
 static void device_added(void *refcon, io_iterator_t it)
 {
@@ -64,11 +192,17 @@ static void device_added(void *refcon, io_iterator_t it)
 		}
 		model = ozzy_device_lookup((uint16_t)vid, (uint16_t)pid);
 		if (model && is_allowed(model)) {
-			struct daemon_device *d = device_start(s, model);
+			struct daemon_device *d = device_new(s, model);
 
 			if (d) {
 				d->next = devices;
 				devices = d;
+				handover_init(&d->handover, getuid());
+				handover_console(&d->handover, console_uid);
+				if (!d->handover.front)
+					ozzy_log("%s at 0x%08x: another user is in front, leaving it to them", model->name,
+						 d->location_id);
+				apply(d, handover_device(&d->handover, true));
 			}
 		}
 		IOObjectRelease(s);
@@ -89,7 +223,8 @@ static void device_removed(void *refcon, io_iterator_t it)
 			if (IOObjectIsEqualTo(d->service, s)) {
 				*link = d->next;
 				ozzy_log("%s at 0x%08x disconnected", d->model->name, d->location_id);
-				device_stop(d);
+				apply(d, handover_device(&d->handover, false));
+				device_free(d);
 				break;
 			}
 			link = &d->next;
@@ -128,7 +263,7 @@ static void quit(void)
 		struct daemon_device *d = devices;
 
 		devices = d->next;
-		device_stop(d);
+		device_free(d);
 	}
 	exit(0);
 }
@@ -196,6 +331,13 @@ int main(int argc, char **argv)
 	dispatch_source_set_event_handler(intr, ^{ quit(); });
 	dispatch_resume(term);
 	dispatch_resume(intr);
+
+	if (watch_console()) {
+		log_console();
+	} else {
+		ozzy_log("no console user notifications: driving devices as if in front");
+		console_uid = getuid();
+	}
 
 	power_port = IORegisterForSystemPower(NULL, &power_notify, power_changed, &power_notifier);
 	if (power_port)

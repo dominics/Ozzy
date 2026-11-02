@@ -1,9 +1,11 @@
 /* SPDX-License-Identifier: MIT */
-/* One driven device (device.h), as OzzyKext */
+/* One device the daemon knows and may drive (device.h), as OzzyKext */
 
 #include "device.h"
 #include <mach/mach_time.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "../../../common/ozzy_version.h"
 #include "../../../engine/shared/ozzy_log.h"
 
@@ -205,26 +207,28 @@ static void remove_timer(CFRunLoopTimerRef *t)
 
 /* --- Lifecycle --- */
 
-static void free_device(struct daemon_device *d)
+/* Undo what device_drive set up, keeping the device known for another drive */
+static void close_device(struct daemon_device *d)
 {
 	remove_timer(&d->poll);
 	remove_timer(&d->watch);
 	ubus_close(&d->bus);
 	segment_destroy(&d->seg);
 	free(d->engine_mem);
-	if (d->service)
-		IOObjectRelease(d->service);
-	pthread_mutex_destroy(&d->lock);
-	free(d);
+	d->engine_mem = NULL;
+	d->engine = NULL;
+	memset(&d->bus, 0, sizeof(d->bus));
+	memset(&d->seg, 0, sizeof(d->seg));
+	d->seg.fd = -1;
+	d->driving = false;
+	d->running = false;
+	d->sleeping = false;
+	d->recovered_at = 0;
 }
 
-struct daemon_device *device_start(io_service_t service, const struct ozzy_device *model)
+struct daemon_device *device_new(io_service_t service, const struct ozzy_device *model)
 {
 	struct daemon_device *d = calloc(1, sizeof(*d));
-	char name[OZZY_DAEMON_SEGMENT_NAME_MAX];
-	enum segment_result made;
-	size_t size;
-	IOReturn kr;
 
 	if (!d)
 		return NULL;
@@ -234,12 +238,38 @@ struct daemon_device *device_start(io_service_t service, const struct ozzy_devic
 	d->model = model;
 	d->seg.fd = -1;
 	d->location_id = registry_u32(service, CFSTR(kUSBDevicePropertyLocationID));
-	ozzy_log("%s at 0x%08x (build %s)", model->name, d->location_id, OZZY_GIT_VERSION);
+	return d;
+}
 
-	kr = ubus_open(&d->bus, service);
+/* Someone else has it: close again, say why once per round */
+static enum handover_start busy(struct daemon_device *d, const char *why)
+{
+	if (!d->busy_logged) {
+		ozzy_log("  %s: waiting for it to let go", why);
+		d->busy_logged = true;
+	}
+	close_device(d);
+	return HANDOVER_BUSY;
+}
+
+enum handover_start device_drive(struct daemon_device *d)
+{
+	const struct ozzy_device *model = d->model;
+	char name[OZZY_DAEMON_SEGMENT_NAME_MAX], why[160];
+	enum segment_result made;
+	size_t size;
+	IOReturn kr;
+
+	if (d->driving)
+		return HANDOVER_STARTED;
+	if (!d->busy_logged)
+		ozzy_log("%s at 0x%08x (build %s)", model->name, d->location_id, OZZY_GIT_VERSION);
+
+	kr = ubus_open(&d->bus, d->service);
+	if (kr == kIOReturnExclusiveAccess)
+		return busy(d, "held by another driver or process (the Ozzy kext, another user's daemon?)");
 	if (kr != kIOReturnSuccess) {
-		ozzy_log("  open failed: 0x%x%s", (unsigned int)kr,
-			 kr == kIOReturnExclusiveAccess ? " (another driver has it: the Ozzy kext?), leaving it" : "");
+		ozzy_log("  open failed: 0x%x", (unsigned int)kr);
 		goto fail;
 	}
 	if (model->family != OZZY_FAMILY_USB_MIDI && ubus_class_compliant(&d->bus)) {
@@ -257,6 +287,10 @@ struct daemon_device *device_start(io_service_t service, const struct ozzy_devic
 
 	ozzy_daemon_segment_name(name, d->location_id);
 	made = segment_create(&d->seg, name, SEGMENT_STALE_MS);
+	if (made == SEGMENT_IN_USE) {
+		snprintf(why, sizeof(why), "segment %s: %s", name, d->seg.reason);
+		return busy(d, why);
+	}
 	if (made != SEGMENT_CREATED && made != SEGMENT_REPLACED_STALE) {
 		ozzy_log("  segment %s: %s", name, d->seg.reason);
 		goto fail;
@@ -264,13 +298,18 @@ struct daemon_device *device_start(io_service_t service, const struct ozzy_devic
 	if (made == SEGMENT_REPLACED_STALE)
 		ozzy_log("  segment %s: %s", name, d->seg.reason);
 	/* The device's own strings, before attach (it keeps them over the model's name) */
-	registry_string(service, kUSBVendorString, d->seg.shm->manufacturer_name, sizeof(d->seg.shm->manufacturer_name));
-	registry_string(service, kUSBProductString, d->seg.shm->product_name, sizeof(d->seg.shm->product_name));
-	registry_string(service, kUSBSerialNumberString, d->seg.shm->serial_number, sizeof(d->seg.shm->serial_number));
+	registry_string(d->service, kUSBVendorString, d->seg.shm->manufacturer_name,
+			sizeof(d->seg.shm->manufacturer_name));
+	registry_string(d->service, kUSBProductString, d->seg.shm->product_name, sizeof(d->seg.shm->product_name));
+	registry_string(d->service, kUSBSerialNumberString, d->seg.shm->serial_number,
+			sizeof(d->seg.shm->serial_number));
 
-	if (!ubus_start_io(&d->bus) || !ubus_configure(&d->bus, d->engine)) {
-		ozzy_log("  configuration failed");
-		goto fail;
+	if (!ubus_start_io(&d->bus))
+		goto fail_config;
+	if (!ubus_configure(&d->bus, d->engine)) {
+		if (d->bus.busy)
+			return busy(d, "an interface is held by another driver or process");
+		goto fail_config;
 	}
 	d->bus.trailer = d->seg.trailer;
 
@@ -284,33 +323,52 @@ struct daemon_device *device_start(io_service_t service, const struct ozzy_devic
 		goto fail;
 	}
 	ubus_watch_reset(&d->bus);
+	d->driving = true;
 	d->running = true;
+	d->busy_logged = false;
+	d->slow_logged = false;
 	d->poll = add_timer(d, POLL_MS, poll_fired);
 	d->watch = add_timer(d, WATCH_MS, watch_fired);
 	ozzy_log("  driver ready (segment %s)", name);
-	return d;
+	return HANDOVER_STARTED;
 
+fail_config:
+	ozzy_log("  configuration failed");
 fail:
-	free_device(d);
-	return NULL;
+	close_device(d);
+	d->busy_logged = false;
+	d->slow_logged = false;
+	return HANDOVER_FAILED;
 }
 
-void device_stop(struct daemon_device *d)
+void device_release(struct daemon_device *d)
 {
+	if (!d->driving)
+		return;
 	remove_timer(&d->poll);
 	remove_timer(&d->watch);
 	/* Wait for a request in progress (its control requests fail fast once the device is gone) */
 	pthread_mutex_lock(&d->lock);
 	d->running = false;
 	pthread_mutex_unlock(&d->lock);
-	if (d->seg.shm) {
-		d->seg.shm->audio.hardware_present = false;
-		d->seg.shm->audio.driver_ready = false;
+	d->seg.shm->audio.hardware_present = false;
+	d->seg.shm->audio.driver_ready = false;
+	ozzy_engine_stop(d->engine);   /* aborts what's in flight */
+	close_device(d);
+	ozzy_log("%s at 0x%08x released", d->model->name, d->location_id);
+}
+
+void device_free(struct daemon_device *d)
+{
+	if (d->retry) {
+		CFRunLoopTimerInvalidate(d->retry);
+		CFRelease(d->retry);
+		d->retry = NULL;
 	}
-	if (d->engine)
-		ozzy_engine_stop(d->engine);   /* aborts what's in flight */
-	ozzy_log("%s at 0x%08x stopped", d->model->name, d->location_id);
-	free_device(d);
+	device_release(d);
+	IOObjectRelease(d->service);
+	pthread_mutex_destroy(&d->lock);
+	free(d);
 }
 
 void device_sleep(struct daemon_device *d)

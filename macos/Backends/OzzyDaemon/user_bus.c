@@ -695,8 +695,11 @@ static bool open_interfaces(struct user_bus *b, const struct ozzy_device_profile
 		}
 		kr = (*intf)->USBInterfaceOpen(intf);
 		if (kr != kIOReturnSuccess) {
-			ozzy_log("interface %u: open failed: 0x%x%s", number, (unsigned int)kr,
-				 kr == kIOReturnExclusiveAccess ? " (another driver or process has it)" : "");
+			/* Held by another driver or process: the caller logs it, once per round of retries */
+			if (kr == kIOReturnExclusiveAccess)
+				b->busy = true;
+			else
+				ozzy_log("interface %u: open failed: 0x%x", number, (unsigned int)kr);
 			(*intf)->Release(intf);
 			ok = false;
 			break;
