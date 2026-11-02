@@ -8,6 +8,7 @@
 #include <string.h>
 #include "../../../common/ozzy_version.h"
 #include "../../../engine/shared/ozzy_log.h"
+#include "../../../engine/devices/ploytec/ploytec_midi2.h"
 
 #define POLL_MS          5      /* the mailbox */
 #define WATCH_MS         250    /* the watchdog's period, as the kext's */
@@ -314,6 +315,9 @@ enum handover_start device_drive(struct daemon_device *d)
 	d->bus.trailer = d->seg.trailer;
 
 	ozzy_engine_attach(d->engine, &d->bus.bus, d->seg.shm);
+	/* A second MIDI port (the CMS 600-3's SystemCtrl) runs on the trailer's ring pair */
+	if (ozzy_engine_set_midi2(d->engine, &d->seg.trailer->midi2.in, &d->seg.trailer->midi2.out))
+		ozzy_daemon_midi2_publish(d->seg.trailer, DYNACORD_MIDI_PORT_SYSCTRL_NAME);
 	ozzy_engine_set_usb_speed(d->engine, ubus_speed(&d->bus));
 	ozzy_engine_set_driver_version(d->engine, OZZY_GIT_VERSION);
 	ozzy_engine_set_anchors(d->engine, true);   /* OzzyHAL's zero timestamps */

@@ -14,6 +14,8 @@ int main(void)
 	printf("audio at %zu\n", offsetof(struct ozzy_shared_memory, audio));
 	printf("trailer at %llu\n", (unsigned long long)OZZY_DAEMON_TRAILER_OFFSET(sizeof(struct ozzy_shared_memory)));
 	printf("trailer %zu, mailbox at %zu\n", sizeof(struct ozzy_daemon_trailer), offsetof(struct ozzy_daemon_trailer, mailbox));
+	printf("midi2 at %zu, out at %zu, in at %zu\n", offsetof(struct ozzy_daemon_trailer, midi2),
+	       offsetof(struct ozzy_daemon_trailer, midi2.out), offsetof(struct ozzy_daemon_trailer, midi2.in));
 	printf("segment %llu\n", (unsigned long long)ozzy_daemon_segment_size(sizeof(struct ozzy_shared_memory)));
 	return 0;
 }
