@@ -82,14 +82,24 @@ struct ozzy_pcm_stream {
 	uint64_t period_next;              /* ring position of the next period boundary */
 };
 
-struct ozzy_midi {
-	struct snd_rawmidi *rmidi;
+#define OZZY_MIDI_PORTS 2   /* the CMS 600-3's second port (OZZY_QUIRK_MIDI_PORT2) */
+
+/* One MIDI port: a rawmidi substream per direction on a ring pair */
+struct ozzy_midi_port {
 	struct snd_rawmidi_substream *in;  /* triggered input, NULL if none */
 	struct snd_rawmidi_substream *out; /* triggered output, NULL if none */
-	spinlock_t lock;
+	volatile struct ozzy_midi_buffer *ring_in, *ring_out;
 	struct midi_running_status rs;     /* the output stream's running status (PR #80) */
 	u8 pending[2];                     /* expanded bytes that didn't fit the ring yet */
 	unsigned int pending_count;
+};
+
+struct ozzy_midi {
+	struct snd_rawmidi *rmidi;
+	spinlock_t lock;
+	unsigned int ports;                /* 1, or 2 with the engine moving the second */
+	struct ozzy_midi_port port[OZZY_MIDI_PORTS];
+	struct ozzy_midi_buffer midi2_in, midi2_out;   /* the second port's rings */
 };
 
 /*
@@ -132,6 +142,7 @@ void ozzy_pcm_progress(struct ozzy_chip *chip, enum ozzy_pcm_dir dir, uint64_t f
 void ozzy_pcm_stop_streams(struct ozzy_chip *chip);
 
 /* midi.c */
+void ozzy_midi_attach(struct ozzy_chip *chip);
 int ozzy_midi_init(struct ozzy_chip *chip);
 void ozzy_midi_service(struct ozzy_chip *chip);
 
