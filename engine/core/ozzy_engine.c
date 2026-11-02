@@ -281,6 +281,10 @@ void ozzy_engine_stats_recovery(struct ozzy_engine *e, bool streaming)
 bool ozzy_engine_start(struct ozzy_engine *e)
 {
 	memset(&e->report, 0, sizeof(e->report));
+	/* Input in the shared memory starts as silence: the HAL reads it by sample time, and a
+	 * new run's clock starts again at 0, over the previous run's input */
+	if (e->mem.pcm_in_ring)
+		memset(e->mem.pcm_in_ring, 0, e->mem.pcm_in_ring_bytes);
 	if (!e->ops->start(e))
 		return false;
 	e->starts++;

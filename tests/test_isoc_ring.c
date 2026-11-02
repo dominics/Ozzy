@@ -71,8 +71,8 @@ static void check_f32_clamp(void)
 }
 
 /*
- * Without a ring (macOS: the HAL reads the slots), a short PCM IN read leaves the frames it
- * didn't bring as silence in its slot, and a failed one the whole slot
+ * Without a ring (macOS: the HAL reads the slots), input starts as silence, a short PCM IN
+ * read leaves the frames it didn't bring as silence in its slot, and a failed one the whole slot
  */
 static void check_short_in(void)
 {
@@ -90,7 +90,11 @@ static void check_short_in(void)
 	ozzy_engine_set_endpoint(e, OZZY_PIPE_FEEDBACK, 0x81, 1, 3, 4);
 	ozzy_engine_attach(e, &fb.bus, &shm);
 	ozzy_engine_set_anchors(e, true);
+	memset(shm.audio.input_buffer, 0x77, sizeof(shm.audio.input_buffer));   /* a previous run's input */
 	CHECK(ozzy_engine_start(e), "CMS start");
+	for (i = 0, stale = 0; i < sizeof(shm.audio.input_buffer); i++)
+		stale += shm.audio.input_buffer[i] != 0;
+	CHECK(!stale, "%u bytes of the previous run's input left after start", stale);
 	for (i = 0; i < 100 && ins < 2 && fake_bus_pop(&fb, &x); i++) {
 		uint32_t got, b;
 
