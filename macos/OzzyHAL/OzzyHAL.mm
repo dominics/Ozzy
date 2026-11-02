@@ -168,6 +168,9 @@ void OzzyHALDevice::Unmap() {
     // The anchors were the driver's: none survives it
     ozzy_timeline_restart(&mTimeline);
     mExtras.RestartMonoTimelines();
+    // Nor a layout check's request: the next mapping is checked afresh
+    mRelayoutRequested.store(false);
+    mLayoutDiffers = false;
 }
 
 /* Unmap if the driver went away or restarted (a daemon also when its heartbeat stopped).
@@ -334,7 +337,7 @@ void OzzyHALDevice::RestoreSettings(AudioServerPlugInHostRef host) {
         }
         if (key) CFRelease(key);
     }
-    if (changed) ApplyDeviceConfig();
+    if (changed) ApplyLayout(mSHM.load(std::memory_order_relaxed));
     else UpdateRoutes();
 }
 
@@ -445,6 +448,48 @@ OSStatus OzzyHALDevice::SetSetting(AudioServerPlugInHostRef host, unsigned int i
 
 /* The change action of a rate change; a setting's is (id << 32) | value */
 static const UInt64 kRateChangeAction = 1ULL << 63;
+/* The change action that applies a layout the driver published by itself (CheckLayout) */
+static const UInt64 kRelayoutAction = 1ULL << 62;
+
+/* ApplyDeviceConfig, keeping the layout it applies for CheckLayout. With the mapping held. */
+void OzzyHALDevice::ApplyLayout(const ozzy_shared_memory* shm) {
+    if (!shm) return;
+    {
+        std::lock_guard<std::mutex> lock(mLayoutLock);
+        mLayout = OzzyLayout::Of(shm);   // before: a change while applying shows up next time
+    }
+    ApplyDeviceConfig();
+}
+
+/* Monitor thread: a layout the driver published after the change that asked for it (a rate
+ * change that outlived the mailbox's 3 s) or by itself is applied through a configuration
+ * change of its own, so CoreAudio stops IO first */
+void OzzyHALDevice::CheckLayout(AudioServerPlugInHostRef host) {
+    ozzy_shared_memory* shm = mSHM.load(std::memory_order_relaxed);
+    if (!host || !shm || !mConnected || mChanging.load() || mRelayoutRequested.load()) return;
+    OzzyLayout now = OzzyLayout::Of(shm);
+    {
+        std::lock_guard<std::mutex> lock(mLayoutLock);
+        if (now == mLayout) {
+            mLayoutDiffers = false;
+            return;
+        }
+    }
+    // Only one seen on two polls in a row: an engine start publishes its layout field by field
+    bool settled = mLayoutDiffers && now == mDifferentLayout;
+    mLayoutDiffers = true;
+    mDifferentLayout = now;
+    if (!settled) return;
+    mLayoutDiffers = false;
+    LogOzzyHAL("device %{public}u: the driver's layout changed (%{public}u Hz); applying it", mSlot, now.rate);
+    mRelayoutRequested.store(true);
+    if (host->RequestDeviceConfigurationChange(host, GetDeviceID(), kRelayoutAction, nullptr) != kAudioHardwareNoError)
+        mRelayoutRequested.store(false);
+}
+
+void OzzyHALDevice::AbortConfigurationChange(UInt64 action) {
+    if (action == kRelayoutAction) mRelayoutRequested.store(false);
+}
 
 OSStatus OzzyHALDevice::SetSampleRate(AudioServerPlugInHostRef host, Float64 rate) {
     uint32_t hz = (uint32_t)rate;
@@ -468,22 +513,27 @@ kern_return_t OzzyHALDevice::CallSetRate(uint32_t rate) {
 }
 
 OSStatus OzzyHALDevice::PerformConfigurationChange(AudioServerPlugInHostRef host, UInt64 action) {
-    bool rateChange = action & kRateChangeAction;
+    bool relayout = action == kRelayoutAction;
+    bool rateChange = !relayout && (action & kRateChangeAction);
     unsigned int id = (unsigned int)(action >> 32);
     uint32_t value = (uint32_t)action;
-    if (!rateChange && (value >= SettingCount(id) || ozzy_setting_descs[id].kind != OZZY_SETTING_DEVICE))
+    if (!relayout && !rateChange && (value >= SettingCount(id) || ozzy_setting_descs[id].kind != OZZY_SETTING_DEVICE))
         return kAudioHardwareIllegalOperationError;
 
+    mChanging.store(true);
     OzzyMonoChangeBegins(this);   // the engine restarts under MON and AUX too
     ozzy_shared_memory* shm = AcquireSHM();
-    kern_return_t kr = !shm ? kIOReturnNotAttached : rateChange ? CallSetRate(value) : CallApplySetting(id, value);
-    if (shm) ApplyDeviceConfig();
+    kern_return_t kr = !shm ? kIOReturnNotAttached : relayout ? KERN_SUCCESS
+                     : rateChange ? CallSetRate(value) : CallApplySetting(id, value);
+    ApplyLayout(shm);
     ReleaseSHM();
+    if (relayout) mRelayoutRequested.store(false);
 
-    if (kr == KERN_SUCCESS && !rateChange) StoreSetting(host, id, value);
+    if (kr == KERN_SUCCESS && !rateChange && !relayout) StoreSetting(host, id, value);
     // The rate may have changed (S/PDIF lock), and the clock source item names say the lock
     if (host) NotifyDeviceChanged(host);
     OzzyMonoRequestChange(this, host, action);
+    mChanging.store(false);
     return kr == KERN_SUCCESS ? kAudioHardwareNoError : kAudioHardwareUnspecifiedError;
 }
 
@@ -572,7 +622,7 @@ bool OzzyHALDevice::UpdateConnectionState(AudioServerPlugInHostRef host) {
     if (currentlyConnected) {
         UpdateMetadata();
         ozzy_settings_defaults(&mSettings);   // routes start at their defaults; storage may change them
-        ApplyDeviceConfig();
+        ApplyLayout(shm);
         RestoreSettings(host);
         mExtras.Restore(host, mDeviceUID);
         LogOzzyHAL("device %{public}u ready: '%{public}s'", mSlot, shm->product_name);
@@ -994,6 +1044,7 @@ void OzzyHAL::MonitorLoop() {
                 AudioObjectPropertyAddress statsAddr = { OZZY_PROPERTY_STATS, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
                 mHost->PropertiesChanged(mHost, mDevices[i].GetDeviceID(), 1, &statsAddr);
             }
+            mDevices[i].CheckLayout(mHost);
             if (mDevices[i].InfoChanged()) {
                 AudioObjectPropertyAddress infoAddr = { OZZY_PROPERTY_INFO, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
                 mHost->PropertiesChanged(mHost, mDevices[i].GetDeviceID(), 1, &infoAddr);
@@ -1046,10 +1097,11 @@ extern "C" HRESULT OzzyPerformDeviceConfigurationChange(AudioServerPlugInDriverR
         return OzzyMonoPerformConfigurationChange(dev, OzzyHAL::Get().GetHost(), ObjectKind(inDeviceObjectID));
     return dev ? dev->PerformConfigurationChange(OzzyHAL::Get().GetHost(), inChangeAction) : kAudioHardwareBadObjectError;
 }
-extern "C" HRESULT OzzyAbortDeviceConfigurationChange(AudioServerPlugInDriverRef, AudioObjectID inDeviceObjectID, UInt64, void*) {
+extern "C" HRESULT OzzyAbortDeviceConfigurationChange(AudioServerPlugInDriverRef, AudioObjectID inDeviceObjectID, UInt64 inChangeAction, void*) {
     OzzyHALDevice* dev = OzzyHAL::Get().DeviceForObject(inDeviceObjectID);
     if (dev && OzzyIsMonoObject(ObjectKind(inDeviceObjectID)))
         return OzzyMonoPerformConfigurationChange(dev, nullptr, ObjectKind(inDeviceObjectID));
+    if (dev) dev->AbortConfigurationChange(inChangeAction);
     return kAudioHardwareNoError;
 }
 

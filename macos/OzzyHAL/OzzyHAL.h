@@ -122,6 +122,10 @@ public:
     // CoreAudio stopped IO for a setting or rate change: send it to the kext, re-read the
     // format, keep it
     OSStatus PerformConfigurationChange(AudioServerPlugInHostRef host, UInt64 action);
+    void AbortConfigurationChange(UInt64 action);
+    // The monitor thread: if the driver's layout is no longer the one applied (and no change is
+    // under way), ask CoreAudio for a configuration change that applies it
+    void CheckLayout(AudioServerPlugInHostRef host);
 
     AudioChannelLayout* GetPreferredChannelLayout(AudioObjectPropertyScope inScope);
     UInt32 GetPreferredChannelLayoutSize(AudioObjectPropertyScope inScope) const;
@@ -213,6 +217,14 @@ private:
     ozzy_shared_memory* AcquireSHM();
     void ReleaseSHM();
     void ApplyDeviceConfig();
+    // ApplyDeviceConfig, keeping the layout it applies (mLayout); with the mapping held
+    void ApplyLayout(const ozzy_shared_memory* shm);
+    OzzyLayout mLayout = {};           // the layout ApplyLayout applied last (mLayoutLock)
+    std::mutex mLayoutLock;
+    std::atomic<bool> mChanging { false };            // PerformConfigurationChange is running
+    std::atomic<bool> mRelayoutRequested { false };   // CheckLayout asked CoreAudio for a change
+    bool mLayoutDiffers = false;       // CheckLayout's last poll saw mDifferentLayout (monitor thread)
+    OzzyLayout mDifferentLayout = {};
     kern_return_t CallSetRate(uint32_t rate);
     kern_return_t CallApplySetting(unsigned int id, uint32_t value);
     CFStringRef CopySettingKey(unsigned int id) const;

@@ -24,6 +24,7 @@
 #include "OzzyChannels.h"
 #include "OzzyVolume.h"
 #include "OzzyTimeline.h"
+#include "../../engine/shared/ozzy_shared_data.h"
 
 /* A device's objects after upstream's device, streams and clock control (OzzyHAL.mm's
  * OzzyObjectKind); kOzzyObjectsPerDevice leaves room for them */
@@ -49,6 +50,28 @@ static const UInt32 kOzzyExtraControls = 2;
 static inline bool OzzyIsExtraControl(uint32_t kind) {
     return kind == kOzzyObjectVolumeControl || kind == kOzzyObjectMuteControl;
 }
+
+/*
+ * The driver's layout as the device last applied it (ApplyDeviceConfig), as the shared memory
+ * had it: the rate, the rings, the clock spacing and the safety offsets. The monitor compares
+ * the shared memory with it, so a layout the driver published late (a rate change that outlived
+ * the mailbox's timeout) is applied too.
+ */
+struct OzzyLayout {
+    uint32_t rate, outRingFrames, inRingFrames, timestampFrames, safetyOffset, inputSafetyOffset;
+
+    static OzzyLayout Of(const ozzy_shared_memory* shm) {
+        return OzzyLayout { shm->audio.sample_rate.load(std::memory_order_relaxed), shm->audio.output_ring_frames,
+                            shm->audio.input_ring_frames, shm->audio.timestamp_frames,
+                            shm->audio.safety_offset_frames, shm->audio.input_safety_offset_frames };
+    }
+    bool operator==(const OzzyLayout& o) const {
+        return rate == o.rate && outRingFrames == o.outRingFrames && inRingFrames == o.inRingFrames &&
+               timestampFrames == o.timestampFrames && safetyOffset == o.safetyOffset &&
+               inputSafetyOffset == o.inputSafetyOffset;
+    }
+    bool operator!=(const OzzyLayout& o) const { return !(*this == o); }
+};
 
 class OzzyHALExtras {
 public:
