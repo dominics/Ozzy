@@ -110,6 +110,8 @@ bool ozzy_isoc_output_start(struct ozzy_isoc_output *out, const struct ozzy_bus 
 	out->out_frame = 0;
 	out->played_frames = 0;
 	out->next_anchor = config->anchor_frames;
+	out->fb_valid_time = 0;
+	out->fb_stalled = false;
 	out->fb_logged = false;
 	out->running = true;
 
@@ -161,6 +163,27 @@ static void clear_sent(struct ozzy_isoc_output *out, const struct ozzy_isoc_outp
 	}
 }
 
+/*
+ * check_stall - At an OUT completion: valid feedback missing for OZZY_FB_STALL_MS after some
+ * came means the device stopped streaming (a Ploytec firmware halts for good when its OUT
+ * buffer runs dry, and its feedback goes empty), while isochronous OUT, which has no
+ * handshake, still completes. Tell the bus once.
+ */
+static void check_stall(struct ozzy_isoc_output *out)
+{
+	uint64_t hz = ozzy_bus_time_hz(out->bus);
+	uint64_t now;
+
+	if (out->fb_stalled || !out->fb_valid_time || !hz)
+		return;
+	now = ozzy_bus_time(out->bus);
+	if (now - out->fb_valid_time <= ozzy_div_u64(hz * OZZY_FB_STALL_MS, 1000))
+		return;
+	out->fb_stalled = true;
+	ozzy_log("isoc: no feedback for %u ms: the device stopped streaming", OZZY_FB_STALL_MS);
+	ozzy_bus_pcm_stalled(out->bus);
+}
+
 bool ozzy_isoc_output_complete(struct ozzy_isoc_output *out, uint8_t pipe, void *xfer, int status,
 			       struct ozzy_isoc_packet *packets, uint32_t count)
 {
@@ -171,6 +194,7 @@ bool ozzy_isoc_output_complete(struct ozzy_isoc_output *out, uint8_t pipe, void 
 		if (!out->running || status == OZZY_STATUS_ABORTED)
 			return true;
 		publish_timestamps(out, &out->out[i]);
+		check_stall(out);
 		if (!out->config.xfer[0])
 			clear_sent(out, &out->out[i]);
 		submit_out(out, i);
@@ -190,6 +214,8 @@ bool ozzy_isoc_output_complete(struct ozzy_isoc_output *out, uint8_t pipe, void 
 			if (isoc_fb_packet(&out->fb, pkt, len))
 				ozzy_log("isoc: more than %u feedback packets were not %u bytes long, PCM out runs at the nominal rate",
 					 out->fb.cfg.max_errors, out->fb.cfg.packet_size);
+			if (out->fb.uframes && len == out->fb.cfg.packet_size)
+				out->fb_valid_time = packets[p].time ? packets[p].time : ozzy_bus_time(out->bus);
 		}
 		submit_feedback(out, i);
 		return true;

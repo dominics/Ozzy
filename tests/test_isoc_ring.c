@@ -11,6 +11,7 @@
 #include "check.h"
 #include "common/devices/ploytec/ploytec_protocol.h"
 #include "common/devices/ploytec/ploytec_codec.h"
+#include "engine/core/ozzy_isoc_output.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -252,6 +253,63 @@ static void check_out_queue(uint16_t vid, uint16_t pid, uint32_t transfers)
 	free(e);
 }
 
+/* Feedback as the CMS sends it (48 frames a millisecond), or none once it has halted */
+static void fill_feedback(struct fake_xfer *x, void *arg)
+{
+	bool halted = *(bool *)arg;
+	uint32_t k;
+
+	for (k = 0; x->isoc && k < x->count; k++) {
+		x->buf[x->packets[k].offset] = 48;
+		x->packets[k].actual = halted ? 0 : x->packets[k].length;
+	}
+}
+
+/*
+ * A device whose feedback goes silent (the CMS firmware halted): the bus hears of it once,
+ * OZZY_FB_STALL_MS after the last valid feedback, not before
+ */
+static void check_stall(void)
+{
+	const struct ozzy_device *model = ozzy_device_lookup(0x0562, 0x03EB);
+	static struct ozzy_shared_memory shm;
+	struct fake_bus fb;
+	struct fake_xfer x;
+	struct ozzy_engine *e;
+	uint64_t halt_at = 0, last_valid = 0, stall_at = 0;
+	unsigned int i, early = 0;
+	bool halted = false;
+
+	memset(&shm, 0, sizeof(shm));
+	fake_bus_init(&fb, &shm, true, NULL);
+	fb.hz = 1000000;   /* microseconds */
+	e = ozzy_engine_init(malloc(ozzy_engine_size(model)), model);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_OUT, 0x02, 1, 156, 1);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_IN, 0x86, 2, 512, 1);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_FEEDBACK, 0x81, 1, 3, 4);
+	ozzy_engine_attach(e, &fb.bus, &shm);
+	CHECK(ozzy_engine_start(e), "CMS start");
+	for (i = 0; i < 2000 && fake_bus_pop(&fb, &x); i++) {
+		if (x.pipe == 0x81 || x.pipe == 0x02)
+			fb.now += 2000;   /* 4 ms per transfer, two pipes */
+		if (!halted && fb.now >= 200000) {
+			halted = true;
+			halt_at = fb.now;
+		}
+		if (x.pipe == 0x81 && !halted)
+			last_valid = fb.now;
+		fake_bus_complete(&fb, e, &x, x.pipe == 0x81 ? fill_feedback : NULL, &halted);
+		early += fb.pcm_stalled && fb.now <= last_valid + OZZY_FB_STALL_MS * 1000;
+		if (fb.pcm_stalled && !stall_at)
+			stall_at = fb.now;
+	}
+	CHECK(halted && fb.now > halt_at + 200000, "ran %llu us", (unsigned long long)fb.now);
+	CHECK(fb.pcm_stalled == 1 && !early, "stall reported %u times, %u too early", fb.pcm_stalled, early);
+	CHECK(stall_at && stall_at <= last_valid + OZZY_FB_STALL_MS * 1000 + 8000, "stall reported %llu us after the last feedback",
+	      (unsigned long long)(stall_at - last_valid));
+	free(e);
+}
+
 int main(void)
 {
 	const struct ozzy_device *model = ozzy_device_lookup(0x0644, 0x8020);
@@ -269,6 +327,7 @@ int main(void)
 	check_clear_sent_xone();
 	check_out_queue(0x0562, 0x03EB, ISOC_OUT_TRANSFERS_DEEP);   /* CMS 600-3 */
 	check_out_queue(0x09E8, 0x0010, ISOC_OUT_TRANSFERS);        /* EIE Pro */
+	check_stall();
 	CHECK(model && model->family == OZZY_FAMILY_PLOYTEC_ISOC, "US-144MKII in the device list");
 	for (i = 0; i < sizeof(out_ring); i++)
 		out_ring[i] = (uint8_t)(i * 7 + 3);

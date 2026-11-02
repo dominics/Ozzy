@@ -108,6 +108,7 @@ struct ozzy_chip {
 	struct mutex lock;
 	bool running;                      /* engine started, device present */
 	bool gone;                         /* disconnected */
+	bool stalled;                      /* the device stopped streaming (ozzy_pcm_stalled) */
 	struct snd_pcm *pcm;
 	struct ozzy_pcm_stream stream[OZZY_PCM_DIRS];
 	struct ozzy_midi midi;
@@ -131,6 +132,7 @@ bool ozzy_chip_revive(struct ozzy_chip *chip);
 int ozzy_pcm_init(struct ozzy_chip *chip);
 void ozzy_pcm_progress(struct ozzy_chip *chip, enum ozzy_pcm_dir dir, uint64_t frames);
 void ozzy_pcm_stop_streams(struct ozzy_chip *chip);
+void ozzy_pcm_stalled(struct ozzy_chip *chip);
 
 /* midi.c */
 int ozzy_midi_init(struct ozzy_chip *chip);

@@ -110,6 +110,11 @@ static uint64_t fb_time_hz(void *ctx)
 	return ((struct fake_bus *)ctx)->hz;
 }
 
+static void fb_pcm_stalled(void *ctx)
+{
+	((struct fake_bus *)ctx)->pcm_stalled++;
+}
+
 static void fb_stats_changed(void *ctx)
 {
 	((struct fake_bus *)ctx)->stats_changed++;
@@ -148,6 +153,7 @@ static const struct ozzy_bus_ops fake_ops = {
 	.abort = fb_abort,
 	.time_hz = fb_time_hz,
 	.stats_changed = fb_stats_changed,
+	.pcm_stalled = fb_pcm_stalled,
 };
 
 static const struct ozzy_bus_ops fake_ops_no_rings = {
@@ -162,6 +168,7 @@ static const struct ozzy_bus_ops fake_ops_no_rings = {
 	.abort = fb_abort,
 	.time_hz = fb_time_hz,
 	.stats_changed = fb_stats_changed,
+	.pcm_stalled = fb_pcm_stalled,
 };
 
 void fake_bus_init(struct fake_bus *fb, struct ozzy_shared_memory *shm, bool rings, FILE *trace)
@@ -197,7 +204,7 @@ void fake_bus_complete(struct fake_bus *fb, struct ozzy_engine *e, struct fake_x
 		for (i = 0; i < x->count; i++) {
 			x->packets[i].actual = x->packets[i].length;
 			x->packets[i].status = 0;
-			x->packets[i].time = fb->ticks + 1000;
+			x->packets[i].time = fb->hz ? fb->now : fb->ticks + 1000;
 		}
 	}
 	if ((x->pipe & 0x80) && fill)

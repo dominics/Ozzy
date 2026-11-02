@@ -75,6 +75,7 @@ int ozzy_chip_restart(struct ozzy_chip *chip)
 	ozzy_pcm_stop_streams(chip);
 	if (chip->gone)
 		return -ENODEV;
+	WRITE_ONCE(chip->stalled, false);   /* the restart watches the feedback afresh */
 	chip->running = ozzy_engine_restart(chip->engine);
 	ozzy_controls_handshake(chip);   /* failed too: clients see the device stopped */
 	if (chip->running)

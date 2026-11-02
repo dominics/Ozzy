@@ -261,6 +261,12 @@ static void ozzy_urb_stats_changed(void *ctx)
 	schedule_delayed_work(&to_lbus(ctx)->chip->stats_work, msecs_to_jiffies(250));
 }
 
+/* From the completion: the device stopped streaming */
+static void ozzy_urb_pcm_stalled(void *ctx)
+{
+	ozzy_pcm_stalled(to_lbus(ctx)->chip);
+}
+
 /* Process context: kill everything in flight; the engine has stopped resubmitting */
 static void ozzy_urb_abort(void *ctx)
 {
@@ -318,6 +324,7 @@ static const struct ozzy_bus_ops ozzy_urb_ops = {
 	.time         = ozzy_urb_time,
 	.abort        = ozzy_urb_abort,
 	.time_hz      = ozzy_urb_time_hz,
+	.pcm_stalled  = ozzy_urb_pcm_stalled,
 	.stats_changed = ozzy_urb_stats_changed,
 	.reselect     = ozzy_urb_reselect,
 };

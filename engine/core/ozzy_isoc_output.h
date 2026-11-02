@@ -82,10 +82,15 @@ struct ozzy_isoc_output {
 	uint64_t out_frame;        /* next frame to send (ring position) */
 	uint64_t played_frames;    /* frames of completed transfers (the device's sample time) */
 	uint64_t next_anchor;      /* sample time of the next timestamp anchor */
+	uint64_t fb_valid_time;    /* bus time of the last feedback packet of the right length, 0: none yet */
+	bool fb_stalled;           /* told the bus (ozzy_bus_pcm_stalled) this run */
 	bool fb_logged;
 	struct ozzy_isoc_output_xfer out[ISOC_OUT_TRANSFERS_MAX];
 	struct ozzy_isoc_output_xfer fb_xfer[ISOC_FB_TRANSFERS];
 };
+
+/* Valid feedback missing this long, after some came this run: the device stopped streaming */
+#define OZZY_FB_STALL_MS 50
 
 /* Frames the output reads ahead of the clock at @rate with @transfers OUT transfers in flight
  * (the HAL's safety offset) */
