@@ -716,6 +716,8 @@ HRESULT OzzyHALDevice::GetZeroTimeStamp(Float64* outSampleTime, UInt64* outHostT
         sTime = mAnchorSample;
         hTime = mAnchorHost;
     } else {
+        // The clock went back: the engine restarted (watchdog, wake) under running IO
+        if (sTime < mAnchorSample) mTimestampSeed++;
         mAnchorSample = sTime;
         mAnchorHost = hTime;
     }
