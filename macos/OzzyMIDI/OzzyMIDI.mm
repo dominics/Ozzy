@@ -236,6 +236,12 @@ static void ScanDevices() {
 		if (port->shm->magic != OZZY_MAGIC || port->shm->session_id != port->sessionID ||
 		    !port->shm->audio.hardware_present.load(std::memory_order_relaxed) || !port->backend.Alive()) {
 			DisconnectPort(port);
+		} else if (!port->device) {
+			// MIDIDeviceCreate failed when it connected: try again each 500 ms, entities included
+			if (scans % 10 == 0) {
+				SetPortDevice(port, port->shm, port->locationID);
+				if (port->device) SetPort2(port, port->backend);
+			}
 		} else if (!port->port2.rings && port->backend.Midi2()) {
 			SetPort2(port, port->backend);
 		}
