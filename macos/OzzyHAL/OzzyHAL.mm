@@ -165,6 +165,9 @@ void OzzyHALDevice::Unmap() {
     while (mSHMUsers.load(std::memory_order_seq_cst)) usleep(100);
     mBackend.Close();
     mRegistryID = 0;
+    // The anchors were the driver's: none survives it
+    ozzy_timeline_restart(&mTimeline);
+    mExtras.RestartMonoTimelines();
 }
 
 /* Unmap if the driver went away or restarted (a daemon also when its heartbeat stopped).
@@ -573,7 +576,7 @@ bool OzzyHALDevice::UpdateConnectionState(AudioServerPlugInHostRef host) {
         LogOzzyHAL("device %{public}u ready: '%{public}s'", mSlot, shm->product_name);
     } else if (mIOStarted) {
         mIOStarted = false;
-        mTimestampSeed++;
+        ozzy_timeline_restart(&mTimeline);
         LogOzzyHAL("device %{public}u: auto-stopped I/O due to disconnect", mSlot);
         std::lock_guard<std::mutex> lock(mClientLock);
         for (int k = 0; k < mClientCount; k++) mClients[k].io = false;
@@ -685,47 +688,39 @@ kern_return_t OzzyHALDevice::StartDeviceIO() {
     if (shm) shm->audio.hal_write_position.store(0, std::memory_order_relaxed);
     ReleaseSHM();
     LogOzzyHAL("device %{public}u: start I/O", mSlot);
-    mAnchorSample = mAnchorHost = 0;
     mIOStarted = true;
-    mTimestampSeed++;
+    ozzy_timeline_restart(&mTimeline);
     return kIOReturnSuccess;
 }
 
 void OzzyHALDevice::StopDeviceIO() {
     LogOzzyHAL("device %{public}u: stop I/O", mSlot);
     mIOStarted = false;
-    mTimestampSeed++;
+    ozzy_timeline_restart(&mTimeline);
     ClearOutputBuffer();
 }
 
-HRESULT OzzyHALDevice::GetZeroTimeStamp(Float64* outSampleTime, UInt64* outHostTime, UInt64* outSeed) {
+bool OzzyHALDevice::ReadClock(bool* got, uint64_t* sampleTime, uint64_t* hostTime) {
     ozzy_shared_memory* shm = AcquireSHM();
-    if (!shm) {
-        ReleaseSHM();
-        return kAudioHardwareNotRunningError;
-    }
-
-    uint64_t sTime = 0, hTime = 0;
-    bool got = ozzy_timestamp_read(&shm->audio.timestamp, &sTime, &hTime);
+    *got = shm && ozzy_timestamp_read(&shm->audio.timestamp, sampleTime, hostTime);
     ReleaseSHM();
+    return shm != nullptr;
+}
+
+HRESULT OzzyHALDevice::GetZeroTimeStamp(Float64* outSampleTime, UInt64* outHostTime, UInt64* outSeed) {
+    uint64_t sTime = 0, hTime = 0, seed = 0;
+    bool got = false;
+    if (!ReadClock(&got, &sTime, &hTime)) return kAudioHardwareNotRunningError;
 
     // Host time 0 is the engine's "no anchor yet" (a start or restart); a failed read, a
     // writer that kept the seqlock busy. Either way serve the last real anchor, and never
-    // hand CoreAudio a (0, 0) one.
-    if (!got || hTime == 0) {
-        if (mAnchorHost == 0) return kAudioHardwareNotRunningError;
-        sTime = mAnchorSample;
-        hTime = mAnchorHost;
-    } else {
-        // The clock went back: the engine restarted (watchdog, wake) under running IO
-        if (sTime < mAnchorSample) mTimestampSeed++;
-        mAnchorSample = sTime;
-        mAnchorHost = hTime;
-    }
+    // hand CoreAudio a (0, 0) one. The clock going back (the engine restarted under running
+    // IO: watchdog, wake) starts a new seed.
+    if (!ozzy_timeline_anchor(&mTimeline, got, &sTime, &hTime, &seed)) return kAudioHardwareNotRunningError;
 
     if (outSampleTime) *outSampleTime = (Float64)sTime;
     if (outHostTime) *outHostTime = hTime;
-    if (outSeed) *outSeed = mTimestampSeed;
+    if (outSeed) *outSeed = seed;
     
     return kAudioHardwareNoError;
 }

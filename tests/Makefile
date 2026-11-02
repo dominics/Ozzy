@@ -16,8 +16,8 @@ TESTS    := test_endpoints test_settings test_info test_transfers test_midi_queu
 HEADERS  := $(wildcard ../engine/*/*.h ../engine/devices/*/*.h ../common/*.h ../common/devices/*/*.h fixtures/*.h) fake_bus.h check.h
 
 # The fork's OzzyHAL extras (macos/OzzyHAL/)
-TESTS    += test_volume test_channels
-HEADERS  += ../macos/OzzyHAL/OzzyVolume.h ../macos/OzzyHAL/OzzyChannels.h
+TESTS    += test_volume test_channels test_timeline
+HEADERS  += ../macos/OzzyHAL/OzzyVolume.h ../macos/OzzyHAL/OzzyChannels.h ../macos/OzzyHAL/OzzyTimeline.h
 
 all: $(addprefix $(BUILD)/,$(TESTS))
 

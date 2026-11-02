@@ -6,7 +6,8 @@
  * kOzzyObjectMonoDevice + 2i and + 2i + 1 of the main device's slot (OzzyHALExtras.h). It
  * shares the main device's engine, clock, rate and timing, and reads its channel from the
  * shared input ring (OzzyHALDevice::ReadInputChannel). Setting its rate changes the main
- * device's. Its IO doesn't count as the main device's.
+ * device's. Its IO doesn't count as the main device's, and it has a timeline of its own
+ * (OzzyTimeline.h) on the main device's clock.
  *
  * Templates over the device class, so the dispatch can use OzzyHALDevice's own getters; included
  * by OzzyHAL.mm only. C++ (OzzyHAL).
@@ -258,13 +259,14 @@ static OSStatus OzzyMonoSetPropertyData(Device* dev, AudioServerPlugInHostRef ho
     return dev->SetSampleRate(host, ((const AudioStreamBasicDescription*)data)->mSampleRate);
 }
 
-/* IO, counted per mono device: its timeline restarts at each start, like the main device's */
+/* IO, counted per mono device: its timeline restarts when its IO starts and stops, like the main
+ * device's, and only then: the main device's IO doesn't touch it */
 template <class Device>
 static OSStatus OzzyMonoStartIO(Device* dev, uint32_t kind) {
     int i = OzzyMonoIndex(kind);
     if (!dev->Extras().Mono(i)) return kAudioHardwareBadObjectError;
     if (!dev->IsConnected()) return kAudioHardwareNotRunningError;
-    if (dev->Extras().mMonoIO[i].fetch_add(1) == 0) dev->Extras().mMonoSeed[i].fetch_add(1);
+    if (dev->Extras().mMonoIO[i].fetch_add(1) == 0) ozzy_timeline_restart(&dev->Extras().mMonoTimeline[i]);
     return kAudioHardwareNoError;
 }
 
@@ -274,19 +276,23 @@ static OSStatus OzzyMonoStopIO(Device* dev, uint32_t kind) {
     if (!dev->Extras().Mono(i)) return kAudioHardwareBadObjectError;
     int io = dev->Extras().mMonoIO[i].load();
     while (io > 0 && !dev->Extras().mMonoIO[i].compare_exchange_weak(io, io - 1)) {}
-    if (io == 1) dev->Extras().mMonoSeed[i].fetch_add(1);
+    if (io == 1) ozzy_timeline_restart(&dev->Extras().mMonoTimeline[i]);
     return kAudioHardwareNoError;
 }
 
-/* The main device's clock, with the mono device's own seed */
+/* The main device's clock, on the mono device's own timeline (its IO thread's anchor and seed) */
 template <class Device>
 static OSStatus OzzyMonoGetZeroTimeStamp(Device* dev, uint32_t kind, Float64* sampleTime, UInt64* hostTime, UInt64* seed) {
     int i = OzzyMonoIndex(kind);
     if (!dev->Extras().Mono(i)) return kAudioHardwareBadObjectError;
-    UInt64 mainSeed = 0;
-    OSStatus st = dev->GetZeroTimeStamp(sampleTime, hostTime, &mainSeed);
-    if (seed) *seed = dev->Extras().mMonoSeed[i].load() + mainSeed;   // either one restarting restarts it
-    return st;
+    uint64_t s = 0, h = 0, n = 0;
+    bool got = false;
+    if (!dev->ReadClock(&got, &s, &h) || !ozzy_timeline_anchor(&dev->Extras().mMonoTimeline[i], got, &s, &h, &n))
+        return kAudioHardwareNotRunningError;
+    if (sampleTime) *sampleTime = (Float64)s;
+    if (hostTime) *hostTime = h;
+    if (seed) *seed = n;
+    return kAudioHardwareNoError;
 }
 
 template <class Device>

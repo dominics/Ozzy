@@ -15,6 +15,7 @@
 #include "PloytecCodec.h"   // the codec function pointer types
 #include "../Shared/OzzyBackend.h"
 #include "OzzyHALExtras.h"
+#include "OzzyTimeline.h"
 
 /* The macOS 12 SDK renamed kAudioObjectPropertyElementMaster; older SDKs only have that name */
 #ifndef __MAC_12_0
@@ -63,6 +64,8 @@ public:
     // OZZY_PROPERTY_CLIENTS's data: a new CFArray of the clients doing IO
     CFArrayRef CopyClientsArray() const;
     HRESULT GetZeroTimeStamp(Float64* outSampleTime, UInt64* outHostTime, UInt64* outSeed);
+    // The engine's clock (struct ozzy_timestamp): false while unmapped; *got: the read succeeded
+    bool ReadClock(bool* got, uint64_t* sampleTime, uint64_t* hostTime);
     OSStatus ioOperation(UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo, void* ioMainBuffer);
 
     Float64 GetNominalSampleRate() const;
@@ -192,9 +195,8 @@ private:
     kern_return_t StartDeviceIO();
     void StopDeviceIO();
     void NotifyClients(AudioServerPlugInHostRef host);
-    uint32_t mTimestampSeed = 1;
-    // The last real anchor GetZeroTimeStamp handed out (host time 0: none since IO started)
-    uint64_t mAnchorSample = 0, mAnchorHost = 0;
+    // GetZeroTimeStamp's anchors and seed (OzzyTimeline.h)
+    struct ozzy_timeline mTimeline = { 1, 0, 0, 0, 0 };
 
     // Kext connection. The monitor thread maps and unmaps; CoreAudio's threads use the
     // mapping between AcquireSHM and ReleaseSHM, and Unmap waits for them to finish.

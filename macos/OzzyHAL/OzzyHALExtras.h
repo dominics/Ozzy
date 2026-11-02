@@ -23,6 +23,7 @@
 #include <string.h>
 #include "OzzyChannels.h"
 #include "OzzyVolume.h"
+#include "OzzyTimeline.h"
 
 /* A device's objects after upstream's device, streams and clock control (OzzyHAL.mm's
  * OzzyObjectKind); kOzzyObjectsPerDevice leaves room for them */
@@ -77,9 +78,13 @@ public:
         return i >= 0 && (unsigned int)i < mMonoCount ? mMono[i] : nullptr;
     }
     unsigned int MonoCount() const { return mMonoCount; }
-    /* Its IO: clients that started it, and its timeline's seed */
+    /* Its IO: clients that started it, and its own timeline (OzzyTimeline.h) */
     std::atomic<int> mMonoIO[OZZY_MAX_MONO_INPUTS] = {};
-    std::atomic<uint64_t> mMonoSeed[OZZY_MAX_MONO_INPUTS] = {};
+    struct ozzy_timeline mMonoTimeline[OZZY_MAX_MONO_INPUTS] = {};
+    /* Any thread: the mono devices' timelines start over (the driver went away) */
+    void RestartMonoTimelines() {
+        for (unsigned int i = 0; i < OZZY_MAX_MONO_INPUTS; i++) ozzy_timeline_restart(&mMonoTimeline[i]);
+    }
     /* Its IO thread's decode buffer (each device has an IO thread of its own) */
     float mMonoScratch[OZZY_MAX_MONO_INPUTS][kOzzyMonoChunkFrames * kOzzyMonoMaxChannels];
 
@@ -106,10 +111,8 @@ public:
                 pairs[out] = (uint32_t)n;
             CFRelease(v);
         }
-        for (unsigned int i = 0; i < OZZY_MAX_MONO_INPUTS; i++) {
-            mMonoIO[i].store(0);
-            mMonoSeed[i].fetch_add(1);
-        }
+        for (unsigned int i = 0; i < OZZY_MAX_MONO_INPUTS; i++) mMonoIO[i].store(0);
+        RestartMonoTimelines();
         mVolume.store(ozzy_volume_clamp(volume));
         mMuted.store(muted);
         mPairIn.store(pairs[0]);
