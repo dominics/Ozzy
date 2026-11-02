@@ -25,8 +25,12 @@ jobs:
           shellcheck macos/packaging/build-pkg.sh macos/packaging/check-pkg.sh \
             macos/install-userspace.command macos/uninstall-userspace.command
           shellcheck --shell=bash macos/packaging/uninstall.sh macos/packaging/scripts/preinstall macos/packaging/scripts/postinstall
+      - name: Engine tests
+        run: make -C tests check
       - name: Daemon tests
         run: make -C macos/Backends/OzzyDaemon check
+      - name: Plug-in backend tests (fake-daemon)
+        run: make -C macos/Backends/OzzyDaemon/tools check
       - name: Build package
         run: macos/packaging/build-pkg.sh
       - name: Check package
