@@ -220,6 +220,38 @@ static void check_clear_sent_xone(void)
 	free(e);
 }
 
+/*
+ * The OUT queue per device: 24 ms for the CMS 600-3 (OZZY_QUIRK_DEEP_OUT_QUEUE), 12 ms for
+ * the rest of the family; the safety offset and the reported queue follow it
+ */
+static void check_out_queue(uint16_t vid, uint16_t pid, uint32_t transfers)
+{
+	const struct ozzy_device *model = ozzy_device_lookup(vid, pid);
+	static struct ozzy_shared_memory shm;
+	struct fake_bus fb;
+	struct fake_xfer x;
+	struct ozzy_engine *e;
+	uint32_t outs = 0;
+
+	memset(&shm, 0, sizeof(shm));
+	fake_bus_init(&fb, &shm, false, NULL);
+	e = ozzy_engine_init(malloc(ozzy_engine_size(model)), model);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_OUT, 0x02, 1, 156, 1);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_IN, 0x86, 2, 512, 1);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_FEEDBACK, 0x81, 1, 3, 4);
+	ozzy_engine_attach(e, &fb.bus, &shm);
+	ozzy_engine_set_anchors(e, true);
+	CHECK(ozzy_engine_start(e), "%s start", model->name);
+	while (fake_bus_pop(&fb, &x))
+		outs += x.pipe == 0x02;
+	CHECK(outs == transfers && shm.info.pipes[OZZY_PIPE_PCM_OUT].in_flight == transfers,
+	      "%s: %u OUT transfers queued, %u reported, want %u", model->name, outs,
+	      shm.info.pipes[OZZY_PIPE_PCM_OUT].in_flight, transfers);
+	CHECK(shm.audio.safety_offset_frames == transfers * isoc_fb_max_frames(shm.audio.sample_rate, ISOC_TRANSFER_UFRAMES),
+	      "%s: safety offset %u at %u Hz", model->name, shm.audio.safety_offset_frames, shm.audio.sample_rate);
+	free(e);
+}
+
 int main(void)
 {
 	const struct ozzy_device *model = ozzy_device_lookup(0x0644, 0x8020);
@@ -235,6 +267,8 @@ int main(void)
 	check_short_in();
 	check_clear_sent_isoc();
 	check_clear_sent_xone();
+	check_out_queue(0x0562, 0x03EB, ISOC_OUT_TRANSFERS_DEEP);   /* CMS 600-3 */
+	check_out_queue(0x09E8, 0x0010, ISOC_OUT_TRANSFERS);        /* EIE Pro */
 	CHECK(model && model->family == OZZY_FAMILY_PLOYTEC_ISOC, "US-144MKII in the device list");
 	for (i = 0; i < sizeof(out_ring); i++)
 		out_ring[i] = (uint8_t)(i * 7 + 3);

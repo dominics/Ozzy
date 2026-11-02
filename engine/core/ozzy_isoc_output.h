@@ -30,6 +30,7 @@ extern "C" {
  * @ring_frames:    frames in the output ring
  * @anchor_frames:  timestamp anchor spacing (the HAL's zero timestamp period), 0: none
  * @out_max_packet: bytes per service interval
+ * @out_transfers:  OUT transfers in flight, at most ISOC_OUT_TRANSFERS_MAX (0: ISOC_OUT_TRANSFERS)
  * @fb_addr:        0: no feedback endpoint, nominal rate
  * @ring:           the plain frame ring OUT packets point into (the HAL writes it on macOS)
  * @xfer:           instead of @ring, one buffer per OUT transfer (@xfer_size bytes each), its
@@ -47,13 +48,14 @@ struct ozzy_isoc_output_config {
 	uint64_t anchor_frames;
 	uint8_t out_addr;
 	uint16_t out_max_packet;
+	uint32_t out_transfers;
 	uint8_t out_interval;
 	uint8_t fb_addr;
 	uint16_t fb_max_packet;
 	uint8_t fb_interval;
 	struct isoc_fb_config feedback;
 	uint8_t *ring;
-	uint8_t *xfer[ISOC_OUT_TRANSFERS];
+	uint8_t *xfer[ISOC_OUT_TRANSFERS_MAX];
 	uint32_t xfer_size;
 	uint8_t *fb_buf;
 	uint32_t fb_size;
@@ -76,18 +78,20 @@ struct ozzy_isoc_output {
 	struct isoc_fb fb;
 	uint32_t out_uframes;      /* microframes per OUT packet */
 	uint32_t out_max_frames;   /* frames that fit one OUT packet */
+	uint32_t out_transfers;    /* OUT transfers in flight */
 	uint64_t out_frame;        /* next frame to send (ring position) */
 	uint64_t played_frames;    /* frames of completed transfers (the device's sample time) */
 	uint64_t next_anchor;      /* sample time of the next timestamp anchor */
 	bool fb_logged;
-	struct ozzy_isoc_output_xfer out[ISOC_OUT_TRANSFERS];
+	struct ozzy_isoc_output_xfer out[ISOC_OUT_TRANSFERS_MAX];
 	struct ozzy_isoc_output_xfer fb_xfer[ISOC_FB_TRANSFERS];
 };
 
-/* Frames the output reads ahead of the clock at @rate (the HAL's safety offset) */
-static inline uint32_t ozzy_isoc_output_safety_offset(uint32_t rate)
+/* Frames the output reads ahead of the clock at @rate with @transfers OUT transfers in flight
+ * (the HAL's safety offset) */
+static inline uint32_t ozzy_isoc_output_safety_offset(uint32_t rate, uint32_t transfers)
 {
-	return ISOC_OUT_TRANSFERS * isoc_fb_max_frames(rate, ISOC_TRANSFER_UFRAMES);
+	return transfers * isoc_fb_max_frames(rate, ISOC_TRANSFER_UFRAMES);
 }
 
 /* Clear the ring, reset the clock, submit the feedback and OUT transfers */

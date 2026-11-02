@@ -113,7 +113,8 @@ static bool isoc_start(struct ozzy_engine *e)
 	}
 	pe->sample_rate = hs.rate;
 	shm->audio.sample_rate = pe->sample_rate;
-	shm->audio.safety_offset_frames = ozzy_isoc_output_safety_offset(pe->sample_rate);
+	shm->audio.safety_offset_frames = ozzy_isoc_output_safety_offset(pe->sample_rate,
+									  ozzy_engine_isoc_out_transfers(e));
 	/* Input: the transfers queued (it shrinks with them; before the setting it was the output's
 	 * offset, 135-147 frames, now 160 at the defaults), at least the jitter floor */
 	shm->audio.input_safety_offset_frames = ozzy_engine_safety_offset(pe->in_queue * pe->in_frames, pe->sample_rate);
@@ -122,7 +123,7 @@ static bool isoc_start(struct ozzy_engine *e)
 	e->report.output = OZZY_INFO_OUTPUT_ISOC;
 	e->report.feedback = !pe->fb_addr || feedback.format == ISOC_FB_NONE ? OZZY_INFO_FEEDBACK_NONE :
 			     feedback.format == ISOC_FB_COUNT ? OZZY_INFO_FEEDBACK_COUNT : OZZY_INFO_FEEDBACK_Q16_16;
-	e->report.in_flight[OZZY_PIPE_PCM_OUT] = ISOC_OUT_TRANSFERS;
+	e->report.in_flight[OZZY_PIPE_PCM_OUT] = (uint8_t)ozzy_engine_isoc_out_transfers(e);
 	e->report.in_flight[OZZY_PIPE_PCM_IN] = (uint8_t)pe->in_queue;
 	e->report.in_flight[OZZY_PIPE_FEEDBACK] = ISOC_FB_TRANSFERS;
 	e->report.in_flight[OZZY_PIPE_MIDI_IN] = PLOYTEC_MIDI_IN_XFERS;
@@ -149,6 +150,7 @@ static bool isoc_start(struct ozzy_engine *e)
 	out.anchor_frames = shm->audio.timestamp_frames;   /* 0: none */
 	out.out_addr = pe->out_addr;
 	out.out_max_packet = pe->out_max_packet;
+	out.out_transfers = ozzy_engine_isoc_out_transfers(e);
 	out.out_interval = pe->out_interval;
 	out.fb_addr = pe->fb_addr;
 	out.fb_max_packet = pe->fb_max_packet;

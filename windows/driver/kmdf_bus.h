@@ -20,7 +20,7 @@ enum {
     KBUS_DEAD_MS = 500,           /* a wedged pipe; a ~110 ms gap in completions can come back on its own */
     KBUS_RECOVER_S = 10,          /* between recoveries: a device a reset doesn't help isn't reset forever */
     KBUS_MAX_PIPES = 8,
-    KBUS_REQUESTS_PER_PIPE = 8,   /* the engines keep at most 4 per pipe in flight */
+    KBUS_REQUESTS_PER_PIPE = 8,   /* the engines keep at most 6 per pipe in flight */
     KBUS_MAX_BLOCKS = 24,         /* transfer buffers (ozzy_engine_alloc_memory: 14) */
 };
 

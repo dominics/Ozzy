@@ -95,6 +95,8 @@ bool ozzy_isoc_output_start(struct ozzy_isoc_output *out, const struct ozzy_bus 
 		ozzy_log("isoc: feedback bInterval %u not supported, PCM out runs at the nominal rate",
 			 config->fb_interval);
 
+	out->out_transfers = !config->out_transfers ? ISOC_OUT_TRANSFERS :
+			     config->out_transfers < ISOC_OUT_TRANSFERS_MAX ? config->out_transfers : ISOC_OUT_TRANSFERS_MAX;
 	out->out_uframes = isoc_fb_interval_uframes(config->out_interval);
 	out->out_max_frames = config->out_max_packet / config->frame_bytes;
 	if (out->out_max_frames < isoc_fb_max_frames(config->rate, out->out_uframes))
@@ -113,7 +115,7 @@ bool ozzy_isoc_output_start(struct ozzy_isoc_output *out, const struct ozzy_bus 
 
 	for (i = 0; fb_fits && i < ISOC_FB_TRANSFERS; i++)
 		submit_feedback(out, i);
-	for (i = 0; i < ISOC_OUT_TRANSFERS; i++)
+	for (i = 0; i < out->out_transfers; i++)
 		submit_out(out, i);
 	return true;
 }

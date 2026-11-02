@@ -27,7 +27,7 @@
 
 #define OZZY_MAX_INTERFACES  4
 #define OZZY_MAX_PIPES        OZZY_PIPE_ROLES
-#define OZZY_URBS_PER_PIPE             8     /* per pipe: more than any engine keeps in flight (4) */
+#define OZZY_URBS_PER_PIPE             8     /* per pipe: more than any engine keeps in flight (6) */
 
 #define chip_log(chip, fmt, ...)  dev_info(&(chip)->dev->dev, "[ozzy] " fmt "\n", ##__VA_ARGS__)
 #define chip_err(chip, fmt, ...)  dev_err(&(chip)->dev->dev, "[ozzy] " fmt "\n", ##__VA_ARGS__)

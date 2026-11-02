@@ -266,7 +266,7 @@ static bool us3xx_start(struct ozzy_engine *e)
 	}
 	ue->sample_rate = hs.rate;
 	shm->audio.sample_rate = ue->sample_rate;
-	shm->audio.safety_offset_frames = ozzy_isoc_output_safety_offset(ue->sample_rate);
+	shm->audio.safety_offset_frames = ozzy_isoc_output_safety_offset(ue->sample_rate, ISOC_OUT_TRANSFERS);
 	shm->audio.input_safety_offset_frames = ozzy_isoc_input_safety_offset(ue->sample_rate);
 	ozzy_engine_publish_settings(e, &clock);
 	e->report.firmware_valid = true;
