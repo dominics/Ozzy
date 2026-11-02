@@ -644,7 +644,8 @@ bool OzzyHALDevice::UpdateConnectionState(AudioServerPlugInHostRef host) {
         ApplyLayout(shm);
         RestoreSettings(host);
         mExtras.Restore(host, mDeviceUID);
-        LogOzzyHAL("device %{public}u ready: '%{public}s'", mSlot, shm->product_name);
+        char name[sizeof(shm->product_name) + 1];
+        LogOzzyHAL("device %{public}u ready: '%{public}s'", mSlot, OzzyCopyName(name, shm->product_name, ""));
     } else if (mIOStarted) {
         mIOStarted = false;
         ozzy_timeline_restart(&mTimeline);
