@@ -111,14 +111,50 @@ static void retry_after_unplug_does_nothing(void)
 	CHECK(handover_started(&h, HANDOVER_BUSY) == HANDOVER_NONE, "a late busy result does nothing");
 }
 
-static void failed_start(void)
+/* A control request timing out at plug-in: retried quickly a few times, then slowly */
+static void failed_start_is_retried(void)
+{
+	struct handover h;
+	int i;
+
+	handover_init(&h, me);
+	handover_console(&h, me);
+	handover_device(&h, true);
+	for (i = 0; i < HANDOVER_FAILED_RETRIES; i++) {
+		CHECK(handover_started(&h, HANDOVER_FAILED) == HANDOVER_RETRY_FAILED && !h.running, "failed retry %d", i);
+		CHECK(handover_retry(&h) == HANDOVER_START, "failed retry %d starts", i);
+	}
+	for (i = 0; i < 3; i++) {
+		CHECK(handover_started(&h, HANDOVER_FAILED) == HANDOVER_RETRY_SLOWLY, "still failing: slowly %d", i);
+		CHECK(handover_retry(&h) == HANDOVER_START, "slow retry %d starts", i);
+	}
+	CHECK(handover_started(&h, HANDOVER_STARTED) == HANDOVER_NONE && h.running, "it started");
+	CHECK(handover_device(&h, false) == HANDOVER_STOP, "unplug");
+	CHECK(handover_device(&h, true) == HANDOVER_START, "replug");
+	CHECK(handover_started(&h, HANDOVER_FAILED) == HANDOVER_RETRY_FAILED, "a replug starts a fast round");
+
+	/* Busy and failed results count separately */
+	handover_retry(&h);
+	CHECK(handover_started(&h, HANDOVER_BUSY) == HANDOVER_RETRY_SOON, "busy after a failure: fast");
+	handover_retry(&h);
+	CHECK(handover_started(&h, HANDOVER_FAILED) == HANDOVER_RETRY_FAILED, "failed again: still fast");
+
+	/* Away from front or unplugged while waiting: nothing more */
+	CHECK(handover_console(&h, other) == HANDOVER_NONE, "nothing running to stop");
+	CHECK(handover_retry(&h) == HANDOVER_NONE, "the pending timer does nothing");
+	CHECK(handover_started(&h, HANDOVER_FAILED) == HANDOVER_NONE, "a late failure does nothing");
+	CHECK(handover_console(&h, me) == HANDOVER_START, "back in front tries again");
+	CHECK(handover_started(&h, HANDOVER_FAILED) == HANDOVER_RETRY_FAILED, "with a fast round");
+}
+
+static void unsupported_gives_up(void)
 {
 	struct handover h;
 
 	handover_init(&h, me);
 	handover_console(&h, me);
 	handover_device(&h, true);
-	CHECK(handover_started(&h, HANDOVER_FAILED) == HANDOVER_GIVE_UP && !h.running, "give up");
+	CHECK(handover_started(&h, HANDOVER_UNSUPPORTED) == HANDOVER_GIVE_UP && !h.running, "give up");
 	CHECK(handover_retry(&h) == HANDOVER_NONE, "no retry after giving up");
 	CHECK(handover_console(&h, other) == HANDOVER_NONE, "nothing to stop");
 	CHECK(handover_console(&h, me) == HANDOVER_START, "back in front tries again");
@@ -140,7 +176,7 @@ static void lost_is_retried_slowly(void)
 	CHECK(handover_device(&h, false) == HANDOVER_NONE, "unplugged while waiting: nothing to stop");
 	CHECK(handover_retry(&h) == HANDOVER_NONE, "and no retry");
 	CHECK(handover_device(&h, true) == HANDOVER_START, "replug starts a new round");
-	CHECK(handover_started(&h, HANDOVER_FAILED) == HANDOVER_GIVE_UP, "a new round gives up on failure as before");
+	CHECK(handover_started(&h, HANDOVER_FAILED) == HANDOVER_RETRY_FAILED, "a new round retries a failure quickly");
 
 	running(&h);
 	handover_console(&h, other);
@@ -155,7 +191,8 @@ int main(void)
 	busy_falls_back_to_slow_retries();
 	slow_retry_stops_when_front_lost();
 	retry_after_unplug_does_nothing();
-	failed_start();
+	failed_start_is_retried();
+	unsupported_gives_up();
 	lost_is_retried_slowly();
 	return CHECK_DONE("handover");
 }

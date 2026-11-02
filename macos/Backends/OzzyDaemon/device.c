@@ -309,7 +309,7 @@ enum handover_start device_drive(struct daemon_device *d)
 	}
 	if (model->family != OZZY_FAMILY_USB_MIDI && ubus_class_compliant(&d->bus)) {
 		ozzy_log("  class compliant (interface 0 is Audio class): leaving it to the class driver");
-		goto fail;
+		goto unsupported;
 	}
 
 	size = ozzy_engine_size(model);
@@ -317,7 +317,7 @@ enum handover_start device_drive(struct daemon_device *d)
 	d->engine = d->engine_mem ? ozzy_engine_init(d->engine_mem, model) : NULL;
 	if (!d->engine) {
 		ozzy_log("  no engine for this device");
-		goto fail;
+		goto unsupported;
 	}
 
 	ozzy_daemon_segment_name(name, d->location_id);
@@ -371,12 +371,16 @@ enum handover_start device_drive(struct daemon_device *d)
 	ozzy_log("  driver ready (segment %s)", name);
 	return HANDOVER_STARTED;
 
+unsupported:
+	close_device(d);
+	d->busy_logged = false;
+	return HANDOVER_UNSUPPORTED;
+
 fail_config:
 	ozzy_log("  configuration failed");
 fail:
 	close_device(d);
 	d->busy_logged = false;
-	d->slow_logged = false;
 	return HANDOVER_FAILED;
 }
 

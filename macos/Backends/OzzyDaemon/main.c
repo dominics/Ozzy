@@ -4,9 +4,9 @@
  * from user space, one segment per device, for OzzyHAL and OzzyMIDI. A LaunchAgent in each GUI
  * session: only the console user's daemon drives a device, the others release it and its
  * segment (handover.h). A device someone else holds (another user's daemon, a kext) is retried
- * until it lets go. The main thread is the control thread: device matching and termination,
- * console changes, system sleep and wake, retries, and each device's mailbox and watchdog
- * timers.
+ * until it lets go, and one that fails to start is retried while it stays attached. The main
+ * thread is the control thread: device matching and termination, console changes, system sleep
+ * and wake, retries, and each device's mailbox and watchdog timers.
  */
 
 #include <IOKit/IOMessage.h>
@@ -91,10 +91,15 @@ static void apply(struct daemon_device *d, enum handover_action action)
 	case HANDOVER_RETRY_SOON:
 		retry_after(d, HANDOVER_SOON_MS);
 		break;
+	case HANDOVER_RETRY_FAILED:
+		ozzy_log("%s at 0x%08x: start failed; trying again in %u ms (%u of %u)", d->model->name, d->location_id,
+			 HANDOVER_FAILED_MS, d->handover.failures, HANDOVER_FAILED_RETRIES);
+		retry_after(d, HANDOVER_FAILED_MS);
+		break;
 	case HANDOVER_RETRY_SLOWLY:
 		if (!d->slow_logged) {
-			ozzy_log("%s at 0x%08x still held; trying again each %u s", d->model->name, d->location_id,
-				 HANDOVER_SLOW_MS / 1000);
+			ozzy_log("%s at 0x%08x %s; trying again each %u s", d->model->name, d->location_id,
+				 d->handover.failures ? "still fails to start" : "still held", HANDOVER_SLOW_MS / 1000);
 			d->slow_logged = true;
 		}
 		retry_after(d, HANDOVER_SLOW_MS);

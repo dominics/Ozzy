@@ -24,7 +24,7 @@ struct daemon_device {
 	struct handover handover;
 	CFRunLoopTimerRef retry;  /* a pending HANDOVER_RETRY_* */
 	bool busy_logged;         /* why it is busy, logged once per round of retries */
-	bool slow_logged;         /* that it went over to slow retries, likewise */
+	bool slow_logged;         /* that it went over to slow retries, likewise (busy or failing) */
 
 	pthread_mutex_t lock;     /* the engine's lifecycle: start, restart, stop (OzzyKext's mSettingsLock) */
 	bool driving;             /* bus, segment and engine set up (device_drive succeeded) */
@@ -48,8 +48,9 @@ struct daemon_device *device_new(io_service_t service, const struct ozzy_device 
 /*
  * device_drive - Open the device and drive it: segment, configuration, engine start, timers on
  * the current run loop. HANDOVER_BUSY when another driver or process holds the device or its
- * segment, logged only if d->busy_logged is clear (and then set). Anything else that fails is
- * logged and HANDOVER_FAILED. On anything but HANDOVER_STARTED the device is left closed.
+ * segment, logged only if d->busy_logged is clear (and then set). HANDOVER_UNSUPPORTED for a
+ * device it can't drive at all (class compliant, no engine). Anything else that fails is logged
+ * and HANDOVER_FAILED. On anything but HANDOVER_STARTED the device is left closed.
  */
 enum handover_start device_drive(struct daemon_device *d);
 
