@@ -70,6 +70,30 @@ static void check_f32_clamp(void)
 	CHECK(f32_to_s24(0.5f) == 4194304, "0.5 encodes as %d", f32_to_s24(0.5f));
 }
 
+/* A start lays the input out again, so the shared input ring starts as silence (the HAL reads it by sample time) */
+static void check_start_clears_input(void)
+{
+	const struct ozzy_device *model = ozzy_device_lookup(0x0562, 0x03EB);
+	static struct ozzy_shared_memory shm;
+	struct fake_bus fb;
+	struct ozzy_engine *e;
+	unsigned int i, stale;
+
+	fake_bus_init(&fb, &shm, false, NULL);
+	e = ozzy_engine_init(malloc(ozzy_engine_size(model)), model);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_OUT, 0x02, 1, 156, 1);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_IN, 0x86, 2, 512, 1);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_FEEDBACK, 0x81, 1, 3, 4);
+	ozzy_engine_attach(e, &fb.bus, &shm);
+	ozzy_engine_set_anchors(e, true);
+	memset(shm.audio.input_buffer, 0x77, sizeof(shm.audio.input_buffer));   /* a previous run's input */
+	CHECK(ozzy_engine_start(e), "CMS start");
+	for (i = 0, stale = 0; i < sizeof(shm.audio.input_buffer); i++)
+		stale += shm.audio.input_buffer[i] != 0;
+	CHECK(!stale, "%u bytes of the previous run's input left after start", stale);
+	free(e);
+}
+
 int main(void)
 {
 	const struct ozzy_device *model = ozzy_device_lookup(0x0644, 0x8020);
@@ -82,6 +106,7 @@ int main(void)
 	unsigned int i, ins = 0, wrong = 0, wrong_in = 0;
 
 	check_f32_clamp();
+	check_start_clears_input();
 	CHECK(model && model->family == OZZY_FAMILY_PLOYTEC_ISOC, "US-144MKII in the device list");
 	for (i = 0; i < sizeof(out_ring); i++)
 		out_ring[i] = (uint8_t)(i * 7 + 3);
