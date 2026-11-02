@@ -50,7 +50,7 @@ for b in "$P/Library/Audio/Plug-Ins/HAL/OzzyHAL.driver" "$P/Library/Audio/MIDI D
 		exe="$b"
 	fi
 	archs="$(lipo -archs "$exe" | tr " " "\n" | LC_ALL=C sort | xargs)"
-	[ "$archs" = "arm64 x86_64" ] || fail "$(basename "$b") has architectures $archs, expected arm64 x86_64"
+	[ "$archs" = "arm64" ] || fail "$(basename "$b") has architectures $archs, expected arm64"
 done
 # The signing identifier comes from the daemon's embedded Info.plist; a bare binary would get its file name
 codesign -dv "$P/Library/Application Support/Ozzy/OzzyDaemon" 2>&1 | grep -qx 'Identifier=com.ozzy.daemon' \

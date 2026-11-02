@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 # Builds Ozzy-CMS600-<version>.pkg: OzzyHAL, OzzyMIDI and the OzzyDaemon
-# LaunchAgent, ad-hoc signed, with arm64 and x86_64 slices. No kext.
+# LaunchAgent, ad-hoc signed, Apple silicon (arm64) only. No kext.
 # Usage: build-pkg.sh [VERSION]
 set -euo pipefail
 PKGDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,11 +25,11 @@ rm -rf "$OUT"
 mkdir -p "$WORK/root" "$WORK/scripts"
 echo "Building Ozzy-CMS600 $VERSION (bundle $BUNDLE_VERSION, build $BUILD_NUMBER)"
 
-# The build settings install.command uses, for both architectures and unsigned (signed below).
+# The build settings install.command uses, for arm64 and unsigned (signed below).
 # 12.0 is the oldest deployment target Xcode 26 builds for.
 xc() {
 	xcodebuild -quiet -project Ozzy.xcodeproj -scheme "$1" -configuration Release -derivedDataPath "$WORK/dd" \
-		-destination 'generic/platform=macOS' ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO \
+		-destination 'generic/platform=macOS' ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO \
 		MACOSX_DEPLOYMENT_TARGET=12.0 \
 		GCC_PREPROCESSOR_DEFINITIONS="\$(inherited) OZZY_GIT_VERSION=\\\"$VERSION\\\"" \
 		OTHER_LDFLAGS="$2" build
@@ -39,7 +39,7 @@ xc OzzyMIDI "\$(inherited) -framework IOKit -framework CoreFoundation -framework
 PRODUCTS="$WORK/dd/Build/Products/Release"
 
 make -s -C Backends/OzzyDaemon clean
-make -s -C Backends/OzzyDaemon build/ozzy-daemon UNIVERSAL=1 OZZY_VERSION="$VERSION"
+make -s -C Backends/OzzyDaemon build/ozzy-daemon ARCHS="-arch arm64" OZZY_VERSION="$VERSION"
 
 R="$WORK/root"
 mkdir -p "$R/Library/Audio/Plug-Ins/HAL" "$R/Library/Audio/MIDI Drivers" "$R/Library/LaunchAgents" \
