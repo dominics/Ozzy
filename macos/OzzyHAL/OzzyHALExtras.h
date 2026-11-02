@@ -91,11 +91,11 @@ public:
         bool muted = false;
         uint32_t pairs[2] = { kDefaultPair, kDefaultPair };
         CFPropertyListRef v;
-        if ((v = Copy(host, kVolumeKey))) {
+        if ((v = CopyOrMigrate(host, kVolumeKey, kLegacyVolumeKey))) {
             if (CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)v, kCFNumberFloat32Type, &volume);
             CFRelease(v);
         }
-        if ((v = Copy(host, kMuteKey))) {
+        if ((v = CopyOrMigrate(host, kMuteKey, kLegacyMuteKey))) {
             if (CFGetTypeID(v) == CFBooleanGetTypeID()) muted = CFBooleanGetValue((CFBooleanRef)v);
             CFRelease(v);
         }
@@ -331,6 +331,10 @@ private:
     static constexpr const char* kMuteKey = "Output Mute";
     static constexpr const char* kInPairKey = "Input Stereo Pair";
     static constexpr const char* kOutPairKey = "Output Stereo Pair";
+    // Ozzy 0.3.0's keys, one per plug-in (it drove one device): read for a device that has none of
+    // its own yet
+    static constexpr const char* kLegacyVolumeKey = "output volume";
+    static constexpr const char* kLegacyMuteKey = "output mute";
 
     AudioObjectID mDevice = kAudioObjectUnknown;
     const struct ozzy_device* mModel = nullptr;
@@ -370,6 +374,18 @@ private:
         CFPropertyListRef v = nullptr;
         if (host && key && host->CopyFromStorage(host, key, &v) != kAudioHardwareNoError) v = nullptr;
         if (key) CFRelease(key);
+        return v;
+    }
+
+    /* What storage has under @what, or else under the plug-in-wide @legacy key, which is then
+     * stored under @what so the device has its own from now on */
+    CFPropertyListRef CopyOrMigrate(AudioServerPlugInHostRef host, const char* what, const char* legacy) const {
+        CFPropertyListRef v = Copy(host, what);
+        if (v || !host) return v;
+        CFStringRef key = CFStringCreateWithCString(NULL, legacy, kCFStringEncodingUTF8);
+        if (key && host->CopyFromStorage(host, key, &v) != kAudioHardwareNoError) v = nullptr;
+        if (key) CFRelease(key);
+        if (v) Store(host, what, CFRetain(v));
         return v;
     }
 
