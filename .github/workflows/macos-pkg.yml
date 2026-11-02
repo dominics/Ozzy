@@ -70,6 +70,6 @@ jobs:
         run: |
           v="$(cat dist/VERSION)"
           args=(--draft --verify-tag --title "Ozzy for Dynacord CMS 600-3 $v" --notes-file macos/packaging/release-notes.md)
-          # v1.0.0-rc.1 and the like: a pre-release, so the latest release stays the last full one
+          # v0.4.0-rc.1 and the like: a pre-release, so the latest release stays the last full one
           case "$v" in *-*) args+=(--prerelease) ;; esac
           gh release create "$GITHUB_REF_NAME" "${args[@]}" "dist/Ozzy-CMS600-$v.pkg" "dist/Ozzy-CMS600-$v.pkg.sha256"
