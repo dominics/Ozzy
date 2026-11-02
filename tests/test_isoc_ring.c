@@ -114,6 +114,112 @@ static void check_short_in(void)
 	free(e);
 }
 
+/* Bytes of @buf (@size bytes, from @at, wrapping) that aren't @value */
+static uint32_t count_not(const uint8_t *buf, uint32_t size, uint32_t at, uint32_t len, uint8_t value)
+{
+	uint32_t j, n = 0;
+
+	for (j = 0; j < len; j++)
+		n += buf[(at + j) % size] != value;
+	return n;
+}
+
+/*
+ * Where the HAL writes the frame ring (no ring platform): once an OUT transfer completes, its
+ * frames are silence, and the transfers still queued keep what the HAL wrote
+ */
+static void check_clear_sent_isoc(void)
+{
+	const struct ozzy_device *model = ozzy_device_lookup(0x0562, 0x03EB);
+	static struct ozzy_shared_memory shm;
+	struct fake_xfer queued[8];
+	struct ozzy_isoc_packet sent_packets[OZZY_MAX_ISOC_PACKETS];
+	struct fake_bus fb;
+	struct fake_xfer x;
+	struct ozzy_engine *e;
+	unsigned int i, k, nq = 0, done = 0, left = 0, kept = 0;
+
+	fake_bus_init(&fb, &shm, false, NULL);
+	e = ozzy_engine_init(malloc(ozzy_engine_size(model)), model);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_OUT, 0x02, 1, 156, 1);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_IN, 0x86, 2, 512, 1);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_FEEDBACK, 0x81, 1, 3, 4);
+	ozzy_engine_attach(e, &fb.bus, &shm);
+	ozzy_engine_set_anchors(e, true);
+	CHECK(ozzy_engine_start(e), "CMS start");
+	memset(shm.audio.output_buffer, 0x33, sizeof(shm.audio.output_buffer));   /* the HAL's frames */
+	for (i = 0; i < 400 && done < 40 && fake_bus_pop(&fb, &x); i++) {
+		if (x.pipe != 0x02) {
+			fake_bus_complete(&fb, e, &x, fill, NULL);
+			continue;
+		}
+		/* The OUT transfers queue in order: complete the oldest, check it and the rest */
+		queued[nq++] = x;
+		if (nq < ISOC_OUT_TRANSFERS)
+			continue;
+		/* Its packets as sent: the completion submits it again with new ones */
+		memcpy(sent_packets, queued[0].packets, queued[0].count * sizeof(sent_packets[0]));
+		fake_bus_complete(&fb, e, &queued[0], NULL, NULL);
+		for (k = 0; k < queued[0].count; k++)
+			left += count_not(queued[0].buf, queued[0].size, sent_packets[k].offset, sent_packets[k].length, 0);
+		for (k = 0; k < nq - 1; k++) {
+			kept += count_not(queued[k + 1].buf, queued[k + 1].size, queued[k + 1].packets[0].offset,
+					  queued[k + 1].packets[0].length, 0x33);
+			queued[k] = queued[k + 1];
+		}
+		nq--;
+		/* The HAL writes the next lap's frames into what just went out */
+		memset(shm.audio.output_buffer, 0x33, sizeof(shm.audio.output_buffer));
+		done++;
+	}
+	CHECK(done == 40 && !left, "CMS: %u OUT transfers, %u bytes left after they went out", done, left);
+	CHECK(!kept, "CMS: %u bytes of queued transfers cleared", kept);
+	free(e);
+}
+
+/* The same on the Xones' own transfers (Xone:DB4, interrupt layout): only the PCM frames */
+static void check_clear_sent_xone(void)
+{
+	const struct ozzy_device *model = ozzy_device_lookup(0x0A4A, 0xFFDB);
+	static struct ozzy_shared_memory shm;
+	struct fake_bus fb;
+	struct fake_xfer x;
+	struct ozzy_engine *e;
+	unsigned int i, f, outs = 0, left = 0, framing = 0;
+	static uint8_t pcm[65536];   /* per byte of a transfer: a PCM frame's */
+
+	fake_bus_init(&fb, &shm, false, NULL);
+	e = ozzy_engine_init(malloc(ozzy_engine_size(model)), model);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_OUT, 0x05, 3, 964, 1);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_IN, 0x86, 3, 1024, 1);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_MIDI_IN, 0x83, 3, 64, 1);
+	ozzy_engine_attach(e, &fb.bus, &shm);
+	ozzy_engine_set_anchors(e, true);
+	CHECK(ozzy_engine_start(e), "Xone start");
+	memset(shm.audio.output_buffer, 0x33, sizeof(shm.audio.output_buffer));
+	for (i = 0; i < 400 && outs < 20 && fake_bus_pop(&fb, &x); i++) {
+		uint32_t frames = x.size / PLOYTEC_INT_OUT_SUBPKT_SIZE * PLOYTEC_FRAMES_PER_OUT_SUBPKT;
+
+		fake_bus_complete(&fb, e, &x, fill, NULL);
+		if (x.pipe != 0x05)
+			continue;
+		memset(pcm, 0, sizeof(pcm));
+		for (f = 0; f < frames; f++) {
+			uint32_t at = ploytec_out_frame_offset(PLOYTEC_OUT_LAYOUT_INT, f);
+
+			left += count_not(x.buf + at, PLOYTEC_OUT_FRAME_SIZE, 0, PLOYTEC_OUT_FRAME_SIZE, 0);
+			memset(pcm + at, 1, PLOYTEC_OUT_FRAME_SIZE);
+		}
+		for (f = 0; f < x.size; f++)   /* MIDI and sync bytes */
+			framing += !pcm[f] && !x.buf[f];   /* 0x33, or MIDI the engine placed since */
+		memset(x.buf, 0x33, x.size);
+		outs++;
+	}
+	CHECK(outs == 20 && !left, "Xone: %u OUT transfers, %u PCM bytes left after they went out", outs, left);
+	CHECK(!framing, "Xone: %u framing bytes cleared", framing);
+	free(e);
+}
+
 int main(void)
 {
 	const struct ozzy_device *model = ozzy_device_lookup(0x0644, 0x8020);
@@ -127,6 +233,8 @@ int main(void)
 
 	check_f32_clamp();
 	check_short_in();
+	check_clear_sent_isoc();
+	check_clear_sent_xone();
 	CHECK(model && model->family == OZZY_FAMILY_PLOYTEC_ISOC, "US-144MKII in the device list");
 	for (i = 0; i < sizeof(out_ring); i++)
 		out_ring[i] = (uint8_t)(i * 7 + 3);
