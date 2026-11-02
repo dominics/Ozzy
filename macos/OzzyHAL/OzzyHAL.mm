@@ -911,9 +911,17 @@ void OzzyHAL::Attach(OzzyBackend& backend, uint64_t registryID, uint32_t locatio
 }
 
 /* Attach to the daemon segments of listed USB devices that no device has yet (by the kext or a
- * daemon). A device without a segment (no daemon drives it) is skipped quietly. */
+ * daemon). A device without a segment (no daemon drives it) is skipped quietly; one the console
+ * user doesn't own, or from a daemon this plug-in doesn't understand, is refused (logged once). */
 void OzzyHAL::ScanDaemonSegments() {
+    static OzzyDaemonRefusalLog refusals;
+    static bool consoleUnknown;
     OzzyUSBDevice usb[kOzzyMaxDevices];
+    uid_t console;
+    bool consoleKnown = OzzyConsoleUser(&console);
+    if (!consoleKnown && !consoleUnknown) LogOzzyHALError("console user unknown: no daemon segment is mapped");
+    consoleUnknown = !consoleKnown;
+    if (!consoleKnown) return;
     unsigned int n = OzzyListUSBDevices(usb, kOzzyMaxDevices);
     for (unsigned int k = 0; k < n; k++) {
         bool known = false;
@@ -922,7 +930,15 @@ void OzzyHAL::ScanDaemonSegments() {
                                                   mDevices[i].GetLocationID() == usb[k].locationID));
         if (known || (!usb[k].model->in_channels && !usb[k].model->out_channels)) continue;   // MIDI only
         OzzyBackend backend;
-        if (backend.OpenDaemon(usb[k].locationID)) Attach(backend, usb[k].registryID, usb[k].locationID);
+        if (backend.OpenDaemonOwnedBy(usb[k].locationID, console)) Attach(backend, usb[k].registryID, usb[k].locationID);
+        else if (refusals.IsNew(usb[k].locationID, backend.refusal, backend.refusalValue)) {
+            if (backend.refusal == OzzyDaemonRefusal::Owner)
+                LogOzzyHALError("ignoring the daemon segment of %{public}08x: owned by uid %{public}u, not the console user %{public}u",
+                                usb[k].locationID, backend.refusalValue, (unsigned int)console);
+            else
+                LogOzzyHALError("ignoring the daemon segment of %{public}08x: version %{public}u, expected %{public}u",
+                                usb[k].locationID, backend.refusalValue, (unsigned int)OZZY_DAEMON_VERSION);
+        }
     }
 }
 

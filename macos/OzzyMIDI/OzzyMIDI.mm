@@ -211,9 +211,17 @@ static void ConnectService(io_service_t service, uint64_t registryID) {
 }
 
 /* Connect to the daemon segments of listed USB devices that no port has yet (by the kext or a
- * daemon). A device without a segment (no daemon drives it) is skipped quietly. */
+ * daemon). A device without a segment (no daemon drives it) is skipped quietly; one the console
+ * user doesn't own, or from a daemon this plug-in doesn't understand, is refused (logged once). */
 static void ScanDaemonSegments() {
+	static OzzyDaemonRefusalLog refusals;
+	static bool consoleUnknown;
 	OzzyUSBDevice usb[kMaxPorts];
+	uid_t console;
+	bool consoleKnown = OzzyConsoleUser(&console);
+	if (!consoleKnown && !consoleUnknown) LogOzzyMIDIError("console user unknown: no daemon segment is mapped");
+	consoleUnknown = !consoleKnown;
+	if (!consoleKnown) return;
 	unsigned int n = OzzyListUSBDevices(usb, kMaxPorts);
 	for (unsigned int k = 0; k < n; k++) {
 		bool known = false;
@@ -221,8 +229,17 @@ static void ScanDaemonSegments() {
 			known |= gPorts[i].shm && (gPorts[i].registryID == usb[k].registryID ||
 			                           gPorts[i].locationID == usb[k].locationID);
 		OzzyBackend backend;
-		if (!known && backend.OpenDaemon(usb[k].locationID))
+		if (known) continue;
+		if (backend.OpenDaemonOwnedBy(usb[k].locationID, console))
 			AttachBackend(backend, usb[k].registryID, usb[k].locationID);
+		else if (refusals.IsNew(usb[k].locationID, backend.refusal, backend.refusalValue)) {
+			if (backend.refusal == OzzyDaemonRefusal::Owner)
+				LogOzzyMIDIError("ignoring the daemon segment of %{public}08x: owned by uid %{public}u, not the console user %{public}u",
+			                 usb[k].locationID, backend.refusalValue, (unsigned int)console);
+			else
+				LogOzzyMIDIError("ignoring the daemon segment of %{public}08x: version %{public}u, expected %{public}u",
+			                 usb[k].locationID, backend.refusalValue, (unsigned int)OZZY_DAEMON_VERSION);
+		}
 	}
 }
 
