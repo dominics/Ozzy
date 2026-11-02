@@ -93,13 +93,13 @@ OZZY_DEVICE(AkaiEIEPro, 0x09E8, 0x0010, "Akai EIE Pro", PLOYTEC_ISOC, 4, 4,
  * M4_C1 MIDI on 0x83 / 0x04), 4 in / 4 out. Facts and rates from dominics/Ozzy, which drives
  * it on real hardware, and its captures (dominics/dynacord-cms-pcap): 44.1, 48 and 96 kHz,
  * the Xone handshake, both interfaces selected again on a rate change (Ozzy's restarts do).
- * Its MIDI frame has a second port at offset 4 ("SystemCtrl", FX control) that Ozzy doesn't
- * offer; the first is the DIN sockets. The later HW:03 revision is class compliant: if it
+ * Its MIDI frame has a second port at offset 4 ("SystemCtrl", FX control, OZZY_QUIRK_MIDI_PORT2);
+ * the first is the DIN sockets. The later HW:03 revision is class compliant: if it
  * shares this ID, Ozzy leaves it to the class driver (its interface 0 is Audio class).
  */
 #ifndef OZZY_DISABLE_DynacordCMS600
 OZZY_DEVICE(DynacordCMS600, 0x0562, 0x03EB, "Dynacord CMS 600-3", PLOYTEC_ISOC, 4, 4,
-	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_96K, EXPERIMENTAL, 0, OZZY_NO_LATENCY)
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_96K, EXPERIMENTAL, OZZY_QUIRK_MIDI_PORT2, OZZY_NO_LATENCY)
 #endif
 
 /*

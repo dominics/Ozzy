@@ -46,6 +46,8 @@ struct ploytec_isoc_engine {
 	uint32_t in_frames;        /* frames per PCM in transfer this run (OZZY_SETTING_PCM_IN_FRAMES) */
 	uint32_t in_queue;         /* PCM in transfers in flight this run (OZZY_SETTING_PCM_IN_QUEUE) */
 	bool streamed;             /* has streamed since attach: a start is a restart */
+	/* The second MIDI port's rings (OZZY_QUIRK_MIDI_PORT2, ploytec_midi2.h), NULL without */
+	volatile struct ozzy_midi_buffer *midi2_in, *midi2_out;
 };
 
 void ploytec_isoc_engine_init(struct ploytec_isoc_engine *pe, const struct ozzy_device *model);

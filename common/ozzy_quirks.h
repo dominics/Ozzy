@@ -161,6 +161,13 @@ enum ozzy_quirk {
 	 * output pair. Defaults: the converters' power-up state, and the selector Ozzy always wrote.
 	 */
 	OZZY_QUIRK_ESI_CPORT = 1u << 21,
+
+	/*
+	 * Dynacord CMS 600-3: a second MIDI port ("SystemCtrl") in bytes 4-7 of the M4_C1 MIDI frame
+	 * (common/devices/ploytec/dynacord_midi.h). The engine moves it once the platform gives it
+	 * rings for it (engine/devices/ploytec/ploytec_midi2.h). Fork only.
+	 */
+	OZZY_QUIRK_MIDI_PORT2 = 1u << 22,
 };
 
 #endif /* OZZY_QUIRKS_H */
