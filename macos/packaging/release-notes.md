@@ -1,4 +1,4 @@
-Userspace macOS driver for the Dynacord CMS 600-3: 4 inputs and 4 outputs at 44.1, 48 and 96 kHz, plus USB-MIDI. Needs an Apple Silicon Mac on macOS 26.1 or later, and no SIP changes.
+Userspace macOS driver for the Dynacord CMS 600-3: 4 inputs and 4 outputs at 44.1, 48 and 96 kHz, plus both MIDI ports (USB-MIDI and SystemCtrl). Needs an Apple Silicon Mac on macOS 26.1 or later, and no SIP changes.
 
 ## Install with Homebrew
 
