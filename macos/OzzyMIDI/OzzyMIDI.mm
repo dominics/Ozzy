@@ -90,9 +90,15 @@ static void SetPortDevice(OzzyMidiPort* port, const ozzy_shared_memory* shm, uin
 	} else {
 		LogOzzyMIDI("creating device: '%{public}s'", name);
 		OSStatus err = MIDIDeviceCreate(gDriverRef, deviceName, vendorName, deviceName, &port->device);
+		MIDIEntityRef ent = 0;
 		if (err == noErr) {
-			MIDIEntityRef ent;
-			MIDIDeviceAddEntity(port->device, CFSTR("MIDI"), false, 1, 1, &ent);
+			err = MIDIDeviceAddEntity(port->device, CFSTR("MIDI"), false, 1, 1, &ent);
+			if (err != noErr) {
+				LogOzzyMIDIError("failed to add the MIDI entity: %{public}d", (int)err);
+				MIDIDeviceDispose(port->device);
+			}
+		}
+		if (err == noErr) {
 			port->source = MIDIEntityGetSource(ent, 0);
 			MIDIEndpointSetRefCons(MIDIEntityGetDestination(ent, 0), port, nullptr);
 			// Without this the device exists but no client sees it (only a rescan's FindDevices
