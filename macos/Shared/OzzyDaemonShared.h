@@ -14,11 +14,18 @@
  * - client: waits for ack_seq == req_seq (acquire), then reads status
  * OZZY_METHOD_MIDI_OUT_PENDING doesn't use the mailbox: OzzyMIDI sets midi_out_pending and the
  * daemon's engine thread exchanges it back to 0.
+ *
+ * Second MIDI port (version 2): a device with OZZY_QUIRK_MIDI_PORT2 (the CMS 600-3's
+ * "SystemCtrl") has a second MIDI ring pair in the trailer, struct ozzy_daemon_midi2, used like
+ * the shared memory's midi_out / midi_in (ozzy_midi_ring_push / ozzy_midi_ring_pop): clients
+ * fill out and drain in. ozzy_daemon_midi2() is NULL for a device without one. The engine sends
+ * port 2 in the transfers it sends each millisecond anyway, so it has no midi_out_pending.
  */
 
 #ifndef OzzyDaemonShared_h
 #define OzzyDaemonShared_h
 
+#include "../../engine/shared/ozzy_shared_data.h"
 #include <IOKit/IOReturn.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,7 +36,7 @@
 #endif
 
 #define OZZY_DAEMON_MAGIC          0x545A5A4Fu   /* "OZZT" */
-#define OZZY_DAEMON_VERSION        1
+#define OZZY_DAEMON_VERSION        2             /* 2: struct ozzy_daemon_midi2 */
 #define OZZY_DAEMON_SEGMENT_PREFIX "/ozzy."      /* + the locationID as 8 hex digits */
 #define OZZY_DAEMON_SEGMENT_NAME_MAX 32          /* PSHMNAMLEN is 31 */
 #define OZZY_DAEMON_PAGE           16384u        /* the trailer starts on a 16 KiB boundary */
@@ -51,6 +58,17 @@ struct ozzy_daemon_mailbox {
 	uint32_t _reserved;
 };
 
+#define OZZY_DAEMON_MIDI_NAME_MAX  32
+
+/* The second MIDI port (engine/devices/ploytec/ploytec_midi2.h) */
+struct ozzy_daemon_midi2 {
+	uint32_t present;             /* daemon: 1 once the engine moves the port (after name) */
+	char name[OZZY_DAEMON_MIDI_NAME_MAX];   /* the port's name, e.g. "SystemCtrl" */
+	uint8_t _pad[28];
+	struct ozzy_midi_buffer out;  /* clients fill it, the engine drains it */
+	struct ozzy_midi_buffer in;   /* the engine fills it, clients drain it */
+};
+
 struct ozzy_daemon_trailer {
 	uint32_t magic;               /* OZZY_DAEMON_MAGIC once the daemon has set the segment up */
 	uint32_t version;             /* OZZY_DAEMON_VERSION */
@@ -58,6 +76,7 @@ struct ozzy_daemon_trailer {
 	uint32_t daemon_pid;
 	uint8_t _pad[48];
 	struct ozzy_daemon_mailbox mailbox __attribute__((aligned(64)));
+	struct ozzy_daemon_midi2 midi2 __attribute__((aligned(64)));
 };
 
 /* The segment's name for the device at @location_id */
@@ -117,6 +136,14 @@ static inline int32_t ozzy_daemon_call(struct ozzy_daemon_trailer *t, uint32_t m
 	return __atomic_load_n(&m->status, __ATOMIC_RELAXED);
 }
 
+/* The second MIDI port's rings and name, or NULL if the device has none (or no daemon runs it) */
+static inline struct ozzy_daemon_midi2 *ozzy_daemon_midi2(struct ozzy_daemon_trailer *t)
+{
+	if (!ozzy_daemon_trailer_valid(t) || !__atomic_load_n(&t->midi2.present, __ATOMIC_ACQUIRE))
+		return NULL;
+	return &t->midi2;
+}
+
 /* OZZY_METHOD_MIDI_OUT_PENDING: tell the daemon midi_out has bytes */
 static inline void ozzy_daemon_midi_out_pending(struct ozzy_daemon_trailer *t)
 {
@@ -146,6 +173,13 @@ static inline void ozzy_daemon_ack(struct ozzy_daemon_trailer *t, uint32_t seq, 
 {
 	__atomic_store_n(&t->mailbox.status, status, __ATOMIC_RELAXED);
 	__atomic_store_n(&t->mailbox.ack_seq, seq, __ATOMIC_RELEASE);
+}
+
+/* Offer the second MIDI port as @name, once ozzy_engine_set_midi2() took &t->midi2.in and .out */
+static inline void ozzy_daemon_midi2_publish(struct ozzy_daemon_trailer *t, const char *name)
+{
+	snprintf(t->midi2.name, sizeof(t->midi2.name), "%s", name);
+	__atomic_store_n(&t->midi2.present, 1u, __ATOMIC_RELEASE);
 }
 
 /* Whether OzzyMIDI queued MIDI out since the last call (clears it) */
