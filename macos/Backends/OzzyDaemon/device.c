@@ -154,7 +154,10 @@ static void poll_fired(CFRunLoopTimerRef timer, void *info)
 /*
  * As OzzyKext::WatchLocked: a PCM pipe that stopped completing gets the device a reselect and a
  * new start, counted in the stats. Also a device that keeps completing but stopped streaming:
- * its feedback without data, or PCM out failing in a row.
+ * its feedback without data, or PCM out failing in a row. A bulk PCM IN pipe isn't watched for
+ * completions: a bulk read completes when the device has data, and the CMS 600-3's 0x86 goes
+ * quiet for over 500 ms after a switch to 96 kHz and now and then while idle, then carries on.
+ * Its feedback going silent is what says the device stopped.
  */
 static void watch_locked(struct daemon_device *d)
 {
@@ -169,6 +172,8 @@ static void watch_locked(struct daemon_device *d)
 		return;
 	for (i = 0; i < sizeof(roles) / sizeof(roles[0]) && !why; i++) {
 		pipe = d->engine->pipe[roles[i]].address;
+		if (roles[i] == OZZY_PIPE_PCM_IN && d->engine->pipe[roles[i]].transfer_type == kUSBBulk)
+			continue;
 		if (pipe && ubus_pipe_stalled(&d->bus, pipe, now, ubus_ms_to_ticks(&d->bus, WATCH_DEAD_MS)))
 			why = "no completion";
 	}
