@@ -1,5 +1,33 @@
 # 🎛️ Ozzy - USB Audio & MIDI Driver for Non-Class Compliant Devices
 
+<!-- fork: dominics/Ozzy -->
+## About this fork
+
+This is [dominics/Ozzy](https://github.com/dominics/Ozzy), a fork of [mischa85/Ozzy](https://github.com/mischa85/Ozzy) for the Dynacord CMS 600-3 mixer (USB ID `0562:03eb`) on macOS. The fork's own work lives on its `release` branch; the rest of this README is upstream's.
+
+**A userspace driver.** Upstream's macOS driver is a kernel extension, which on Apple silicon means lowering the Mac's security settings. This fork adds OzzyDaemon, a background process that talks to the mixer through macOS's userspace USB API and feeds the same Core Audio (OzzyHAL) and MIDI (OzzyMIDI) plug-ins. It needs no kext and no changes to System Integrity Protection. For now the package drives the CMS 600-3 only.
+
+**CMS 600-3 extras.** Both of the mixer's MIDI ports, named channels, output volume and mute, and the MON and AUX inputs as separate devices. The protocol was reverse-engineered from USB captures, kept at [dominics/dynacord-cms-pcap](https://github.com/dominics/dynacord-cms-pcap).
+
+### Install (CMS 600-3, Apple silicon, macOS 26.1 or later)
+
+```bash
+brew install --cask dominics/tap/ozzy-cms600
+```
+
+Or download `Ozzy-CMS600-<version>.pkg` from the [releases page](https://github.com/dominics/Ozzy/releases). The package is not signed with an Apple Developer ID, so Gatekeeper blocks it the first time you open it. Double-click it and close the warning, then open System Settings > Privacy & Security, click **Open Anyway** next to the message about the package, and confirm the warnings that follow. Or skip Gatekeeper from Terminal with `sudo installer -pkg Ozzy-CMS600-*.pkg -target /`.
+
+From source: `macos/install-userspace.command` builds the same package with `macos/packaging/build-pkg.sh` and installs it.
+
+The package installs `/Library/Audio/Plug-Ins/HAL/OzzyHAL.driver`, `/Library/Audio/MIDI Drivers/OzzyMIDI.plugin` and `/Library/Application Support/Ozzy/OzzyDaemon`, which `/Library/LaunchAgents/com.ozzy.daemon.plist` starts in each GUI session (log: `~/Library/Logs/OzzyDaemon.log`). It refuses to install over upstream's kext driver: both drivers claim the mixer, so run `macos/uninstall.command` and reboot first.
+
+Uninstall: `brew uninstall --cask ozzy-cms600`, `macos/uninstall-userspace.command`, or `sudo "/Library/Application Support/Ozzy/uninstall.sh"`.
+
+**Power-cycle quirk**: the mixer only enumerates if it is powered on with the USB cable already plugged in. If it does not show up, power it off, plug in the cable, then power it on.
+
+---
+<!-- /fork -->
+
 **Bringing legacy professional audio hardware back to life.**
 
 Modern operating systems dropped support for non-class compliant USB audio devices—hardware that doesn't follow the standard USB Audio Class specification. These devices require vendor-specific drivers, and when manufacturers abandon them, perfectly good professional equipment becomes unusable.
