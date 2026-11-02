@@ -51,6 +51,24 @@ echo "OZZY DEBUG LOG - $(date)" >> "$LOGFILE"
         echo "No install log on the Desktop"
     fi
     echo "-----------------------------------------------------"
+    # The userspace driver (OzzyDaemon) logs only to its own file, not to the system log
+    if [ -f "/Library/LaunchAgents/com.ozzy.daemon.plist" ]; then
+        echo "Userspace driver: $("/Library/Application Support/Ozzy/OzzyDaemon" --version 2>/dev/null || echo "version unknown")"
+        if launchctl print "gui/$(id -u)/com.ozzy.daemon" > /dev/null 2>&1; then
+            echo "LaunchAgent com.ozzy.daemon: loaded"
+            launchctl print "gui/$(id -u)/com.ozzy.daemon" | grep -E "^[[:space:]]*(state|pid|last exit code|runs) =" | sed 's/^[[:space:]]*/   /'
+        else
+            echo "LaunchAgent com.ozzy.daemon: NOT loaded for this user"
+        fi
+        DAEMON_LOG="$HOME/Library/Logs/OzzyDaemon.log"
+        if [ -f "$DAEMON_LOG" ]; then
+            echo "DAEMON LOG ($DAEMON_LOG, last 2000 lines)"
+            tail -n 2000 "$DAEMON_LOG"
+        else
+            echo "No daemon log at $DAEMON_LOG"
+        fi
+        echo "-----------------------------------------------------"
+    fi
 } >> "$LOGFILE" 2>&1
 
 echo "HISTORY (Start - Last 2h)" >> "$LOGFILE"
