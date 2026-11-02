@@ -132,7 +132,7 @@ related to level metering or some control protocol. Has its own pipe assignment 
 - **A wrong byte 0 in Ploytec PCM IN frames, seen only by userspace macOS drivers.** Byte 0 of
   the 64-byte input frame holds bit 23 of the first channels, so a wrong byte 0 is a full-scale
   click on a quiet input. nkurence (#85, WZ4, his IOUSBLib harness): one frame near the start of a
-  capture, bit 23 flipped on several odd channels, 2 of 6 captures. dominics/Ozzy TODO.md
+  capture, bit 23 flipped on several odd channels, 2 of 6 captures. [TODO.md](../../TODO.md)
   (CMS 600-3, OzzyDaemon over IOUSBLib): byte 0 repeating the previous frame's in ~8% of frames in
   some 48 kHz sessions started right after a rate change, gone after another change. Not on the
   DB4 with the Linux module (2026-11-01): usbmon of 9 starts (attach, PipeWire's change, 7 rate
