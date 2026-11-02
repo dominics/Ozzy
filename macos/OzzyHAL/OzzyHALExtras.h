@@ -102,11 +102,12 @@ public:
         bool muted = false;
         uint32_t pairs[2] = { kDefaultPair, kDefaultPair };
         CFPropertyListRef v;
-        if ((v = CopyOrMigrate(host, kVolumeKey, kLegacyVolumeKey))) {
+        MigrateLegacy(host);
+        if ((v = Copy(host, kVolumeKey))) {
             if (CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)v, kCFNumberFloat32Type, &volume);
             CFRelease(v);
         }
-        if ((v = CopyOrMigrate(host, kMuteKey, kLegacyMuteKey))) {
+        if ((v = Copy(host, kMuteKey))) {
             if (CFGetTypeID(v) == CFBooleanGetTypeID()) muted = CFBooleanGetValue((CFBooleanRef)v);
             CFRelease(v);
         }
@@ -343,8 +344,7 @@ private:
     static constexpr const char* kMuteKey = "Output Mute";
     static constexpr const char* kInPairKey = "Input Stereo Pair";
     static constexpr const char* kOutPairKey = "Output Stereo Pair";
-    // Ozzy 0.3.0's keys, one per plug-in (it drove one device): read for a device that has none of
-    // its own yet
+    // Ozzy 0.3.0's keys, one per plug-in (it drove one device): see MigrateLegacy
     static constexpr const char* kLegacyVolumeKey = "output volume";
     static constexpr const char* kLegacyMuteKey = "output mute";
 
@@ -389,16 +389,41 @@ private:
         return v;
     }
 
-    /* What storage has under @what, or else under the plug-in-wide @legacy key, which is then
-     * stored under @what so the device has its own from now on */
-    CFPropertyListRef CopyOrMigrate(AudioServerPlugInHostRef host, const char* what, const char* legacy) const {
-        CFPropertyListRef v = Copy(host, what);
-        if (v || !host) return v;
+    /* The plug-in-wide @legacy key's value (released by the caller), or null */
+    static CFPropertyListRef CopyLegacy(AudioServerPlugInHostRef host, const char* legacy) {
         CFStringRef key = CFStringCreateWithCString(NULL, legacy, kCFStringEncodingUTF8);
+        CFPropertyListRef v = nullptr;
         if (key && host->CopyFromStorage(host, key, &v) != kAudioHardwareNoError) v = nullptr;
         if (key) CFRelease(key);
-        if (v) Store(host, what, CFRetain(v));
         return v;
+    }
+
+    /*
+     * Ozzy 0.3.0's plug-in-wide volume and mute become this device's, but only for a device that
+     * has no settings of its own yet: a device set up since (any of its keys stored) keeps its
+     * own, and stale 0.3.0 values never come back over them. The 0.3.0 keys are deleted either
+     * way, so this happens once.
+     */
+    void MigrateLegacy(AudioServerPlugInHostRef host) const {
+        if (!host || !mUID) return;
+        CFPropertyListRef volume = CopyLegacy(host, kLegacyVolumeKey);
+        CFPropertyListRef mute = CopyLegacy(host, kLegacyMuteKey);
+        if (!volume && !mute) return;
+        bool own = false;
+        for (const char* what : { kVolumeKey, kMuteKey, kInPairKey, kOutPairKey }) {
+            CFPropertyListRef v = Copy(host, what);
+            if (v) { own = true; CFRelease(v); }
+        }
+        if (!own) {
+            if (volume) Store(host, kVolumeKey, CFRetain(volume));
+            if (mute) Store(host, kMuteKey, CFRetain(mute));
+        }
+        if (volume) CFRelease(volume);
+        if (mute) CFRelease(mute);
+        for (const char* legacy : { kLegacyVolumeKey, kLegacyMuteKey }) {
+            CFStringRef key = CFStringCreateWithCString(NULL, legacy, kCFStringEncodingUTF8);
+            if (key) { host->DeleteFromStorage(host, key); CFRelease(key); }
+        }
     }
 
     /* Write @value (released here) under @what */

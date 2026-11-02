@@ -177,7 +177,8 @@ static void check_stall(struct ozzy_isoc_output *out)
 	if (out->fb_stalled || !out->fb_valid_time || !hz)
 		return;
 	now = ozzy_bus_time(out->bus);
-	if (now - out->fb_valid_time <= ozzy_div_u64(hz * OZZY_FB_STALL_MS, 1000))
+	/* A packet's time can come from a bus frame clock a little ahead of this one: not stale */
+	if (out->fb_valid_time >= now || now - out->fb_valid_time <= ozzy_div_u64(hz * OZZY_FB_STALL_MS, 1000))
 		return;
 	out->fb_stalled = true;
 	ozzy_log("isoc: no feedback for %u ms: the device stopped streaming", OZZY_FB_STALL_MS);

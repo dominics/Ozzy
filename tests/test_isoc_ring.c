@@ -267,9 +267,10 @@ static void fill_feedback(struct fake_xfer *x, void *arg)
 
 /*
  * A device whose feedback goes silent (the CMS firmware halted): the bus hears of it once,
- * OZZY_FB_STALL_MS after the last valid feedback, not before
+ * OZZY_FB_STALL_MS after the last valid feedback, not before, also when packet times run ahead
+ * of the completions
  */
-static void check_stall(void)
+static void check_stall(uint64_t packet_lead)
 {
 	const struct ozzy_device *model = ozzy_device_lookup(0x0562, 0x03EB);
 	static struct ozzy_shared_memory shm;
@@ -283,6 +284,7 @@ static void check_stall(void)
 	memset(&shm, 0, sizeof(shm));
 	fake_bus_init(&fb, &shm, true, NULL);
 	fb.hz = 1000000;   /* microseconds */
+	fb.packet_lead = packet_lead;
 	e = ozzy_engine_init(malloc(ozzy_engine_size(model)), model);
 	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_OUT, 0x02, 1, 156, 1);
 	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_IN, 0x86, 2, 512, 1);
@@ -327,7 +329,8 @@ int main(void)
 	check_clear_sent_xone();
 	check_out_queue(0x0562, 0x03EB, ISOC_OUT_TRANSFERS_DEEP);   /* CMS 600-3 */
 	check_out_queue(0x09E8, 0x0010, ISOC_OUT_TRANSFERS);        /* EIE Pro */
-	check_stall();
+	check_stall(0);
+	check_stall(3000);   /* packet times a bus clock puts after the completion */
 	CHECK(model && model->family == OZZY_FAMILY_PLOYTEC_ISOC, "US-144MKII in the device list");
 	for (i = 0; i < sizeof(out_ring); i++)
 		out_ring[i] = (uint8_t)(i * 7 + 3);
