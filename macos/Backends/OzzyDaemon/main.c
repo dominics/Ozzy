@@ -14,11 +14,14 @@
 #include <SystemConfiguration/SystemConfiguration.h>
 #include <dispatch/dispatch.h>
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 #include "device.h"
 #include "../../../common/ozzy_devices.h"
@@ -270,11 +273,54 @@ static void quit(void)
 	exit(0);
 }
 
-/* stderr (the engine's log) to ~/Library/Logs/OzzyDaemon.log */
+static FILE *log_file;
+static pthread_t log_thread;
+
+/* Copy the stderr pipe (@arg, its read end) to the log file, each line with the local time */
+static void *log_main(void *arg)
+{
+	FILE *in = fdopen((int)(intptr_t)arg, "r");
+	char line[1024], stamp[32];
+	bool line_start = true;
+	struct timeval tv;
+	struct tm tm;
+	size_t n;
+
+	if (!in)
+		return NULL;
+	while (fgets(line, sizeof(line), in)) {
+		if (line_start) {
+			gettimeofday(&tv, NULL);
+			localtime_r(&tv.tv_sec, &tm);
+			n = strftime(stamp, sizeof(stamp), "%F %T", &tm);
+			snprintf(stamp + n, sizeof(stamp) - n, ".%03d ", (int)(tv.tv_usec / 1000));
+			fputs(stamp, log_file);
+		}
+		fputs(line, log_file);
+		n = strlen(line);
+		line_start = n && line[n - 1] == '\n';
+		if (line_start)
+			fflush(log_file);
+	}
+	fflush(log_file);
+	fclose(in);
+	return NULL;
+}
+
+/* At exit: close stderr so the copier reaches end of file, and let it write what's left */
+static void log_drain(void)
+{
+	fflush(stderr);
+	close(STDERR_FILENO);
+	pthread_join(log_thread, NULL);
+}
+
+/* stderr (the engine's log) to ~/Library/Logs/OzzyDaemon.log, each line timestamped */
 static void log_to_file(void)
 {
 	const char *home = getenv("HOME");
 	char dir[1024], path[1100];
+	int fds[2];
 
 	if (!home)
 		return;
@@ -282,8 +328,24 @@ static void log_to_file(void)
 	if (mkdir(dir, 0755) != 0 && errno != EEXIST)
 		return;
 	snprintf(path, sizeof(path), "%s/OzzyDaemon.log", dir);
-	if (freopen(path, "a", stderr))
-		setvbuf(stderr, NULL, _IOLBF, 0);
+	log_file = fopen(path, "a");
+	if (!log_file)
+		return;
+	if (pipe(fds) != 0 || dup2(fds[1], STDERR_FILENO) < 0) {
+		/* no copier: the file without timestamps */
+		fclose(log_file);
+		if (freopen(path, "a", stderr))
+			setvbuf(stderr, NULL, _IOLBF, 0);
+		return;
+	}
+	close(fds[1]);
+	setvbuf(stderr, NULL, _IOLBF, 0);
+	if (pthread_create(&log_thread, NULL, log_main, (void *)(intptr_t)fds[0]) != 0) {
+		dup2(fileno(log_file), STDERR_FILENO);
+		close(fds[0]);
+		return;
+	}
+	atexit(log_drain);
 }
 
 static void usage(void)
