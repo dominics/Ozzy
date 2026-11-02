@@ -138,6 +138,27 @@ static void publish_timestamps(struct ozzy_isoc_output *out, const struct ozzy_i
 	}
 }
 
+/*
+ * clear_sent - In the frame ring, silence where completed OUT transfer @t read, so a writer
+ * that stops (the HAL's process gone) leaves silence a lap later, not the ring played again.
+ * The writer is never that far ahead: it writes at most the queued transfers plus one IO
+ * buffer past the clock, well short of a lap, so these frames are behind it.
+ */
+static void clear_sent(struct ozzy_isoc_output *out, const struct ozzy_isoc_output_xfer *t)
+{
+	const struct ozzy_isoc_output_config *c = &out->config;
+	uint32_t ring_bytes = c->ring_frames * c->frame_bytes;
+	uint32_t p;
+
+	for (p = 0; p < t->count; p++) {
+		uint32_t at = t->packets[p].offset, len = t->packets[p].length;
+		uint32_t first = len < ring_bytes - at ? len : ring_bytes - at;   /* a packet may wrap */
+
+		memset(c->ring + at, 0, first);
+		memset(c->ring, 0, len - first);
+	}
+}
+
 bool ozzy_isoc_output_complete(struct ozzy_isoc_output *out, uint8_t pipe, void *xfer, int status,
 			       struct ozzy_isoc_packet *packets, uint32_t count)
 {
@@ -148,6 +169,8 @@ bool ozzy_isoc_output_complete(struct ozzy_isoc_output *out, uint8_t pipe, void 
 		if (!out->running || status == OZZY_STATUS_ABORTED)
 			return true;
 		publish_timestamps(out, &out->out[i]);
+		if (!out->config.xfer[0])
+			clear_sent(out, &out->out[i]);
 		submit_out(out, i);
 		return true;
 	}
