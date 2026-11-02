@@ -218,7 +218,9 @@ static void isoc_done(void *refcon, IOReturn result, void *arg0)
 /*
  * As KextBus::SubmitIsoc, with the frame io(): the frame list goes back to back from one
  * buffer (isoc_plan). Each transfer starts where the pipe's previous one ended, the first
- * ISOC_LEAD_FRAMES ahead of the bus.
+ * ISOC_LEAD_FRAMES ahead of the bus. A transfer whose start has already passed means the
+ * pipe's whole queue ran dry: it starts ISOC_LEAD_FRAMES out instead and is counted as late
+ * (ubus_pipe_late), since the device has had a hole in the stream.
  */
 static bool ubus_submit_isoc(void *ctx, uint8_t pipe, void *buf, uint32_t buf_size, struct ozzy_isoc_packet *packets,
 			     uint32_t count, void *xfer)
@@ -227,8 +229,8 @@ static bool ubus_submit_isoc(void *ctx, uint8_t pipe, void *buf, uint32_t buf_si
 	struct ubus_pipe *p = find_pipe(b, pipe);
 	struct ubus_request *r;
 	ubus_interface_t intf;
-	uint64_t uframe = 0, host = 0, first, frames;
-	bool in = pipe & 0x80, have_clock;
+	uint64_t uframe = 0, host = 0, first, frames, behind;
+	bool in = pipe & 0x80, have_clock, late;
 	IOReturn kr;
 	uint32_t i;
 
@@ -261,10 +263,7 @@ static bool ubus_submit_isoc(void *ctx, uint8_t pipe, void *buf, uint32_t buf_si
 	os_unfair_lock_lock(&b->lock);
 	if (have_clock)
 		frame_clock_sample(&b->clock, uframe, host);
-	if (p->next_frame <= uframe / 8)
-		p->next_frame = uframe / 8 + ISOC_LEAD_FRAMES;
-	first = p->next_frame;
-	p->next_frame += frames;
+	late = isoc_schedule(&p->next_frame, uframe / 8, frames, ISOC_LEAD_FRAMES, &first, &behind);
 	r->start_uframe = first * 8;
 	isoc_plan_times(packets, count, &b->clock, r->start_uframe, p->uframes_per_packet);
 	os_unfair_lock_unlock(&b->lock);
@@ -284,6 +283,11 @@ static bool ubus_submit_isoc(void *ctx, uint8_t pipe, void *buf, uint32_t buf_si
 		return false;
 	}
 	__atomic_store_n(&p->submitted, true, __ATOMIC_RELAXED);
+	if (late) {
+		__atomic_fetch_add(&p->late, 1u, __ATOMIC_RELAXED);
+		ozzy_log("isoc pipe 0x%02x: late, its queue ran dry %llu frame(s) ago; resumed at frame %llu", pipe,
+			 (unsigned long long)behind, (unsigned long long)first);
+	}
 	return true;
 }
 
@@ -796,6 +800,7 @@ void ubus_watch_reset(struct user_bus *b)
 		__atomic_store_n(&b->pipes[i].last_done, now, __ATOMIC_RELAXED);
 		__atomic_store_n(&b->pipes[i].last_data, now, __ATOMIC_RELAXED);
 		__atomic_store_n(&b->pipes[i].error_streak, 0u, __ATOMIC_RELAXED);
+		__atomic_store_n(&b->pipes[i].late, 0u, __ATOMIC_RELAXED);
 		__atomic_store_n(&b->pipes[i].submitted, false, __ATOMIC_RELAXED);
 	}
 }
@@ -821,6 +826,13 @@ uint32_t ubus_pipe_errors(struct user_bus *b, uint8_t address)
 	struct ubus_pipe *p = find_pipe(b, address);
 
 	return p ? __atomic_load_n(&p->error_streak, __ATOMIC_RELAXED) : 0;
+}
+
+uint32_t ubus_pipe_late(struct user_bus *b, uint8_t address)
+{
+	struct ubus_pipe *p = find_pipe(b, address);
+
+	return p ? __atomic_load_n(&p->late, __ATOMIC_RELAXED) : 0;
 }
 
 void ubus_close(struct user_bus *b)

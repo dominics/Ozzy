@@ -131,6 +131,24 @@ static void test_frame_clock(void)
 	CHECK(frame_clock_time(&fc, 8001) == 1000000000ull + 7 + 125000, "1 GHz clock");
 }
 
+/* Transfers back to back from where the last ended; a passed start is late and moves out */
+static void test_schedule(void)
+{
+	uint64_t next = 0, first = 0, behind = 0;
+
+	CHECK(!isoc_schedule(&next, 1000, 4, 10, &first, &behind) && first == 1010 && next == 1014,
+	      "the first transfer starts the lead out: %llu", (unsigned long long)first);
+	CHECK(!isoc_schedule(&next, 1003, 4, 10, &first, &behind) && first == 1014 && next == 1018,
+	      "the next one where it ended");
+	CHECK(!isoc_schedule(&next, 1017, 4, 10, &first, &behind) && first == 1018, "one frame of queue left: on time");
+	CHECK(isoc_schedule(&next, 1022, 4, 10, &first, &behind) && behind == 0 && first == 1032 && next == 1036,
+	      "the queue ending at the bus frame: late");
+	CHECK(isoc_schedule(&next, 1040, 4, 10, &first, &behind) && behind == 4 && first == 1050,
+	      "4 frames dry: late by 4, %llu", (unsigned long long)behind);
+	next = 0;
+	CHECK(!isoc_schedule(&next, 2000, 4, 10, &first, &behind) && first == 2010, "after an abort (0): not late");
+}
+
 int main(void)
 {
 	test_direct();
@@ -138,5 +156,6 @@ int main(void)
 	test_zero_length();
 	test_in_scatter();
 	test_frame_clock();
+	test_schedule();
 	return CHECK_DONE("isoc_plan");
 }

@@ -163,11 +163,13 @@ static void poll_fired(CFRunLoopTimerRef timer, void *info)
 /*
  * As OzzyKext::WatchLocked: a PCM pipe that stopped completing gets the device a reselect and a
  * new start, counted in the stats. Also a device that keeps completing but stopped streaming:
- * its feedback without data, or PCM out failing in a row. A bulk PCM IN pipe isn't watched for
- * completions: a bulk read completes when the device has data, and the CMS 600-3's 0x86 goes
- * quiet for over 500 ms after a switch to 96 kHz and now and then while idle, then carries on.
- * Its feedback going silent is what says the device stopped. True if the restart failed: the
- * caller has the device released (on_lost).
+ * its feedback without data, or PCM out failing in a row. And PCM out late: its queue ran dry,
+ * which halts the CMS 600-3's streaming until a new start, with no error to show for it
+ * (isochronous OUT has no handshake). A bulk PCM IN pipe isn't watched for completions: a bulk
+ * read completes when the device has data, and the CMS 600-3's 0x86 goes quiet for over 500 ms
+ * after a switch to 96 kHz and now and then while idle, then carries on. Its feedback going
+ * silent is what says the device stopped. True if the restart failed: the caller has the
+ * device released (on_lost).
  */
 static bool watch_locked(struct daemon_device *d)
 {
@@ -196,6 +198,10 @@ static bool watch_locked(struct daemon_device *d)
 	if (!why && out && ubus_pipe_errors(&d->bus, out) >= ERROR_STREAK) {
 		pipe = out;
 		why = "failing";
+	}
+	if (!why && out && ubus_pipe_late(&d->bus, out)) {
+		pipe = out;
+		why = "ran dry";
 	}
 	if (!why || (d->recovered_at && now - d->recovered_at < ubus_ms_to_ticks(&d->bus, WATCH_RECOVER_S * 1000ull)))
 		return false;
