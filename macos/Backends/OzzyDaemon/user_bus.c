@@ -111,6 +111,13 @@ static void note_completion(struct ubus_pipe *p, int status, bool has_data)
 		__atomic_fetch_add(&p->error_streak, 1u, __ATOMIC_RELAXED);
 }
 
+/* A submit that won't happen: counted for the watchdog (ubus_pipe_refused) */
+static bool refuse(struct ubus_pipe *p)
+{
+	__atomic_fetch_add(&p->refused, 1u, __ATOMIC_RELAXED);
+	return false;
+}
+
 /* --- Bulk and interrupt --- */
 
 static void bulk_done(void *refcon, IOReturn result, void *arg0)
@@ -144,7 +151,7 @@ static bool ubus_submit(void *ctx, uint8_t pipe, void *buf, uint32_t size, void 
 	r = acquire(b);
 	if (!r) {
 		ozzy_log("pipe 0x%02x: no free request", pipe);
-		return false;
+		return refuse(p);
 	}
 	r->pipe = p;
 	r->xfer = xfer;
@@ -158,7 +165,7 @@ static bool ubus_submit(void *ctx, uint8_t pipe, void *buf, uint32_t size, void 
 		__atomic_fetch_sub(&b->pending, 1, __ATOMIC_RELEASE);
 		release(b, r);
 		ozzy_log("pipe 0x%02x submit failed: 0x%x", pipe, (unsigned int)kr);
-		return false;
+		return refuse(p);
 	}
 	__atomic_store_n(&p->submitted, true, __ATOMIC_RELAXED);
 	return true;
@@ -234,17 +241,19 @@ static bool ubus_submit_isoc(void *ctx, uint8_t pipe, void *buf, uint32_t buf_si
 	IOReturn kr;
 	uint32_t i;
 
-	if (!p || p->type != kUSBIsoc || count == 0 || count > OZZY_MAX_ISOC_PACKETS)
+	if (!p)
 		return false;
+	if (p->type != kUSBIsoc || count == 0 || count > OZZY_MAX_ISOC_PACKETS)
+		return refuse(p);
 	r = acquire(b);
 	if (!r) {
 		ozzy_log("isoc pipe 0x%02x: no free request", pipe);
-		return false;
+		return refuse(p);
 	}
 	if (!isoc_plan_make(&r->plan, buf, buf_size, packets, count, r->bounce, b->bounce_size, !in)) {
 		release(b, r);
 		ozzy_log("isoc pipe 0x%02x: %u packets don't fit the bounce buffer", pipe, count);
-		return false;
+		return refuse(p);
 	}
 	for (i = 0; i < count; i++) {
 		r->frames[i].frStatus = kIOReturnSuccess;
@@ -280,7 +289,7 @@ static bool ubus_submit_isoc(void *ctx, uint8_t pipe, void *buf, uint32_t buf_si
 		release(b, r);
 		ozzy_log("isoc pipe 0x%02x submit failed: 0x%x (frame %llu, bus %llu)", pipe, (unsigned int)kr,
 			 (unsigned long long)first, (unsigned long long)(uframe / 8));
-		return false;
+		return refuse(p);
 	}
 	__atomic_store_n(&p->submitted, true, __ATOMIC_RELAXED);
 	if (late) {
@@ -542,8 +551,10 @@ static void ubus_abort(void *ctx)
 			ozzy_log("%d transfers still pending after abort", __atomic_load_n(&b->pending, __ATOMIC_ACQUIRE));
 	}
 	os_unfair_lock_lock(&b->lock);
-	for (i = 0; i < UBUS_PIPE_SLOTS; i++)
+	for (i = 0; i < UBUS_PIPE_SLOTS; i++) {
 		b->pipes[i].next_frame = 0;
+		__atomic_store_n(&b->pipes[i].refused, 0u, __ATOMIC_RELAXED);
+	}
 	os_unfair_lock_unlock(&b->lock);
 }
 
@@ -833,6 +844,13 @@ uint32_t ubus_pipe_late(struct user_bus *b, uint8_t address)
 	struct ubus_pipe *p = find_pipe(b, address);
 
 	return p ? __atomic_load_n(&p->late, __ATOMIC_RELAXED) : 0;
+}
+
+uint32_t ubus_pipe_refused(struct user_bus *b, uint8_t address)
+{
+	struct ubus_pipe *p = find_pipe(b, address);
+
+	return p ? __atomic_load_n(&p->refused, __ATOMIC_RELAXED) : 0;
 }
 
 void ubus_close(struct user_bus *b)

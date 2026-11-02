@@ -13,9 +13,9 @@
 #define POLL_MS          5      /* the mailbox */
 #define WATCH_MS         250    /* the watchdog's period, as the kext's */
 #define WATCH_DEAD_MS    500    /* a PCM pipe with no completion this long has stalled */
-#define WATCH_RECOVER_S  10     /* between recoveries: not forever on a dead device */
+#define WATCH_RECOVER_MS 1000   /* between recoveries: not back to back on a device that fails again at once */
 #define FEEDBACK_DEAD_MS 1000   /* feedback without data this long: the device stopped streaming */
-#define ERROR_STREAK     200    /* failed PCM out completions in a row: likewise */
+#define ERROR_STREAK     3      /* failed completions in a row on a watched pipe: likewise */
 #define SEGMENT_STALE_MS 1000
 
 /* A registry string of the device ("USB Product Name"...) into @dst */
@@ -163,8 +163,10 @@ static void poll_fired(CFRunLoopTimerRef timer, void *info)
 /*
  * As OzzyKext::WatchLocked: a PCM pipe that stopped completing gets the device a reselect and a
  * new start, counted in the stats. Also a device that keeps completing but stopped streaming:
- * its feedback without data, or PCM out failing in a row. And PCM out late: its queue ran dry,
- * which halts the CMS 600-3's streaming until a new start, with no error to show for it
+ * its feedback without data, or PCM out, feedback, PCM in or MIDI in failing in a row (one
+ * failure now and then carries on by itself). A transfer of theirs the bus refused to submit
+ * is gone for good until a new start, so that recovers it too. And PCM out late: its queue ran
+ * dry, which halts the CMS 600-3's streaming until a new start, with no error to show for it
  * (isochronous OUT has no handshake). A bulk PCM IN pipe isn't watched for completions: a bulk
  * read completes when the device has data, and the CMS 600-3's 0x86 goes quiet for over 500 ms
  * after a switch to 96 kHz and now and then while idle, then carries on. Its feedback going
@@ -174,6 +176,8 @@ static void poll_fired(CFRunLoopTimerRef timer, void *info)
 static bool watch_locked(struct daemon_device *d)
 {
 	static const enum ozzy_pipe_role roles[] = { OZZY_PIPE_PCM_OUT, OZZY_PIPE_PCM_IN };
+	static const enum ozzy_pipe_role streams[] = { OZZY_PIPE_PCM_OUT, OZZY_PIPE_FEEDBACK, OZZY_PIPE_PCM_IN,
+						       OZZY_PIPE_MIDI_IN };
 	uint64_t now = mach_absolute_time();
 	const char *why = NULL;
 	uint8_t pipe = 0, fb, out;
@@ -195,15 +199,20 @@ static bool watch_locked(struct daemon_device *d)
 		pipe = fb;
 		why = "no feedback";
 	}
-	if (!why && out && ubus_pipe_errors(&d->bus, out) >= ERROR_STREAK) {
-		pipe = out;
-		why = "failing";
+	for (i = 0; i < sizeof(streams) / sizeof(streams[0]) && !why; i++) {
+		pipe = d->engine->pipe[streams[i]].address;
+		if (!pipe)
+			continue;
+		if (ubus_pipe_errors(&d->bus, pipe) >= ERROR_STREAK)
+			why = "failing";
+		else if (ubus_pipe_refused(&d->bus, pipe))
+			why = "a transfer was refused";
 	}
 	if (!why && out && ubus_pipe_late(&d->bus, out)) {
 		pipe = out;
 		why = "ran dry";
 	}
-	if (!why || (d->recovered_at && now - d->recovered_at < ubus_ms_to_ticks(&d->bus, WATCH_RECOVER_S * 1000ull)))
+	if (!why || (d->recovered_at && now - d->recovered_at < ubus_ms_to_ticks(&d->bus, WATCH_RECOVER_MS)))
 		return false;
 
 	d->recovered_at = now;
