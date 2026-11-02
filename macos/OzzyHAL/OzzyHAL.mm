@@ -474,6 +474,7 @@ OSStatus OzzyHALDevice::PerformConfigurationChange(AudioServerPlugInHostRef host
     if (!rateChange && (value >= SettingCount(id) || ozzy_setting_descs[id].kind != OZZY_SETTING_DEVICE))
         return kAudioHardwareIllegalOperationError;
 
+    OzzyMonoChangeBegins(this);   // the engine restarts under MON and AUX too
     ozzy_shared_memory* shm = AcquireSHM();
     kern_return_t kr = !shm ? kIOReturnNotAttached : rateChange ? CallSetRate(value) : CallApplySetting(id, value);
     if (shm) ApplyDeviceConfig();
@@ -482,6 +483,7 @@ OSStatus OzzyHALDevice::PerformConfigurationChange(AudioServerPlugInHostRef host
     if (kr == KERN_SUCCESS && !rateChange) StoreSetting(host, id, value);
     // The rate may have changed (S/PDIF lock), and the clock source item names say the lock
     if (host) NotifyDeviceChanged(host);
+    OzzyMonoRequestChange(this, host, action);
     return kr == KERN_SUCCESS ? kAudioHardwareNoError : kAudioHardwareUnspecifiedError;
 }
 
@@ -1040,9 +1042,16 @@ extern "C" HRESULT OzzyRemoveDeviceClient(AudioServerPlugInDriverRef, AudioObjec
 }
 extern "C" HRESULT OzzyPerformDeviceConfigurationChange(AudioServerPlugInDriverRef, AudioObjectID inDeviceObjectID, UInt64 inChangeAction, void*) {
     OzzyHALDevice* dev = OzzyHAL::Get().DeviceForObject(inDeviceObjectID);
+    if (dev && OzzyIsMonoObject(ObjectKind(inDeviceObjectID)))
+        return OzzyMonoPerformConfigurationChange(dev, OzzyHAL::Get().GetHost(), ObjectKind(inDeviceObjectID));
     return dev ? dev->PerformConfigurationChange(OzzyHAL::Get().GetHost(), inChangeAction) : kAudioHardwareBadObjectError;
 }
-extern "C" HRESULT OzzyAbortDeviceConfigurationChange(AudioServerPlugInDriverRef, AudioObjectID, UInt64, void*) { return kAudioHardwareNoError; }
+extern "C" HRESULT OzzyAbortDeviceConfigurationChange(AudioServerPlugInDriverRef, AudioObjectID inDeviceObjectID, UInt64, void*) {
+    OzzyHALDevice* dev = OzzyHAL::Get().DeviceForObject(inDeviceObjectID);
+    if (dev && OzzyIsMonoObject(ObjectKind(inDeviceObjectID)))
+        return OzzyMonoPerformConfigurationChange(dev, nullptr, ObjectKind(inDeviceObjectID));
+    return kAudioHardwareNoError;
+}
 
 extern "C" Boolean OzzyHasProperty(AudioServerPlugInDriverRef, AudioObjectID inObjectID, pid_t, const AudioObjectPropertyAddress* inAddress) {
     if (inObjectID == kAudioObjectPlugInObject) {
