@@ -125,6 +125,7 @@ void ozzy_urb_free(struct ozzy_urb_bus *bus);
 
 /* core.c */
 int ozzy_chip_restart(struct ozzy_chip *chip);
+bool ozzy_chip_revive(struct ozzy_chip *chip);
 
 /* pcm.c */
 int ozzy_pcm_init(struct ozzy_chip *chip);

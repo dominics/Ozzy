@@ -79,11 +79,27 @@ int ozzy_chip_restart(struct ozzy_chip *chip)
 	ozzy_controls_handshake(chip);   /* failed too: clients see the device stopped */
 	if (chip->running)
 		return 0;
+	if (chip->model->quirks & OZZY_QUIRK_NO_USB_RESET) {
+		chip_err(chip, "restart failed, the next stream start tries again");
+		return -EIO;
+	}
 	/* The restart left the device unusable: reset it, as the pre-engine driver did on every
 	 * rate change. Queued, as pre_reset takes chip->lock; post_reset brings the engine back. */
 	chip_err(chip, "restart failed, resetting the device");
 	usb_queue_reset_device(chip->intf[0]);
 	return -EIO;
+}
+
+/*
+ * ozzy_chip_revive - Process context, chip->lock held: a device that a failed restart left
+ * stopped without a USB reset (OZZY_QUIRK_NO_USB_RESET) gets the restart again. Returns
+ * whether the device runs.
+ */
+bool ozzy_chip_revive(struct ozzy_chip *chip)
+{
+	if (!chip->running && !chip->gone && (chip->model->quirks & OZZY_QUIRK_NO_USB_RESET))
+		ozzy_chip_restart(chip);
+	return chip->running;
 }
 
 /* Claim the profile's interfaces (the probed one is interface 0) and select its alternate setting */

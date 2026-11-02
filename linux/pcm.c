@@ -45,8 +45,12 @@ static int ozzy_pcm_open(struct snd_pcm_substream *substream)
 	unsigned int channels = dir == OZZY_PCM_OUT ? model->out_channels : model->in_channels;
 	uint32_t rates[OZZY_MAX_RATES];
 	unsigned int n = ozzy_device_rates(model, rates), i, packet_bytes;
+	bool running;
 
-	if (!chip->running)
+	mutex_lock(&chip->lock);
+	running = ozzy_chip_revive(chip);
+	mutex_unlock(&chip->lock);
+	if (!running)
 		return -ENODEV;
 
 	runtime->hw.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BLOCK_TRANSFER |
@@ -101,7 +105,7 @@ static int ozzy_pcm_prepare(struct snd_pcm_substream *substream)
 		return -EINVAL;
 
 	mutex_lock(&chip->lock);
-	if (!chip->running) {
+	if (!ozzy_chip_revive(chip)) {
 		ret = -ENODEV;
 	} else {
 		change = ozzy_engine_change_rate(chip->engine, runtime->rate);

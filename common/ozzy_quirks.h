@@ -153,6 +153,13 @@ enum ozzy_quirk {
 	OZZY_QUIRK_DEEP_OUT_QUEUE = 1u << 23,
 
 	/*
+	 * Never USB reset the device after a failed restart (Dynacord CMS 600-3): its USB card may
+	 * not enumerate again until the mixer is power cycled. It stays stopped instead, and the
+	 * next stream start tries the restart again.
+	 */
+	OZZY_QUIRK_NO_USB_RESET = 1u << 24,
+
+	/*
 	 * Write the two WM8776 codecs in configurationDone (Musonik PHASE X64), from the
 	 * Input / Output settings (ozzy_settings.h). Their defaults are Windows 2.9.34's
 	 * WM8776SetDefault: inputs 1/2 Mic/Line, inputs 3/4 Aux, playback on both output pairs,
