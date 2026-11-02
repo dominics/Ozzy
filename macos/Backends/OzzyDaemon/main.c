@@ -110,7 +110,7 @@ static void apply(struct daemon_device *d, enum handover_action action)
 	}
 }
 
-/* A watchdog recovery failed: release the device and its segment, then try it again slowly */
+/* A watchdog recovery or a restart failed: release the device and its segment, then try it again slowly */
 static void device_lost(struct daemon_device *d)
 {
 	ozzy_log("%s at 0x%08x: could not restart it; releasing it and trying again each %u s", d->model->name,

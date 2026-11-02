@@ -76,14 +76,17 @@ static bool engine_restart(struct daemon_device *d)
 
 /* --- Settings and rate (the mailbox) --- */
 
-/* Restart with the settings the engine holds now; on failure the HAL drops the device */
+/*
+ * Restart with the settings the engine holds now. On failure the HAL drops the device and the
+ * caller has it released and retried (on_lost), as after a failed watchdog recovery.
+ */
 static IOReturn restart_locked(struct daemon_device *d)
 {
 	if (engine_restart(d)) {
 		ubus_watch_reset(&d->bus);
 		return kIOReturnSuccess;
 	}
-	d->running = false;
+	d->running = false;   /* the engine is stopped */
 	return kIOReturnIOError;
 }
 
@@ -117,6 +120,7 @@ static void poll_fired(CFRunLoopTimerRef timer, void *info)
 {
 	struct daemon_device *d = info;
 	uint32_t seq, method, args[2];
+	bool lost;
 
 	(void)timer;
 	if (!ozzy_daemon_take_request(d->seg.trailer, &seq, &method, args)) {
@@ -130,6 +134,7 @@ static void poll_fired(CFRunLoopTimerRef timer, void *info)
 		return;
 	}
 	pthread_mutex_lock(&d->lock);
+	bool was_running = d->running;
 	IOReturn status;
 	switch (method) {
 	case OZZY_METHOD_APPLY_SETTING:
@@ -142,11 +147,15 @@ static void poll_fired(CFRunLoopTimerRef timer, void *info)
 		status = kIOReturnUnsupported;
 		break;
 	}
+	lost = was_running && !d->running;
 	pthread_mutex_unlock(&d->lock);
 	if (status != kIOReturnSuccess)
 		ozzy_log("request %u (%u, %u) failed: 0x%x", method, args[0], args[1], (unsigned int)status);
 	/* After the restart has rewritten the shared memory: the HAL reads it on return */
 	ozzy_daemon_ack(d->seg.trailer, seq, status);
+	/* The restart failed: release the device and its segment, and try it again later */
+	if (lost && d->on_lost)
+		d->on_lost(d);
 }
 
 /* --- Watchdog --- */
@@ -438,6 +447,8 @@ void device_sleep(struct daemon_device *d)
  * the kext's setPowerState) */
 void device_wake(struct daemon_device *d)
 {
+	bool lost = false;
+
 	pthread_mutex_lock(&d->lock);
 	if (d->sleeping) {
 		d->sleeping = false;
@@ -449,8 +460,11 @@ void device_wake(struct daemon_device *d)
 				ozzy_log("start after wake failed");
 				ozzy_engine_stop(d->engine);
 				d->running = false;
+				lost = true;
 			}
 		}
 	}
 	pthread_mutex_unlock(&d->lock);
+	if (lost && d->on_lost)
+		d->on_lost(d);
 }

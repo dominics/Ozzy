@@ -35,7 +35,10 @@ struct daemon_device {
 	bool running;
 	bool sleeping;
 	uint64_t recovered_at;
-	/* A watchdog recovery failed: called on the control thread without the lock, to release it */
+	/*
+	 * A watchdog recovery, or the restart for a setting, a rate or a wake, failed: called on
+	 * the control thread without the lock, to release it and try again later
+	 */
 	void (*on_lost)(struct daemon_device *d);
 
 	CFRunLoopTimerRef poll;   /* the mailbox */
@@ -67,7 +70,10 @@ void device_release(struct daemon_device *d);
 /* The device is gone or the daemon quits: release and free */
 void device_free(struct daemon_device *d);
 
-/* System sleep: suspend (the HAL keeps the device). Wake: a new start. No-ops unless driving. */
+/*
+ * System sleep: suspend (the HAL keeps the device). Wake: a new start; if it fails, on_lost.
+ * No-ops unless driving.
+ */
 void device_sleep(struct daemon_device *d);
 void device_wake(struct daemon_device *d);
 
