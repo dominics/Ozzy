@@ -27,11 +27,8 @@
 #include <string.h>
 #include "OzzyHALExtras.h"
 
-static inline bool OzzyIsMonoDevice(uint32_t kind) { return OzzyMonoIndex((int)kind) >= 0 && (kind - kOzzyObjectMonoDevice) % 2 == 0; }
-static inline bool OzzyIsMonoObject(uint32_t kind) { return OzzyMonoIndex(kind) >= 0; }
-
 /* A mono input device's ID or its stream's, for the main device @device */
-static inline AudioObjectID OzzyMonoDeviceID(AudioObjectID device, int i) { return device + kOzzyObjectMonoDevice + 2 * i; }
+static inline AudioObjectID OzzyMonoDeviceID(AudioObjectID device, int i) { return device + OzzyMonoDeviceKind((unsigned int)i); }
 static inline AudioObjectID OzzyMonoStreamID(AudioObjectID device, int i) { return OzzyMonoDeviceID(device, i) + 1; }
 
 /* The mono devices to add to the plug-in's device list after @dev's, into @out (null: count) */

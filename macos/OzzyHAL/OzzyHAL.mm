@@ -808,20 +808,9 @@ OSStatus OzzyHALDevice::ioOperation(UInt32 inOperationID, UInt32 inIOBufferFrame
 void OzzyHALDevice::ReadInputChannel(uint32_t channel, UInt32 frames, const AudioServerPlugInIOCycleInfo* cycle, float* out,
                                      float* scratch, uint32_t chunk) {
     ozzy_shared_memory* shm = AcquireSHM();
-    uint32_t channels = mInputChannels;
-    if (!shm || !mReadInput || channel < 1 || channel > channels || channels > kOzzyMonoMaxChannels) {
-        memset(out, 0, frames * sizeof(float));
-        ReleaseSHM();
-        return;
-    }
     // The device's channel, before the capture routing (the routes are the main device's)
-    uint64_t sampleTime = (uint64_t)cycle->mInputTime.mSampleTime;
-    for (UInt32 done = 0; done < frames;) {
-        UInt32 n = frames - done < chunk ? frames - done : chunk;
-        mReadInput(scratch, shm->audio.input_buffer, sampleTime + done, n, mInRingFrames);
-        for (UInt32 k = 0; k < n; k++) out[done + k] = scratch[k * channels + channel - 1];
-        done += n;
-    }
+    ozzy_mono_read(mReadInput, shm ? shm->audio.input_buffer : nullptr, mInRingFrames, mInputChannels, channel,
+                   (uint64_t)cycle->mInputTime.mSampleTime, frames, out, scratch, chunk);
     ReleaseSHM();
 }
 

@@ -7,7 +7,7 @@ for t in test_endpoints test_settings test_info test_transfers test_midi_queue t
 	"$B/$t" 2>/dev/null || fail=1
 done
 # The fork's OzzyHAL extras (macos/OzzyHAL/)
-for t in test_volume test_channels test_timeline; do
+for t in test_volume test_channels test_timeline test_hal_objects; do
 	"$B/$t" 2>/dev/null || fail=1
 done
 for g in trace layout; do

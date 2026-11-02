@@ -30,6 +30,7 @@
 #define kOzzyMaxDevices         8
 #define kOzzyObjectIDBase       100
 #define kOzzyObjectsPerDevice   16
+static_assert(kOzzyObjectKinds <= kOzzyObjectsPerDevice, "a device's objects (OzzyHALObjects.h) fit its slot");
 
 class OzzyHALDevice {
 public:

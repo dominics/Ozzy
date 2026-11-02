@@ -22,34 +22,17 @@
 #include <atomic>
 #include <string.h>
 #include "OzzyChannels.h"
+#include "OzzyHALObjects.h"
 #include "OzzyVolume.h"
 #include "OzzyTimeline.h"
 #include "../../engine/shared/ozzy_shared_data.h"
 
-/* A device's objects after upstream's device, streams and clock control (OzzyHAL.mm's
- * OzzyObjectKind); kOzzyObjectsPerDevice leaves room for them */
-enum OzzyExtraObjectKind : uint32_t {
-    kOzzyObjectVolumeControl = 4,
-    kOzzyObjectMuteControl = 5,
-    kOzzyObjectMonoDevice = 6,     // mono input i: its device at 6 + 2i, its stream at 7 + 2i
-    kOzzyObjectKinds = kOzzyObjectMonoDevice + 2 * OZZY_MAX_MONO_INPUTS,   // the objects a device has
-};
-
 /* Frames a mono input device decodes at a time (OzzyHALMono.h) */
 static const uint32_t kOzzyMonoChunkFrames = 256;
-static const uint32_t kOzzyMonoMaxChannels = 16;
-
-/* The mono input index of an object kind, or -1 */
-static inline int OzzyMonoIndex(uint32_t kind) {
-    return kind >= kOzzyObjectMonoDevice && kind < kOzzyObjectKinds ? (int)(kind - kOzzyObjectMonoDevice) / 2 : -1;
-}
+static const uint32_t kOzzyMonoMaxChannels = OZZY_MONO_MAX_CHANNELS;
 
 /* The controls each device has, in its control list after the clock source */
 static const UInt32 kOzzyExtraControls = 2;
-
-static inline bool OzzyIsExtraControl(uint32_t kind) {
-    return kind == kOzzyObjectVolumeControl || kind == kOzzyObjectMuteControl;
-}
 
 /*
  * The driver's layout as the device last applied it (ApplyDeviceConfig), as the shared memory
@@ -80,10 +63,7 @@ public:
 
     /* The main device and its mono devices into @out; returns how many */
     UInt32 RelatedDevices(AudioObjectID out[1 + OZZY_MAX_MONO_INPUTS]) const {
-        UInt32 n = 0;
-        out[n++] = mDevice;
-        for (unsigned int i = 0; i < mMonoCount; i++) out[n++] = mDevice + kOzzyObjectMonoDevice + 2 * i;
-        return n;
+        return ozzy_related_devices(mDevice, mMonoCount, out);
     }
 
     /* The device's model and channels, from ApplyDeviceConfig */
