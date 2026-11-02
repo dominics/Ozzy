@@ -13,6 +13,7 @@
 #include "../../engine/shared/ozzy_shared_data.h"
 #include "../../common/ozzy_devices.h"
 #include "PloytecCodec.h"   // the codec function pointer types
+#include "../Shared/OzzyBackend.h"
 
 /* The macOS 12 SDK renamed kAudioObjectPropertyElementMaster; older SDKs only have that name */
 #ifndef __MAC_12_0
@@ -36,11 +37,12 @@ public:
     AudioObjectID GetOutputStreamID() const { return GetDeviceID() + 2; }
     AudioObjectID GetClockControlID() const { return GetDeviceID() + 3; }
 
-    // Connection to the kext (monitor thread)
+    // Connection to the driver, the kext or a daemon (monitor thread)
     bool IsMapped() const { return mSHM.load(std::memory_order_relaxed) != nullptr; }
     bool IsUsed() const { return mDeviceUID != nullptr; }   // has been published before
     uint64_t GetRegistryID() const { return mRegistryID; }
-    bool Map(io_connect_t connect, mach_vm_address_t address, mach_vm_size_t size, uint64_t registryID, uint32_t locationID);
+    uint32_t GetLocationID() const { return mLocationID; }
+    bool Map(const OzzyBackend& backend, uint64_t registryID, uint32_t locationID);
     void Unmap();
     bool CheckHealth();
     bool UpdateConnectionState(AudioServerPlugInHostRef host);   // true if it changed
@@ -187,10 +189,8 @@ private:
     // mapping between AcquireSHM and ReleaseSHM, and Unmap waits for them to finish.
     std::atomic<ozzy_shared_memory*> mSHM { nullptr };
     std::atomic<uint32_t> mSHMUsers { 0 };
-    io_connect_t mKextConnect = IO_OBJECT_NULL;
-    mach_vm_address_t mKextMapAddress = 0;
-    mach_vm_size_t mKextMapSize = 0;
-    uint64_t mRegistryID = 0;
+    OzzyBackend mBackend;       // the kext's user client or a daemon's segment (OzzyBackend.h)
+    uint64_t mRegistryID = 0;   // the OzzyKext instance's, or the USB device's for a daemon
     uint32_t mLocationID = 0;   // USB port (IOUSBHostDevice locationID)
     uint32_t mSessionID = 0;
 
@@ -238,6 +238,8 @@ private:
     void MonitorLoop();
     void ScanServices();
     void ConnectService(io_service_t service, uint64_t registryID);
+    void ScanDaemonSegments();
+    void Attach(OzzyBackend& backend, uint64_t registryID, uint32_t locationID);
     OzzyHALDevice* SlotForUID(const char* uid);
 };
 

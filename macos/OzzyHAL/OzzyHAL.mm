@@ -131,10 +131,10 @@ bool OzzyHALDevice::HasDeviceUID(const char* uid) const {
     return CFStringGetCString(mDeviceUID, buf, sizeof(buf), kCFStringEncodingUTF8) && strcmp(buf, uid) == 0;
 }
 
-/* Take over a mapped kext connection. Returns false (and leaves it to the caller to close)
- * if the shared memory isn't usable. */
-bool OzzyHALDevice::Map(io_connect_t connect, mach_vm_address_t address, mach_vm_size_t size, uint64_t registryID, uint32_t locationID) {
-    ozzy_shared_memory* shm = (ozzy_shared_memory*)address;
+/* Take over an open backend (a kext connection or a daemon segment). Returns false (and leaves
+ * it to the caller to close) if the shared memory isn't usable. */
+bool OzzyHALDevice::Map(const OzzyBackend& backend, uint64_t registryID, uint32_t locationID) {
+    ozzy_shared_memory* shm = backend.shm;
     if (shm->magic != OZZY_MAGIC) {
         LogOzzyHALError("SHM magic mismatch");
         return false;
@@ -146,14 +146,13 @@ bool OzzyHALDevice::Map(io_connect_t connect, mach_vm_address_t address, mach_vm
     }
     if (shm->vendor_id == 0) return false;
 
-    mKextConnect = connect;
-    mKextMapAddress = address;
-    mKextMapSize = size;
+    mBackend = backend;
     mRegistryID = registryID;
     mLocationID = locationID;
     mSessionID = shm->session_id;
     mSHM.store(shm, std::memory_order_release);
-    LogOzzyHAL("device %{public}u: attached to kext (session: 0x%{public}08X)", mSlot, mSessionID);
+    LogOzzyHAL("device %{public}u: attached to %{public}s (session: 0x%{public}08X)", mSlot,
+               backend.kind == OzzyBackendKind::Daemon ? "daemon" : "kext", mSessionID);
     return true;
 }
 
@@ -162,22 +161,21 @@ bool OzzyHALDevice::Map(io_connect_t connect, mach_vm_address_t address, mach_vm
 void OzzyHALDevice::Unmap() {
     if (!mSHM.exchange(nullptr, std::memory_order_seq_cst)) return;
     while (mSHMUsers.load(std::memory_order_seq_cst)) usleep(100);
-    IOConnectUnmapMemory(mKextConnect, 0, mach_task_self(), mKextMapAddress);
-    IOServiceClose(mKextConnect);
-    mKextConnect = IO_OBJECT_NULL;
-    mKextMapAddress = 0;
-    mKextMapSize = 0;
+    mBackend.Close();
     mRegistryID = 0;
 }
 
-/* Unmap if the kext went away or restarted. Returns true while still mapped. */
+/* Unmap if the driver went away or restarted (a daemon also when its heartbeat stopped).
+ * Returns true while still mapped. */
 bool OzzyHALDevice::CheckHealth() {
     ozzy_shared_memory* shm = mSHM.load(std::memory_order_relaxed);
     if (!shm) return false;
     bool magicValid = (shm->magic == OZZY_MAGIC) && (shm->session_id == mSessionID);
     bool hwPresent = magicValid && shm->audio.hardware_present.load(std::memory_order_acquire);
-    if (magicValid && hwPresent) return true;
-    LogOzzyHAL("device %{public}u: disconnected (magic: %{public}d, hw: %{public}d)", mSlot, magicValid, hwPresent);
+    bool alive = mBackend.Alive();
+    if (magicValid && hwPresent && alive) return true;
+    LogOzzyHAL("device %{public}u: disconnected (magic: %{public}d, hw: %{public}d, alive: %{public}d)", mSlot,
+               magicValid, hwPresent, alive);
     Unmap();
     return false;
 }
@@ -273,7 +271,7 @@ void OzzyHALDevice::ApplyDeviceConfig() {
  * thread, which owns it. */
 kern_return_t OzzyHALDevice::CallApplySetting(unsigned int id, uint32_t value) {
     uint64_t in[2] = { id, value };
-    kern_return_t kr = IOConnectCallScalarMethod(mKextConnect, OZZY_METHOD_APPLY_SETTING, in, 2, nullptr, nullptr);
+    kern_return_t kr = mBackend.Call(OZZY_METHOD_APPLY_SETTING, in, 2);
     if (kr != KERN_SUCCESS)
         LogOzzyHALError("device %{public}u: %{public}s %{public}s failed (0x%{public}x)", mSlot,
                         ozzy_setting_descs[id].name, ozzy_setting_descs[id].value_names[value], kr);
@@ -457,7 +455,7 @@ OSStatus OzzyHALDevice::SetSampleRate(AudioServerPlugInHostRef host, Float64 rat
  * handshake). Call with the mapping held. */
 kern_return_t OzzyHALDevice::CallSetRate(uint32_t rate) {
     uint64_t in[1] = { rate };
-    kern_return_t kr = IOConnectCallScalarMethod(mKextConnect, OZZY_METHOD_SET_RATE, in, 1, nullptr, nullptr);
+    kern_return_t kr = mBackend.Call(OZZY_METHOD_SET_RATE, in, 1);
     if (kr != KERN_SUCCESS)
         LogOzzyHALError("device %{public}u: %{public}u Hz failed (0x%{public}x)", mSlot, rate, kr);
     return kr;   // ApplyDeviceConfig logs the result
@@ -810,6 +808,7 @@ void OzzyHAL::Init(AudioServerPlugInHostRef host) {
 
     // Pick up devices that are already connected, then watch for changes
     ScanServices();
+    ScanDaemonSegments();
     mMonitorRunning = true;
     pthread_create(&mMonitorThread, NULL, MonitorEntry, this);
 }
@@ -850,26 +849,36 @@ OzzyHALDevice* OzzyHAL::SlotForUID(const char* uid) {
 }
 
 void OzzyHAL::ConnectService(io_service_t service, uint64_t registryID) {
-    io_connect_t connect = IO_OBJECT_NULL;
-    mach_vm_address_t address = 0;
-    mach_vm_size_t size = 0;
-
-    if (IOServiceOpen(service, mach_task_self(), 0, &connect) != KERN_SUCCESS) return;
-    kern_return_t kr = IOConnectMapMemory(connect, 0, mach_task_self(), &address, &size, kIOMapAnywhere);
-    if (kr != KERN_SUCCESS) {
-        LogOzzyHALError("failed to map kext memory (0x%{public}x)", kr);
-        IOServiceClose(connect);
+    OzzyBackend backend;
+    if (!backend.OpenKext(service)) {
+        LogOzzyHALError("failed to open or map the kext");
         return;
     }
+    Attach(backend, registryID, OzzyUSBLocationID(service));
+}
 
+/* Give an open backend a device slot, or close it */
+void OzzyHAL::Attach(OzzyBackend& backend, uint64_t registryID, uint32_t locationID) {
     char uid[128];
-    uint32_t locationID = OzzyUSBLocationID(service);
-    OzzyHALDevice::MakeDeviceUID((const ozzy_shared_memory*)address, locationID, uid, sizeof(uid));
+    OzzyHALDevice::MakeDeviceUID(backend.shm, locationID, uid, sizeof(uid));
     OzzyHALDevice* device = SlotForUID(uid);
     if (!device) LogOzzyHALError("too many devices, ignoring '%{public}s'", uid);
-    if (!device || !device->Map(connect, address, size, registryID, locationID)) {
-        IOConnectUnmapMemory(connect, 0, mach_task_self(), address);
-        IOServiceClose(connect);
+    if (!device || !device->Map(backend, registryID, locationID)) backend.Close();
+}
+
+/* Attach to the daemon segments of listed USB devices that no device has yet (by the kext or a
+ * daemon). A device without a segment (no daemon drives it) is skipped quietly. */
+void OzzyHAL::ScanDaemonSegments() {
+    OzzyUSBDevice usb[kOzzyMaxDevices];
+    unsigned int n = OzzyListUSBDevices(usb, kOzzyMaxDevices);
+    for (unsigned int k = 0; k < n; k++) {
+        bool known = false;
+        for (uint32_t i = 0; i < kOzzyMaxDevices; i++)
+            known |= (mDevices[i].IsMapped() && (mDevices[i].GetRegistryID() == usb[k].registryID ||
+                                                  mDevices[i].GetLocationID() == usb[k].locationID));
+        if (known || (!usb[k].model->in_channels && !usb[k].model->out_channels)) continue;   // MIDI only
+        OzzyBackend backend;
+        if (backend.OpenDaemon(usb[k].locationID)) Attach(backend, usb[k].registryID, usb[k].locationID);
     }
 }
 
@@ -913,6 +922,7 @@ void OzzyHAL::MonitorLoop() {
         }
 
         ScanServices();
+        ScanDaemonSegments();
 
         bool anyMapped = false;
         for (uint32_t i = 0; i < kOzzyMaxDevices; i++) {

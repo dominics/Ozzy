@@ -8,7 +8,8 @@
  * (--midi-loop, like a cable from the mixer's MIDI out to its MIDI in).
  *
  * Like the daemon: the heartbeat ticks each 250 ms, the mailbox is polled each millisecond and
- * APPLY_SETTING / SET_RATE restart the engine before the ack. Failure modes for the plug-ins'
+ * APPLY_SETTING / SET_RATE restart the engine before the ack (--restart-delay: as slowly as the
+ * real handshake, which stops the heartbeat meanwhile, as in ozzy-daemon). Failure modes for the plug-ins'
  * health checks:
  *   SIGUSR1           hang: the heartbeat, the clock and the mailbox stop; the process stays
  *   --crash-after S   crash: exit after S seconds without removing the segment, as a killed
@@ -46,6 +47,7 @@ struct fake_daemon {
 	enum fake_mode mode;
 	bool midi_loop;
 	bool verbose;
+	uint32_t restart_delay_ms;  /* --restart-delay */
 
 	uint64_t t0_ns;           /* the clock's start: frames due since then */
 	uint64_t out_frames;      /* PCM OUT frames completed since t0 */
@@ -232,6 +234,10 @@ static IOReturn restart(struct fake_daemon *fd)
 {
 	bool ok = ozzy_engine_restart(fd->engine);
 
+	/* The real handshake's time: the heartbeat stands still meanwhile, as in ozzy-daemon */
+	if (fd->restart_delay_ms)
+		usleep(fd->restart_delay_ms * 1000u);
+
 	reset_clock(fd);
 	return ok ? kIOReturnSuccess : kIOReturnIOError;
 }
@@ -299,6 +305,7 @@ static void usage(FILE *out)
 		"  --model KEY         a device-table key (default DynacordCMS600; Xone and isoc families)\n"
 		"  --rate HZ           the rate to start at (default: the model's start rate)\n"
 		"  --midi-loop         MIDI OUT comes back on MIDI IN (isoc family)\n"
+		"  --restart-delay MS  a restart (SET_RATE, APPLY_SETTING) takes this long, heartbeat stopped\n"
 		"  --crash-after S     exit after S seconds, leaving the segment behind\n"
 		"  --seconds S         run for S seconds, then remove the segment (default: until a signal)\n"
 		"  --list              the models it can fake\n"
@@ -352,6 +359,8 @@ int main(int argc, char **argv)
 			key = v;
 			i++;
 		} else if (v && !strcmp(a, "--rate") && parse_u32(v, 10, &rate)) {
+			i++;
+		} else if (v && !strcmp(a, "--restart-delay") && parse_u32(v, 10, &fd.restart_delay_ms)) {
 			i++;
 		} else if (v && !strcmp(a, "--crash-after") && parse_u32(v, 10, &crash_after)) {
 			i++;

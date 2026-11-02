@@ -11,7 +11,7 @@ LOG=$(mktemp -t ozzy-fake-daemon)
 
 cleanup() {
 	[ -n "$FAKE" ] && kill "$FAKE" 2>/dev/null && wait "$FAKE" 2>/dev/null || true
-	rm -f "$LOG"
+	rm -f "$LOG" "$LOG.backend"
 }
 trap cleanup EXIT
 
@@ -23,6 +23,7 @@ fail() {
 }
 
 client() { "$B/shm-client" --location "$LOC" "$@"; }
+backend() { "$B/backend-client" "$LOC" "$@"; }
 
 start_fake() {
 	"$B/fake-daemon" --location "$LOC" "$@" >> "$LOG" 2>&1 &
@@ -43,21 +44,39 @@ client --set-rate 48000 --expect-rate 48000 --set-rate 44100 --expect-rate 44100
 client --set-rate 12345 > /dev/null 2>&1 && fail "SET_RATE took a rate the model doesn't have"
 client --midi-loop 903c40803c00 > /dev/null || fail "MIDI didn't come back through the loop"
 echo "tools: live segment ok (info, heartbeat, SET_RATE, MIDI loop)"
+backend --alive --set-rate 48000 --midi-loop 903c40 > /dev/null || fail "backend: live segment"
+backend --gone 1500 > /dev/null && fail "backend: a live daemon counted as gone"
+echo "tools: backend ok on a live segment (alive over 1.5 s, SET_RATE, MIDI loop)"
+
+# The plug-ins' backend keeps its mapping while the daemon hangs
+backend --alive --gone 3000 > "$LOG.backend" &
+BC=$!
+sleep 0.6
 
 # 2. A hung daemon: the segment stays as it was, only the heartbeat stops
 kill -USR1 "$FAKE"
 sleep 0.1
 client --dead 1200 > /dev/null || fail "a hung daemon still looks alive"
+wait "$BC" || fail "backend: a hung daemon still counted as alive ($(cat "$LOG.backend"))"
 kill "$FAKE"; wait "$FAKE" 2>/dev/null || true; FAKE=
 client --info > /dev/null 2>&1 && fail "the segment is still there after SIGTERM"
-echo "tools: hung daemon ok (heartbeat stops; SIGTERM removes the segment)"
+backend --open-fails > /dev/null || fail "backend: opened a removed segment"
+echo "tools: hung daemon ok (heartbeat stops, backend sees it gone; SIGTERM removes the segment)"
 
 # 3. A crashed daemon: the segment is left behind, magic and all; the next one replaces it
-start_fake --crash-after 1
+start_fake --crash-after 2
+backend --alive --gone 4000 > "$LOG.backend" || fail "backend: a crashed daemon still counted as alive ($(cat "$LOG.backend"))"
 wait "$FAKE" 2>/dev/null || true; FAKE=
 client --dead 1200 > /dev/null || fail "a crashed daemon's segment looks alive"
+backend --gone 1500 > /dev/null || fail "backend: a stale segment opened as alive"
 start_fake
 grep -q "replaced a stale segment" "$LOG" || fail "the next daemon didn't replace the stale segment"
 client --alive 1000 > /dev/null || fail "the replacement isn't alive"
-echo "tools: crashed daemon ok (stale segment, replaced by the next daemon)"
+backend --alive > /dev/null || fail "backend: the replacement isn't alive"
+echo "tools: crashed daemon ok (stale segment, backend sees it gone, replaced by the next daemon)"
+# 4. A restart as slow as the real handshake stops the heartbeat; the backend mustn't drop the device
+kill "$FAKE"; wait "$FAKE" 2>/dev/null || true; FAKE=
+start_fake --restart-delay 1500
+backend --set-rate-watched 48000 > "$LOG.backend" || fail "backend: a slow restart counted as a dead daemon ($(cat "$LOG.backend"))"
+echo "tools: slow restart ok (1.5 s, heartbeat stopped, the backend kept the device)"
 echo "all tools tests passed"

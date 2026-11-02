@@ -2,6 +2,7 @@
 #include "../../engine/shared/ozzy_shared_data.h"
 #include "../Shared/OzzyLog.h"
 #include "../Shared/OzzyKextClient.h"
+#include "../Shared/OzzyBackend.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMIDI/CoreMIDI.h>
 #include <mach/mach_time.h>
@@ -11,7 +12,8 @@
 #include <IOKit/IOKitLib.h>
 
 /*
- * One port per OzzyKext instance (a DB4 and a Xone:1D can be connected at the same time).
+ * One port per OzzyKext instance or OzzyDaemon segment (OzzyBackend.h; a DB4 and a Xone:1D can
+ * be connected at the same time).
  * A port keeps its MIDI device when the hardware goes away (it goes offline), so apps keep
  * their connections when the same device comes back.
  *
@@ -29,12 +31,10 @@
 #define kPendingSize 65536
 
 struct OzzyMidiPort {
-	// Connection to one OzzyKext instance; shm is null while disconnected
-	uint64_t registryID;
+	// Connection to one OzzyKext instance or daemon segment; shm is null while disconnected
+	uint64_t registryID;   // the OzzyKext instance's, or the USB device's for a daemon
 	uint32_t locationID;   // USB port: tells two devices of the same model apart
-	io_connect_t connect;
-	mach_vm_address_t mapAddress;
-	mach_vm_size_t mapSize;
+	OzzyBackend backend;
 	ozzy_shared_memory* shm;
 	uint32_t sessionID;
 
@@ -113,14 +113,10 @@ static void SetPortDevice(OzzyMidiPort* port, const ozzy_shared_memory* shm, uin
 	if (vendorName) CFRelease(vendorName);
 }
 
-/* Close the port's kext connection; no CoreMIDI calls */
+/* Close the port's connection to its driver; no CoreMIDI calls */
 static void UnmapPort(OzzyMidiPort* port) {
 	pthread_mutex_lock(&gPortLock);
-	IOConnectUnmapMemory(port->connect, 0, mach_task_self(), port->mapAddress);
-	IOServiceClose(port->connect);
-	port->connect = IO_OBJECT_NULL;
-	port->mapAddress = 0;
-	port->mapSize = 0;
+	port->backend.Close();
 	port->shm = nullptr;
 	port->registryID = 0;
 	port->pending.head = port->pending.tail = 0;
@@ -157,20 +153,9 @@ static OzzyMidiPort* PortForDevice(const char* name, uint32_t locationID) {
 	return nullptr;
 }
 
-static void ConnectService(io_service_t service, uint64_t registryID) {
-	io_connect_t connect = IO_OBJECT_NULL;
-	mach_vm_address_t address = 0;
-	mach_vm_size_t size = 0;
-
-	if (IOServiceOpen(service, mach_task_self(), 0, &connect) != KERN_SUCCESS) return;
-	kern_return_t kr = IOConnectMapMemory(connect, 0, mach_task_self(), &address, &size, kIOMapAnywhere);
-	if (kr != KERN_SUCCESS) {
-		LogOzzyMIDIError("failed to map kext memory (0x%{public}x)", kr);
-		IOServiceClose(connect);
-		return;
-	}
-
-	ozzy_shared_memory* shm = (ozzy_shared_memory*)address;
+/* Give an open backend a port, or close it */
+static void AttachBackend(OzzyBackend& backend, uint64_t registryID, uint32_t locationID) {
+	ozzy_shared_memory* shm = backend.shm;
 	OzzyMidiPort* port = nullptr;
 	if (shm->magic != OZZY_MAGIC || shm->version != OZZY_SHARED_VERSION) {
 		LogOzzyMIDIError("SHM magic/version mismatch (version %{public}u, expected %{public}u): reinstall Ozzy",
@@ -178,39 +163,64 @@ static void ConnectService(io_service_t service, uint64_t registryID) {
 	} else if (!shm->audio.hardware_present.load()) {
 		// Not started yet; try again on the next scan
 	} else {
-		port = PortForDevice(shm->product_name[0] ? shm->product_name : "Ozzy MIDI", OzzyUSBLocationID(service));
+		port = PortForDevice(shm->product_name[0] ? shm->product_name : "Ozzy MIDI", locationID);
 		if (!port) LogOzzyMIDIError("too many devices");
 	}
 	if (!port) {
-		IOConnectUnmapMemory(connect, 0, mach_task_self(), address);
-		IOServiceClose(connect);
+		backend.Close();
 		return;
 	}
 
-	SetPortDevice(port, shm, OzzyUSBLocationID(service));
+	SetPortDevice(port, shm, locationID);
 
 	pthread_mutex_lock(&gPortLock);
 	port->registryID = registryID;
-	port->locationID = OzzyUSBLocationID(service);
-	port->connect = connect;
-	port->mapAddress = address;
-	port->mapSize = size;
+	port->locationID = locationID;
+	port->backend = backend;
 	port->sessionID = shm->session_id;
 	port->generation++;
 	port->pending.buf = port->pendingBuf;
 	port->pending.mask = kPendingSize - 1;
 	port->shm = shm;
 	pthread_mutex_unlock(&gPortLock);
-	LogOzzyMIDI("connected to '%{public}s' (session: 0x%{public}08X)", port->name, port->sessionID);
+	LogOzzyMIDI("connected to '%{public}s' (%{public}s, session: 0x%{public}08X)", port->name,
+	            backend.kind == OzzyBackendKind::Daemon ? "daemon" : "kext", port->sessionID);
 }
 
-/* Connect to OzzyKext instances we don't have yet and drop ports whose device went away */
+static void ConnectService(io_service_t service, uint64_t registryID) {
+	OzzyBackend backend;
+	if (!backend.OpenKext(service)) {
+		LogOzzyMIDIError("failed to open or map the kext");
+		return;
+	}
+	AttachBackend(backend, registryID, OzzyUSBLocationID(service));
+}
+
+/* Connect to the daemon segments of listed USB devices that no port has yet (by the kext or a
+ * daemon). A device without a segment (no daemon drives it) is skipped quietly. */
+static void ScanDaemonSegments() {
+	OzzyUSBDevice usb[kMaxPorts];
+	unsigned int n = OzzyListUSBDevices(usb, kMaxPorts);
+	for (unsigned int k = 0; k < n; k++) {
+		bool known = false;
+		for (int i = 0; i < kMaxPorts; i++)
+			known |= gPorts[i].shm && (gPorts[i].registryID == usb[k].registryID ||
+			                           gPorts[i].locationID == usb[k].locationID);
+		OzzyBackend backend;
+		if (!known && backend.OpenDaemon(usb[k].locationID))
+			AttachBackend(backend, usb[k].registryID, usb[k].locationID);
+	}
+}
+
+/* Connect to OzzyKext instances and daemon segments we don't have yet and drop ports whose
+ * device (or daemon) went away */
 static void ScanDevices() {
+	static unsigned int scans;
 	for (int i = 0; i < kMaxPorts; i++) {
 		OzzyMidiPort* port = &gPorts[i];
 		if (!port->shm) continue;
 		if (port->shm->magic != OZZY_MAGIC || port->shm->session_id != port->sessionID ||
-		    !port->shm->audio.hardware_present.load(std::memory_order_relaxed)) {
+		    !port->shm->audio.hardware_present.load(std::memory_order_relaxed) || !port->backend.Alive()) {
 			DisconnectPort(port);
 		}
 	}
@@ -225,6 +235,8 @@ static void ScanDevices() {
 		IOObjectRelease(service);
 	}
 	IOObjectRelease(it);
+	// Daemon segments each 500 ms: it lists the USB devices
+	if (scans++ % 10 == 0) ScanDaemonSegments();
 }
 
 static int GetExpectedDataLength(uint8_t status) {
@@ -304,7 +316,7 @@ static bool FlushMidiOut(OzzyMidiPort* port) {
 	pthread_mutex_lock(&gPortLock);
 	bool moved = port->shm && ozzy_midi_queue_pending(&port->pending) &&
 	             ozzy_midi_queue_write(&port->shm->midi_out, &port->pending, nullptr, 0);
-	if (moved) IOConnectCallScalarMethod(port->connect, OZZY_METHOD_MIDI_OUT_PENDING, NULL, 0, NULL, NULL);
+	if (moved) port->backend.MidiOutPending();
 	if (!ozzy_midi_queue_pending(&port->pending)) {
 		dropped = port->pending.dropped;
 		port->pending.dropped = 0;
@@ -465,7 +477,7 @@ static OSStatus Send(MIDIDriverRef self, const MIDIPacketList *pktlist, void *de
 		ozzy_midi_queue_write(&port->shm->midi_out, &port->pending, packet->data, packet->length);
 		packet = MIDIPacketNext(packet);
 	}
-	IOConnectCallScalarMethod(port->connect, OZZY_METHOD_MIDI_OUT_PENDING, NULL, 0, NULL, NULL);
+	port->backend.MidiOutPending();
 	bool startedDropping = droppedBefore == 0 && port->pending.dropped != 0;
 	pthread_mutex_unlock(&gPortLock);
 

@@ -1,8 +1,10 @@
 # Tools for OzzyDaemon's segment, no device needed:
 #   fake-daemon   serves a segment with the real engine on a fake bus (a chosen model)
 #   shm-client    reads it, calls its mailbox, sends MIDI, checks the heartbeat
+#   backend-client   the plug-ins' daemon backend (macos/Shared/OzzyBackend.h) against it
 #   make check    runs the two together (check.sh)
 CC       ?= cc
+CXX      ?= c++
 OZZY     := ../../../..
 BUILD    := build
 VERSION  := $(shell git -C $(OZZY) describe --always --dirty 2>/dev/null || echo unknown)
@@ -21,7 +23,7 @@ ENGINE   := $(OZZY)/engine/core/ozzy_engine.c $(OZZY)/engine/core/ozzy_isoc_outp
 HEADERS  := $(wildcard ../*.h $(OZZY)/engine/*/*.h $(OZZY)/engine/devices/*/*.h $(OZZY)/common/*.h \
             $(OZZY)/common/devices/*/*.h $(OZZY)/tests/fake_bus.h) $(OZZY)/macos/Shared/OzzyDaemonShared.h
 
-all: $(BUILD)/fake-daemon $(BUILD)/shm-client
+all: $(BUILD)/fake-daemon $(BUILD)/shm-client $(BUILD)/backend-client
 
 $(BUILD):
 	mkdir -p $@
@@ -31,6 +33,11 @@ $(BUILD)/fake-daemon: fake-daemon.c ../segment.c $(OZZY)/tests/fake_bus.c $(ENGI
 
 $(BUILD)/shm-client: shm-client.c $(HEADERS) | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ shm-client.c
+
+# As the plug-ins build it: C++, the client side of the shared memory (no OZZY_USER_ENGINE)
+$(BUILD)/backend-client: backend-client.cpp $(OZZY)/macos/Shared/OzzyBackend.h $(HEADERS) | $(BUILD)
+	$(CXX) -std=gnu++11 -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers $(MINOS) \
+		-I$(OZZY) -o $@ backend-client.cpp -framework IOKit -framework CoreFoundation
 
 check: all
 	./check.sh $(BUILD)
