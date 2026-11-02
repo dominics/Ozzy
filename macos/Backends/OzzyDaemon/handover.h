@@ -41,6 +41,7 @@ struct handover {
 	bool present;
 	bool running;
 	bool retry_pending;
+	bool lost;               /* it was running and stopped by itself: retried slowly, failed or busy */
 	unsigned int retries;
 };
 
@@ -62,5 +63,12 @@ enum handover_action handover_started(struct handover *h, enum handover_start re
 
 /* The retry delay has passed */
 enum handover_action handover_retry(struct handover *h);
+
+/*
+ * handover_lost - The running device stopped and couldn't be restarted (a failed watchdog
+ * recovery), and has been released. While it is still wanted it is retried each
+ * HANDOVER_SLOW_MS, a failed start included, until one succeeds or a new round starts.
+ */
+enum handover_action handover_lost(struct handover *h);
 
 #endif

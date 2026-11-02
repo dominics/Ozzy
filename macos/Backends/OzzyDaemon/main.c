@@ -105,6 +105,16 @@ static void apply(struct daemon_device *d, enum handover_action action)
 	}
 }
 
+/* A watchdog recovery failed: release the device and its segment, then try it again slowly */
+static void device_lost(struct daemon_device *d)
+{
+	ozzy_log("%s at 0x%08x: could not restart it; releasing it and trying again each %u s", d->model->name,
+		 d->location_id, HANDOVER_SLOW_MS / 1000);
+	device_release(d);
+	d->slow_logged = true;   /* said above */
+	apply(d, handover_lost(&d->handover));
+}
+
 static void log_console(void)
 {
 	if (console_uid == HANDOVER_NO_CONSOLE)
@@ -200,6 +210,7 @@ static void device_added(void *refcon, io_iterator_t it)
 			if (d) {
 				d->next = devices;
 				devices = d;
+				d->on_lost = device_lost;
 				handover_init(&d->handover, getuid());
 				handover_console(&d->handover, console_uid);
 				if (!d->handover.front) {

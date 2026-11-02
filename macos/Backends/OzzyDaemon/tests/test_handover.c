@@ -124,6 +124,29 @@ static void failed_start(void)
 	CHECK(handover_console(&h, me) == HANDOVER_START, "back in front tries again");
 }
 
+static void lost_is_retried_slowly(void)
+{
+	struct handover h;
+
+	running(&h);
+	CHECK(handover_lost(&h) == HANDOVER_RETRY_SLOWLY && !h.running, "a failed recovery: retry slowly");
+	CHECK(handover_retry(&h) == HANDOVER_START, "the retry starts it");
+	CHECK(handover_started(&h, HANDOVER_FAILED) == HANDOVER_RETRY_SLOWLY, "a failed start after a loss: slowly again");
+	CHECK(handover_retry(&h) == HANDOVER_START, "and again");
+	CHECK(handover_started(&h, HANDOVER_BUSY) == HANDOVER_RETRY_SLOWLY, "busy after a loss: slowly too");
+	CHECK(handover_retry(&h) == HANDOVER_START, "once more");
+	CHECK(handover_started(&h, HANDOVER_STARTED) == HANDOVER_NONE && h.running, "back");
+	CHECK(handover_lost(&h) == HANDOVER_RETRY_SLOWLY, "lost again");
+	CHECK(handover_device(&h, false) == HANDOVER_NONE, "unplugged while waiting: nothing to stop");
+	CHECK(handover_retry(&h) == HANDOVER_NONE, "and no retry");
+	CHECK(handover_device(&h, true) == HANDOVER_START, "replug starts a new round");
+	CHECK(handover_started(&h, HANDOVER_FAILED) == HANDOVER_GIVE_UP, "a new round gives up on failure as before");
+
+	running(&h);
+	handover_console(&h, other);
+	CHECK(handover_lost(&h) == HANDOVER_NONE, "lost while not in front: no retry");
+}
+
 int main(void)
 {
 	starts_only_when_front_and_present();
@@ -133,5 +156,6 @@ int main(void)
 	slow_retry_stops_when_front_lost();
 	retry_after_unplug_does_nothing();
 	failed_start();
+	lost_is_retried_slowly();
 	return CHECK_DONE("handover");
 }

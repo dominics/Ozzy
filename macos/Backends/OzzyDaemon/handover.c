@@ -18,6 +18,7 @@ static enum handover_action changed(struct handover *h, bool wanted)
 {
 	h->retries = 0;
 	h->retry_pending = false;
+	h->lost = false;
 	if (!wanted) {
 		if (h->running) {
 			h->running = false;
@@ -52,6 +53,7 @@ enum handover_action handover_started(struct handover *h, enum handover_start re
 	case HANDOVER_STARTED:
 		h->running = true;
 		h->retries = 0;
+		h->lost = false;
 		return HANDOVER_NONE;
 	case HANDOVER_BUSY:
 		if (!h->front || !h->present)
@@ -62,9 +64,24 @@ enum handover_action handover_started(struct handover *h, enum handover_start re
 		h->retries++;
 		return HANDOVER_RETRY_SOON;
 	case HANDOVER_FAILED:
+		if (h->lost && h->front && h->present) {
+			h->retry_pending = true;
+			return HANDOVER_RETRY_SLOWLY;
+		}
 		return HANDOVER_GIVE_UP;
 	}
 	return HANDOVER_NONE;
+}
+
+enum handover_action handover_lost(struct handover *h)
+{
+	h->running = false;
+	h->lost = true;
+	h->retries = HANDOVER_FAST_RETRIES;   /* busy from here on: slowly as well */
+	if (!h->front || !h->present)
+		return HANDOVER_NONE;
+	h->retry_pending = true;
+	return HANDOVER_RETRY_SLOWLY;
 }
 
 enum handover_action handover_retry(struct handover *h)

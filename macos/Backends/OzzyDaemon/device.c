@@ -157,9 +157,10 @@ static void poll_fired(CFRunLoopTimerRef timer, void *info)
  * its feedback without data, or PCM out failing in a row. A bulk PCM IN pipe isn't watched for
  * completions: a bulk read completes when the device has data, and the CMS 600-3's 0x86 goes
  * quiet for over 500 ms after a switch to 96 kHz and now and then while idle, then carries on.
- * Its feedback going silent is what says the device stopped.
+ * Its feedback going silent is what says the device stopped. True if the restart failed: the
+ * caller has the device released (on_lost).
  */
-static void watch_locked(struct daemon_device *d)
+static bool watch_locked(struct daemon_device *d)
 {
 	static const enum ozzy_pipe_role roles[] = { OZZY_PIPE_PCM_OUT, OZZY_PIPE_PCM_IN };
 	uint64_t now = mach_absolute_time();
@@ -169,7 +170,7 @@ static void watch_locked(struct daemon_device *d)
 	bool streaming;
 
 	if (!d->running || d->sleeping)
-		return;
+		return false;
 	for (i = 0; i < sizeof(roles) / sizeof(roles[0]) && !why; i++) {
 		pipe = d->engine->pipe[roles[i]].address;
 		if (roles[i] == OZZY_PIPE_PCM_IN && d->engine->pipe[roles[i]].transfer_type == kUSBBulk)
@@ -188,7 +189,7 @@ static void watch_locked(struct daemon_device *d)
 		why = "failing";
 	}
 	if (!why || (d->recovered_at && now - d->recovered_at < ubus_ms_to_ticks(&d->bus, WATCH_RECOVER_S * 1000ull)))
-		return;
+		return false;
 
 	d->recovered_at = now;
 	ozzy_log("pipe 0x%02x: %s, recovering the device", pipe, why);
@@ -198,22 +199,26 @@ static void watch_locked(struct daemon_device *d)
 	if (streaming) {
 		ubus_watch_reset(&d->bus);
 		ozzy_log("recovered: streaming");
-	} else {
-		ozzy_log("recovered: start failed");
-		ozzy_engine_stop(d->engine);
-		d->running = false;
+		return false;
 	}
+	ozzy_log("recovered: start failed");
+	ozzy_engine_stop(d->engine);
+	d->running = false;
+	return true;
 }
 
 static void watch_fired(CFRunLoopTimerRef timer, void *info)
 {
 	struct daemon_device *d = info;
+	bool lost;
 
 	(void)timer;
 	segment_tick(&d->seg);
 	pthread_mutex_lock(&d->lock);
-	watch_locked(d);
+	lost = watch_locked(d);
 	pthread_mutex_unlock(&d->lock);
+	if (lost && d->on_lost)
+		d->on_lost(d);
 }
 
 static CFRunLoopTimerRef add_timer(struct daemon_device *d, unsigned int ms, CFRunLoopTimerCallBack fn)

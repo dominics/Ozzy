@@ -35,6 +35,8 @@ struct daemon_device {
 	bool running;
 	bool sleeping;
 	uint64_t recovered_at;
+	/* A watchdog recovery failed: called on the control thread without the lock, to release it */
+	void (*on_lost)(struct daemon_device *d);
 
 	CFRunLoopTimerRef poll;   /* the mailbox */
 	CFRunLoopTimerRef watch;  /* the stall watchdog and the heartbeat (seg ticks it during starts) */
