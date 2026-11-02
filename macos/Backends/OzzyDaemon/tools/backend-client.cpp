@@ -55,7 +55,7 @@ static bool MidiLoop(OzzyBackend& b, const char* hex) {
 int main(int argc, char** argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: backend-client LOCATION [--open-fails] [--alive] [--gone MS] [--set-rate HZ]\n"
-                        "       [--set-rate-watched HZ] [--midi-loop HEX]\n");
+                        "       [--set-rate-watched HZ] [--midi-loop HEX] [--midi2 NAME]\n");
         return 2;
     }
     uint32_t location = (uint32_t)strtoul(argv[1], nullptr, 16);
@@ -106,6 +106,12 @@ int main(int argc, char** argv) {
             ok = kr == KERN_SUCCESS && !w.sawGone && b.Alive();
             printf("backend: SET_RATE %s took %llu ms: 0x%x, %s\n", p, (unsigned long long)took, kr,
                    w.sawGone ? "seen as gone meanwhile" : "alive throughout");
+            i++;
+        } else if (p && !strcmp(a, "--midi2")) {
+            // The second MIDI port as OzzyMIDI finds it
+            struct ozzy_daemon_midi2* m2 = b.Midi2();
+            ok = m2 && !strncmp(m2->name, p, sizeof(m2->name));
+            printf("backend: second MIDI port %s\n", m2 ? m2->name : "(none)");
             i++;
         } else if (p && !strcmp(a, "--midi-loop")) {
             ok = MidiLoop(b, p);

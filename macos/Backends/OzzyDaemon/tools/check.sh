@@ -79,4 +79,16 @@ kill "$FAKE"; wait "$FAKE" 2>/dev/null || true; FAKE=
 start_fake --restart-delay 1500
 backend --set-rate-watched 48000 > "$LOG.backend" || fail "backend: a slow restart counted as a dead daemon ($(cat "$LOG.backend"))"
 echo "tools: slow restart ok (1.5 s, heartbeat stopped, the backend kept the device)"
+
+# 5. The same restart with the heartbeat held, as ozzy-daemon does it: a client with no call in
+# flight (OzzyMIDI) keeps the device too, and the second MIDI port is published
+kill "$FAKE"; wait "$FAKE" 2>/dev/null || true; FAKE=
+start_fake --restart-delay 1500 --hold-beat
+backend --midi2 SystemCtrl > "$LOG.backend" || fail "backend: no second MIDI port ($(cat "$LOG.backend"))"
+backend --gone 2500 > "$LOG.backend" &
+BC=$!
+sleep 0.3
+client --set-rate 48000 > /dev/null || fail "SET_RATE with the heartbeat held"
+wait "$BC" && fail "backend: a restart with the heartbeat held counted as a dead daemon ($(cat "$LOG.backend"))"
+echo "tools: held restart ok (1.5 s, a passive client kept the device; SystemCtrl published)"
 echo "all tools tests passed"

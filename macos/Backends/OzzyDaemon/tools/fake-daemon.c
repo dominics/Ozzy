@@ -9,8 +9,9 @@
  *
  * Like the daemon: the heartbeat ticks each 250 ms, the mailbox is polled each millisecond and
  * APPLY_SETTING / SET_RATE restart the engine before the ack (--restart-delay: as slowly as the
- * real handshake, which stops the heartbeat meanwhile, as in ozzy-daemon). Failure modes for the plug-ins'
- * health checks:
+ * real handshake, with the heartbeat stopped meanwhile, or with --hold-beat kept moving by
+ * segment_beat_start as ozzy-daemon does). The CMS 600-3's second MIDI port is published in the
+ * trailer as ozzy-daemon publishes it. Failure modes for the plug-ins' health checks:
  *   SIGUSR1           hang: the heartbeat, the clock and the mailbox stop; the process stays
  *   --crash-after S   crash: exit after S seconds without removing the segment, as a killed
  *                     daemon leaves it (magic, session_id, hardware_present intact)
@@ -26,6 +27,7 @@
 #include <unistd.h>
 #include "tests/fake_bus.h"
 #include "common/devices/ploytec/ploytec_midi.h"
+#include "engine/devices/ploytec/ploytec_midi2.h"
 #include "common/ozzy_version.h"
 #include "macos/Backends/OzzyDaemon/segment.h"
 
@@ -47,6 +49,7 @@ struct fake_daemon {
 	enum fake_mode mode;
 	bool midi_loop;
 	bool verbose;
+	bool hold_beat;            /* --hold-beat */
 	uint32_t restart_delay_ms;  /* --restart-delay */
 
 	uint64_t t0_ns;           /* the clock's start: frames due since then */
@@ -232,11 +235,16 @@ static void pump(struct fake_daemon *fd)
 
 static IOReturn restart(struct fake_daemon *fd)
 {
-	bool ok = ozzy_engine_restart(fd->engine);
+	bool ok;
 
-	/* The real handshake's time: the heartbeat stands still meanwhile, as in ozzy-daemon */
+	if (fd->hold_beat)
+		segment_hold(&fd->seg);
+	ok = ozzy_engine_restart(fd->engine);
+	/* The real handshake's time: the main loop's heartbeat stands still meanwhile */
 	if (fd->restart_delay_ms)
 		usleep(fd->restart_delay_ms * 1000u);
+	if (fd->hold_beat)
+		segment_release(&fd->seg);
 
 	reset_clock(fd);
 	return ok ? kIOReturnSuccess : kIOReturnIOError;
@@ -306,6 +314,7 @@ static void usage(FILE *out)
 		"  --rate HZ           the rate to start at (default: the model's start rate)\n"
 		"  --midi-loop         MIDI OUT comes back on MIDI IN (isoc family)\n"
 		"  --restart-delay MS  a restart (SET_RATE, APPLY_SETTING) takes this long, heartbeat stopped\n"
+		"  --hold-beat         keep the heartbeat moving through a restart, as ozzy-daemon does\n"
 		"  --crash-after S     exit after S seconds, leaving the segment behind\n"
 		"  --seconds S         run for S seconds, then remove the segment (default: until a signal)\n"
 		"  --list              the models it can fake\n"
@@ -341,6 +350,8 @@ int main(int argc, char **argv)
 
 		if (!strcmp(a, "--midi-loop")) {
 			fd.midi_loop = true;
+		} else if (!strcmp(a, "--hold-beat")) {
+			fd.hold_beat = true;
 		} else if (!strcmp(a, "--list")) {
 			unsigned int k;
 
@@ -386,6 +397,8 @@ int main(int argc, char **argv)
 	}
 	if (made == SEGMENT_REPLACED_STALE)
 		printf("fake-daemon: segment %s: %s\n", name, fd.seg.reason);
+	if (fd.hold_beat)
+		segment_beat_start(&fd.seg, HEARTBEAT_MS);
 	snprintf((char *)fd.seg.shm->product_name, sizeof(fd.seg.shm->product_name), "%s (fake)", fd.model->name);
 
 	mem = calloc(1, ozzy_engine_size(fd.model));
@@ -406,6 +419,8 @@ int main(int argc, char **argv)
 	}
 	fd.fb.now = mach_absolute_time();
 	ozzy_engine_attach(fd.engine, &fd.fb.bus, fd.seg.shm);
+	if (ozzy_engine_set_midi2(fd.engine, &fd.seg.trailer->midi2.in, &fd.seg.trailer->midi2.out))
+		ozzy_daemon_midi2_publish(fd.seg.trailer, DYNACORD_MIDI_PORT_SYSCTRL_NAME);
 	ozzy_engine_set_usb_speed(fd.engine, OZZY_USB_SPEED_HIGH);
 	ozzy_engine_set_driver_version(fd.engine, OZZY_GIT_VERSION " (fake)");
 	ozzy_engine_set_anchors(fd.engine, true);
