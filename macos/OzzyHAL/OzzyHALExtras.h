@@ -8,6 +8,8 @@
  * - mono input devices next to the main one (the CMS 600-3's MON and AUX, OzzyChannels.h), as
  *   each device's objects from kOzzyObjectMonoDevice: their state here, their properties and
  *   IO in OzzyHALMono.h
+ * - the related devices (kAudioDevicePropertyRelatedDevices) of the main and mono devices: all
+ *   of them, so an aggregate of them needs no resampling
  * Volume, mute and the stereo pairs are kept in CoreAudio's plug-in storage per device UID, like
  * the device settings. C++ (OzzyHAL).
  */
@@ -18,6 +20,7 @@
 #include <CoreAudio/AudioServerPlugIn.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <atomic>
+#include <string.h>
 #include "OzzyChannels.h"
 #include "OzzyVolume.h"
 
@@ -48,6 +51,17 @@ static inline bool OzzyIsExtraControl(uint32_t kind) {
 
 class OzzyHALExtras {
 public:
+    /* The main device's object ID (OzzyHALDevice::Init) */
+    void SetDevice(AudioObjectID device) { mDevice = device; }
+
+    /* The main device and its mono devices into @out; returns how many */
+    UInt32 RelatedDevices(AudioObjectID out[1 + OZZY_MAX_MONO_INPUTS]) const {
+        UInt32 n = 0;
+        out[n++] = mDevice;
+        for (unsigned int i = 0; i < mMonoCount; i++) out[n++] = mDevice + kOzzyObjectMonoDevice + 2 * i;
+        return n;
+    }
+
     /* The device's model and channels, from ApplyDeviceConfig */
     void Configure(const struct ozzy_device* model, uint32_t inputs, uint32_t outputs) {
         mModel = model;
@@ -123,7 +137,8 @@ public:
     // --- The device's own properties (OzzyHAL.mm asks here first; false: not one of ours) ---
 
     bool HasDeviceProperty(const AudioObjectPropertyAddress* a, Boolean* has) const {
-        if (a->mSelector == kAudioDevicePropertyPreferredChannelsForStereo) {
+        if (a->mSelector == kAudioDevicePropertyPreferredChannelsForStereo ||
+            a->mSelector == kAudioDevicePropertyRelatedDevices) {
             *has = true;
             return true;
         }
@@ -144,6 +159,11 @@ public:
             *status = kAudioHardwareNoError;
             return true;
         }
+        if (a->mSelector == kAudioDevicePropertyRelatedDevices) {
+            *size = (1 + mMonoCount) * sizeof(AudioObjectID);
+            *status = kAudioHardwareNoError;
+            return true;
+        }
         if (a->mSelector == kAudioObjectPropertyElementName) {
             *size = sizeof(CFStringRef);
             *status = ChannelName(a) ? kAudioHardwareNoError : kAudioHardwareUnknownPropertyError;
@@ -161,6 +181,17 @@ public:
             else {
                 if (outData) { ((UInt32*)outData)[0] = p.left; ((UInt32*)outData)[1] = p.right; }
                 if (outSize) *outSize = 2 * sizeof(UInt32);
+            }
+            return true;
+        }
+        if (a->mSelector == kAudioDevicePropertyRelatedDevices) {
+            AudioObjectID related[1 + OZZY_MAX_MONO_INPUTS];
+            UInt32 size = RelatedDevices(related) * sizeof(AudioObjectID);
+            *status = kAudioHardwareNoError;
+            if (outData && inMax < size) *status = kAudioHardwareBadPropertySizeError;
+            else {
+                if (outData) memcpy(outData, related, size);
+                if (outSize) *outSize = size;
             }
             return true;
         }
@@ -301,6 +332,7 @@ private:
     static constexpr const char* kInPairKey = "Input Stereo Pair";
     static constexpr const char* kOutPairKey = "Output Stereo Pair";
 
+    AudioObjectID mDevice = kAudioObjectUnknown;
     const struct ozzy_device* mModel = nullptr;
     uint32_t mInputs = 0, mOutputs = 0;
     const struct ozzy_mono_input* mMono[OZZY_MAX_MONO_INPUTS] = {};

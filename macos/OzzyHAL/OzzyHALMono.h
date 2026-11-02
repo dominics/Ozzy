@@ -40,6 +40,8 @@ static UInt32 OzzyMonoDeviceList(Device* dev, AudioObjectID* out, UInt32 max) {
 template <class Device>
 static void OzzyMonoNotify(Device* dev, AudioServerPlugInHostRef host) {
     if (!host) return;
+    AudioObjectPropertyAddress related = { kAudioDevicePropertyRelatedDevices, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+    if (dev->IsConnected()) host->PropertiesChanged(host, dev->GetDeviceID(), 1, &related);
     for (unsigned int i = 0; i < dev->Extras().MonoCount(); i++) {
         AudioObjectID id = OzzyMonoDeviceID(dev->GetDeviceID(), (int)i);
         if (!dev->IsConnected()) {
@@ -47,15 +49,16 @@ static void OzzyMonoNotify(Device* dev, AudioServerPlugInHostRef host) {
             host->PropertiesChanged(host, id, 1, &alive);
             continue;
         }
-        AudioObjectPropertyAddress addr[7] = {
+        AudioObjectPropertyAddress addr[8] = {
             { kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
             { kAudioDevicePropertyDeviceUID, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
             { kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
             { kAudioDevicePropertyAvailableNominalSampleRates, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
             { kAudioDevicePropertySafetyOffset, kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain },
             { kAudioDevicePropertyZeroTimeStampPeriod, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
-            { kAudioDevicePropertyLatency, kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain } };
-        host->PropertiesChanged(host, id, 7, addr);
+            { kAudioDevicePropertyLatency, kAudioObjectPropertyScopeInput, kAudioObjectPropertyElementMain },
+            related };
+        host->PropertiesChanged(host, id, 8, addr);
         AudioObjectPropertyAddress fmt[2] = {
             { kAudioStreamPropertyVirtualFormat, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain },
             { kAudioStreamPropertyPhysicalFormat, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain } };
@@ -72,7 +75,7 @@ static AudioStreamBasicDescription OzzyMonoFormat(Device* dev) {
     return f;
 }
 
-/* "<main name> <mono name>", or the main UID / model UID with the suffix; the caller releases it */
+/* The main UID / model UID with the suffix; the caller releases it */
 static inline CFStringRef OzzyMonoCopyString(CFStringRef base, const char* sep, const char* add) {
     return CFStringCreateWithFormat(NULL, NULL, CFSTR("%@%s%s"), base ? base : CFSTR("Ozzy"), sep, add);
 }
@@ -102,7 +105,8 @@ static Boolean OzzyMonoHasProperty(Device* dev, uint32_t kind, const AudioObject
             case kAudioDevicePropertyStreams: case kAudioDevicePropertyStreamConfiguration:
             case kAudioDevicePropertyLatency: case kAudioDevicePropertySafetyOffset:
             case kAudioDevicePropertyPreferredChannelLayout: case kAudioDevicePropertyPreferredChannelsForStereo:
-            case kAudioDevicePropertyZeroTimeStampPeriod: case kAudioDevicePropertyClockDomain: return true;
+            case kAudioDevicePropertyZeroTimeStampPeriod: case kAudioDevicePropertyClockDomain:
+            case kAudioDevicePropertyRelatedDevices: return true;
             case kAudioObjectPropertyElementName:
                 return a->mScope == kAudioObjectPropertyScopeInput && a->mElement == 1;
         }
@@ -157,7 +161,7 @@ static OSStatus OzzyMonoGetPropertyData(Device* dev, uint32_t kind, const AudioO
             if (!outData) return kAudioHardwareNoError;
             switch (a->mSelector) {   // the caller releases it
                 case kAudioObjectPropertyName:
-                    str = OzzyIsMonoDevice(kind) ? OzzyMonoCopyString(dev->GetDeviceName(), " ", mono->name)
+                    str = OzzyIsMonoDevice(kind) ? CFStringCreateWithCString(NULL, mono->device_name, kCFStringEncodingUTF8)
                                                  : CFStringCreateWithFormat(NULL, NULL, CFSTR("Ozzy %s Input Stream"), mono->name);
                     break;
                 case kAudioObjectPropertyManufacturer:
@@ -202,6 +206,11 @@ static OSStatus OzzyMonoGetPropertyData(Device* dev, uint32_t kind, const AudioO
         case kAudioDevicePropertySafetyOffset: u32 = dev->GetSafetyOffset(kAudioObjectPropertyScopeInput); break;
         case kAudioDevicePropertyZeroTimeStampPeriod: u32 = dev->GetZeroTimestampPeriod(); break;
         case kAudioDevicePropertyClockDomain: u32 = dev->GetClockDomain(); break;   // the main device's clock
+        case kAudioDevicePropertyRelatedDevices: {
+            AudioObjectID related[1 + OZZY_MAX_MONO_INPUTS];
+            UInt32 n = dev->Extras().RelatedDevices(related);
+            return OzzyMonoWrite(inMax, outSize, outData, related, n * sizeof(AudioObjectID));
+        }
         case kAudioDevicePropertyPreferredChannelLayout: {
             AudioChannelLayout layout = {};
             layout.mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions;

@@ -85,7 +85,8 @@ static inline const struct ozzy_channel_info *ozzy_channel(const struct ozzy_dev
  */
 struct ozzy_mono_input {
 	const char *key;            /* struct ozzy_device.key */
-	const char *name;           /* after the main device's name, e.g. "Dynacord CMS 600-3 MON" */
+	const char *name;           /* its channel's and stream's, e.g. "MON" */
+	const char *device_name;    /* the device's, e.g. "CMS 600-3 MON" */
 	const char *uid_suffix;
 	uint8_t channel;            /* the main device's 1-based input channel */
 };
@@ -93,8 +94,8 @@ struct ozzy_mono_input {
 #define OZZY_MAX_MONO_INPUTS 2   /* per model */
 
 static const struct ozzy_mono_input ozzy_mono_inputs[] = {
-	{ "DynacordCMS600", "MON", ":MON", 4 },
-	{ "DynacordCMS600", "AUX", ":AUX", 3 },
+	{ "DynacordCMS600", "MON", "CMS 600-3 MON", ":MON", 4 },
+	{ "DynacordCMS600", "AUX", "CMS 600-3 AUX", ":AUX", 3 },
 };
 
 /* @model's mono input devices into @out (OZZY_MAX_MONO_INPUTS); returns how many */

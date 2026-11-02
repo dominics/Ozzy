@@ -64,6 +64,7 @@ static OSStatus WriteObjectID(UInt32 inMax, UInt32* outSize, void* outData, Audi
 
 void OzzyHALDevice::Init(uint32_t slot) {
     mSlot = slot;
+    mExtras.SetDevice(GetDeviceID());
 
     mCurrentStreamFormat.mSampleRate = 96000.0;
     mCurrentStreamFormat.mFormatID = kAudioFormatLinearPCM;

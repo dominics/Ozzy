@@ -2,7 +2,8 @@
 /*
  * OzzyHAL's channel names and stereo pairs (macos/OzzyHAL/OzzyChannels.h): the CMS 600-3's
  * names and roles by 1-based element, nothing out of range or for unlisted models, and the
- * stereo pair's checks, fallback and packing, and the CMS 600-3's MON and AUX mono inputs.
+ * stereo pair's checks, fallback and packing, and the CMS 600-3's MON and AUX mono inputs and
+ * their device names.
  * Each channel map's key is a device-table model with that many channels.
  */
 
@@ -55,6 +56,8 @@ int main(void)
 		CHECK(ozzy_mono_inputs_for(cms, mono) == 2 && strcmp(mono[0]->name, "MON") == 0 && mono[0]->channel == 4 &&
 		      strcmp(mono[1]->name, "AUX") == 0 && mono[1]->channel == 3, "CMS 600-3: MON on 4, AUX on 3");
 		CHECK(strcmp(mono[0]->uid_suffix, mono[1]->uid_suffix) != 0, "MON and AUX share a UID");
+		CHECK(strcmp(mono[0]->device_name, "CMS 600-3 MON") == 0 && strcmp(mono[1]->device_name, "CMS 600-3 AUX") == 0,
+		      "device names %s, %s", mono[0]->device_name, mono[1]->device_name);
 		CHECK(ozzy_mono_inputs_for(db4, mono) == 0 && ozzy_mono_inputs_for(NULL, mono) == 0, "mono inputs elsewhere");
 	}
 	for (i = 0; i < sizeof(ozzy_mono_inputs) / sizeof(ozzy_mono_inputs[0]); i++) {
