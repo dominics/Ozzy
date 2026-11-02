@@ -14,19 +14,21 @@
 #include "../../common/ozzy_devices.h"
 #include "PloytecCodec.h"   // the codec function pointer types
 #include "../Shared/OzzyBackend.h"
+#include "OzzyHALExtras.h"
 
 /* The macOS 12 SDK renamed kAudioObjectPropertyElementMaster; older SDKs only have that name */
 #ifndef __MAC_12_0
 #define kAudioObjectPropertyElementMain kAudioObjectPropertyElementMaster
 #endif
 
-// One audio device per OzzyKext instance with audio. Device slot i owns four object IDs:
-// the device (kOzzyObjectIDBase + 4i), its input stream (+1), its output stream (+2) and its
-// clock source control (+3, published only for devices with the Clock Source setting).
+// One audio device per OzzyKext instance with audio. Device slot i owns the object IDs from
+// kOzzyObjectIDBase + kOzzyObjectsPerDevice * i: the device (+0), its input stream (+1), its
+// output stream (+2), its clock source control (+3, published only for devices with the Clock
+// Source setting), then the fork's (OzzyHALExtras.h, from +4).
 // A slot keeps its IDs and UID when its device is replugged.
 #define kOzzyMaxDevices         8
 #define kOzzyObjectIDBase       100
-#define kOzzyObjectsPerDevice   4
+#define kOzzyObjectsPerDevice   16
 
 class OzzyHALDevice {
 public:
@@ -126,6 +128,9 @@ public:
     static void MakeDeviceUID(const ozzy_shared_memory* shm, uint32_t locationID, char* buf, size_t size);
     bool HasDeviceUID(const char* uid) const;
 
+    // The fork's volume, mute, channel names and stereo pairs (OzzyHALExtras.h)
+    OzzyHALExtras& Extras() { return mExtras; }
+
 private:
     uint32_t mSlot = 0;
 
@@ -195,6 +200,7 @@ private:
     uint32_t mSessionID = 0;
 
     alignas(16) uint8_t mChannelLayoutBuffer[0x50C];
+    OzzyHALExtras mExtras;
 
     ozzy_shared_memory* AcquireSHM();
     void ReleaseSHM();

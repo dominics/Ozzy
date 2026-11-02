@@ -6,6 +6,10 @@ fail=0
 for t in test_endpoints test_settings test_info test_transfers test_midi_queue test_ump test_routing test_isoc_ring test_memory test_running_status test_stats test_latency test_clock test_cport test_isoc_input test_midi2 test_midi_parser; do
 	"$B/$t" 2>/dev/null || fail=1
 done
+# The fork's OzzyHAL extras (macos/OzzyHAL/)
+for t in test_volume test_channels; do
+	"$B/$t" 2>/dev/null || fail=1
+done
 for g in trace layout; do
 	if "$B/test_$g" 2>/dev/null | diff -u "golden/$g.txt" - > "$B/$g.diff"; then
 		echo "$g: ok (matches golden/$g.txt)"
