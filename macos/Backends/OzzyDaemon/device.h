@@ -37,7 +37,7 @@ struct daemon_device {
 	uint64_t recovered_at;
 
 	CFRunLoopTimerRef poll;   /* the mailbox */
-	CFRunLoopTimerRef watch;  /* the stall watchdog and the heartbeat */
+	CFRunLoopTimerRef watch;  /* the stall watchdog and the heartbeat (seg ticks it during starts) */
 };
 
 /* Know the device at @service (retained), not yet driven. NULL if out of memory. */

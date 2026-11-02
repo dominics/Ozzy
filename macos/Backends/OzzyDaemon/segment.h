@@ -10,6 +10,7 @@
 #ifndef OZZY_DAEMON_SEGMENT_H
 #define OZZY_DAEMON_SEGMENT_H
 
+#include <dispatch/dispatch.h>
 #include "../../../engine/shared/ozzy_shared_data.h"
 #include "../../Shared/OzzyDaemonShared.h"
 
@@ -28,7 +29,15 @@ struct segment {
 	volatile struct ozzy_shared_memory *shm;
 	struct ozzy_daemon_trailer *trailer;
 	char reason[96];
+
+	/* segment_beat_start: the hold heartbeat */
+	dispatch_queue_t beat_queue;
+	dispatch_source_t beat;
+	uint64_t held_since_ns;   /* __atomic; 0 = not held */
 };
+
+/* How long a hold keeps the heartbeat moving at most */
+enum { SEGMENT_HOLD_MAX_MS = 5000 };
 
 /*
  * segment_create - Create, map and zero the segment @name (shm, then the trailer with its
@@ -48,6 +57,21 @@ bool segment_clear_stale(const char *name, unsigned int stale_after_ms);
 
 /* Advance the heartbeat (what tells a live segment from a stale one) */
 void segment_tick(struct segment *seg);
+
+/*
+ * segment_beat_start - Keep the heartbeat moving from a queue of its own while the control
+ * thread is held up in a call it can't tick from: an engine start or restart, whose handshake
+ * takes about a second, which the plug-ins would otherwise read as a dead daemon.
+ * segment_hold / segment_release bracket such a call. A hold ticks for SEGMENT_HOLD_MAX_MS at
+ * most, so a control thread stuck in one still reads as hung. Call once the segment is mapped;
+ * segment_destroy stops it.
+ */
+void segment_beat_start(struct segment *seg, unsigned int period_ms);
+void segment_hold(struct segment *seg);
+void segment_release(struct segment *seg);
+
+/* segment_beat_stop - Stop the hold heartbeat and wait for a tick in progress. Safe when not started. */
+void segment_beat_stop(struct segment *seg);
 
 /*
  * segment_destroy - Clear hardware_present, driver_ready and the magics and unmap. Unlinks the

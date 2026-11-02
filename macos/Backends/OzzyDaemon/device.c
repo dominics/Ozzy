@@ -50,12 +50,36 @@ static uint32_t registry_u32(io_service_t service, CFStringRef key)
 	return n;
 }
 
+/*
+ * The engine's start and restart, with the heartbeat kept moving through the handshake
+ * (segment_beat_start): the control thread, which ticks it otherwise, is blocked meanwhile
+ */
+static bool engine_start(struct daemon_device *d)
+{
+	bool ok;
+
+	segment_hold(&d->seg);
+	ok = ozzy_engine_start(d->engine);
+	segment_release(&d->seg);
+	return ok;
+}
+
+static bool engine_restart(struct daemon_device *d)
+{
+	bool ok;
+
+	segment_hold(&d->seg);
+	ok = ozzy_engine_restart(d->engine);
+	segment_release(&d->seg);
+	return ok;
+}
+
 /* --- Settings and rate (the mailbox) --- */
 
 /* Restart with the settings the engine holds now; on failure the HAL drops the device */
 static IOReturn restart_locked(struct daemon_device *d)
 {
-	if (ozzy_engine_restart(d->engine)) {
+	if (engine_restart(d)) {
 		ubus_watch_reset(&d->bus);
 		return kIOReturnSuccess;
 	}
@@ -164,7 +188,7 @@ static void watch_locked(struct daemon_device *d)
 	d->recovered_at = now;
 	ozzy_log("pipe 0x%02x: %s, recovering the device", pipe, why);
 	ozzy_engine_suspend(d->engine);
-	streaming = ozzy_engine_start(d->engine);   /* a restart: it selects the interfaces again */
+	streaming = engine_start(d);   /* a restart: it selects the interfaces again */
 	ozzy_engine_stats_recovery(d->engine, streaming);
 	if (streaming) {
 		ubus_watch_reset(&d->bus);
@@ -298,6 +322,7 @@ enum handover_start device_drive(struct daemon_device *d)
 	}
 	if (made == SEGMENT_REPLACED_STALE)
 		ozzy_log("  segment %s: %s", name, d->seg.reason);
+	segment_beat_start(&d->seg, WATCH_MS);
 	/* The device's own strings, before attach (it keeps them over the model's name) */
 	registry_string(d->service, kUSBVendorString, d->seg.shm->manufacturer_name,
 			sizeof(d->seg.shm->manufacturer_name));
@@ -321,7 +346,7 @@ enum handover_start device_drive(struct daemon_device *d)
 	ozzy_engine_set_usb_speed(d->engine, ubus_speed(&d->bus));
 	ozzy_engine_set_driver_version(d->engine, OZZY_GIT_VERSION);
 	ozzy_engine_set_anchors(d->engine, true);   /* OzzyHAL's zero timestamps */
-	if (!ozzy_engine_start(d->engine)) {
+	if (!engine_start(d)) {
 		ozzy_log("  engine start failed");
 		ozzy_engine_stop(d->engine);
 		goto fail;
@@ -404,7 +429,7 @@ void device_wake(struct daemon_device *d)
 		d->sleeping = false;
 		if (d->running) {
 			ozzy_log("wake: starting again");
-			if (ozzy_engine_start(d->engine)) {
+			if (engine_start(d)) {
 				ubus_watch_reset(&d->bus);
 			} else {
 				ozzy_log("start after wake failed");

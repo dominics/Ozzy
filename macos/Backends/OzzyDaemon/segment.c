@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static const size_t shm_bytes = sizeof(struct ozzy_shared_memory);
@@ -187,8 +188,66 @@ void segment_tick(struct segment *seg)
 		__atomic_fetch_add((volatile uint32_t *)&seg->shm->heartbeat, 1u, __ATOMIC_RELAXED);
 }
 
+static uint64_t uptime_ns(void)
+{
+	return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+static void beat_fired(void *info)
+{
+	struct segment *seg = info;
+	uint64_t since = __atomic_load_n(&seg->held_since_ns, __ATOMIC_ACQUIRE);
+
+	if (since && uptime_ns() - since < SEGMENT_HOLD_MAX_MS * 1000000ull)
+		segment_tick(seg);
+}
+
+void segment_beat_start(struct segment *seg, unsigned int period_ms)
+{
+	uint64_t period = period_ms * 1000000ull;
+
+	if (seg->beat || !seg->shm)
+		return;
+	seg->beat_queue = dispatch_queue_create("com.ozzy.daemon.beat", DISPATCH_QUEUE_SERIAL);
+	seg->beat = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, seg->beat_queue);
+	dispatch_set_context(seg->beat, seg);
+	dispatch_source_set_event_handler_f(seg->beat, beat_fired);
+	dispatch_source_set_timer(seg->beat, dispatch_time(DISPATCH_TIME_NOW, (int64_t)period), period, period / 10);
+	dispatch_resume(seg->beat);
+}
+
+void segment_hold(struct segment *seg)
+{
+	__atomic_store_n(&seg->held_since_ns, uptime_ns() | 1, __ATOMIC_RELEASE);
+}
+
+void segment_release(struct segment *seg)
+{
+	__atomic_store_n(&seg->held_since_ns, 0, __ATOMIC_RELEASE);
+}
+
+static void nothing(void *info)
+{
+	(void)info;
+}
+
+void segment_beat_stop(struct segment *seg)
+{
+	if (!seg->beat)
+		return;
+	dispatch_source_cancel(seg->beat);
+	/* The source's handler runs on beat_queue: once this returns, none is running or to come */
+	dispatch_sync_f(seg->beat_queue, NULL, nothing);
+	dispatch_release(seg->beat);
+	dispatch_release(seg->beat_queue);
+	seg->beat = NULL;
+	seg->beat_queue = NULL;
+	segment_release(seg);
+}
+
 void segment_destroy(struct segment *seg)
 {
+	segment_beat_stop(seg);
 	if (seg->base) {
 		/* A mark to tell whether the name still refers to this segment */
 		uint32_t mark = arc4random() | 1;
