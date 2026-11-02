@@ -121,8 +121,8 @@ static void pump_midi_out(struct usb_midi_engine *me)
 		if (ozzy_xchg_acquire_bool(&me->out_busy, true))
 			return;
 
-		r = shm->midi_out.read_index;
-		w = ozzy_load_acquire_u32(&shm->midi_out.write_index);
+		r = shm->midi_out.read_index & OZZY_MIDI_RING_MASK;
+		w = ozzy_load_acquire_u32(&shm->midi_out.write_index) & OZZY_MIDI_RING_MASK;
 		while (r != w) {
 			uint8_t byte = shm->midi_out.buffer[r];
 
@@ -139,7 +139,7 @@ static void pump_midi_out(struct usb_midi_engine *me)
 		ozzy_store_release_bool(&me->out_busy, false);
 
 		/* A kick that came in while we held out_busy returned early; pick up its bytes */
-		if (ozzy_load_acquire_u32(&shm->midi_out.write_index) == r)
+		if ((ozzy_load_acquire_u32(&shm->midi_out.write_index) & OZZY_MIDI_RING_MASK) == r)
 			return;
 	}
 }

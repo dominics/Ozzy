@@ -272,7 +272,9 @@ static inline bool ozzy_timestamp_read(struct ozzy_timestamp *ts, uint64_t *samp
 /*
  * --- MIDI rings: the engine fills midi_in and drains midi_out, a client the other way round ---
  * ozzy_midi_ring_push appends what fits (returns how many), ozzy_midi_ring_pop takes up to
- * @max bytes (returns how many). Either side can call either one.
+ * @max bytes (returns how many). Either side can call either one. Both indices are masked as
+ * they are read: the other side writes them, so an index past the ring can't take a subscript
+ * out of it.
  */
 #ifdef OZZY_ENGINE_SIDE
 typedef volatile struct ozzy_midi_buffer ozzy_midi_ring;
@@ -280,8 +282,8 @@ typedef volatile struct ozzy_midi_buffer ozzy_midi_ring;
 /* Append @count bytes to @ring; what doesn't fit is dropped. Returns how many went in. */
 static inline uint32_t ozzy_midi_ring_push(ozzy_midi_ring *ring, const uint8_t *bytes, uint32_t count)
 {
-	uint32_t w = ring->write_index;
-	uint32_t r = ozzy_load_acquire_u32(&ring->read_index);
+	uint32_t w = ring->write_index & OZZY_MIDI_RING_MASK;
+	uint32_t r = ozzy_load_acquire_u32(&ring->read_index) & OZZY_MIDI_RING_MASK;
 	uint32_t i;
 
 	for (i = 0; i < count && ((w + 1) & OZZY_MIDI_RING_MASK) != r; i++) {
@@ -295,8 +297,8 @@ static inline uint32_t ozzy_midi_ring_push(ozzy_midi_ring *ring, const uint8_t *
 /* Take up to @max bytes from @ring into @dst. Returns how many. */
 static inline uint32_t ozzy_midi_ring_pop(ozzy_midi_ring *ring, uint8_t *dst, uint32_t max)
 {
-	uint32_t r = ring->read_index;
-	uint32_t w = ozzy_load_acquire_u32(&ring->write_index);   /* acquire: the bytes before the index */
+	uint32_t r = ring->read_index & OZZY_MIDI_RING_MASK;
+	uint32_t w = ozzy_load_acquire_u32(&ring->write_index) & OZZY_MIDI_RING_MASK;   /* acquire: the bytes before the index */
 	uint32_t i;
 
 	for (i = 0; i < max && r != w; i++) {
@@ -311,8 +313,8 @@ typedef struct ozzy_midi_buffer ozzy_midi_ring;
 
 static inline uint32_t ozzy_midi_ring_push(ozzy_midi_ring *ring, const uint8_t *bytes, uint32_t count)
 {
-	uint32_t w = ring->write_index.load(std::memory_order_relaxed);
-	uint32_t r = ring->read_index.load(std::memory_order_acquire);
+	uint32_t w = ring->write_index.load(std::memory_order_relaxed) & OZZY_MIDI_RING_MASK;
+	uint32_t r = ring->read_index.load(std::memory_order_acquire) & OZZY_MIDI_RING_MASK;
 	uint32_t i;
 
 	for (i = 0; i < count && ((w + 1) & OZZY_MIDI_RING_MASK) != r; i++) {
@@ -325,8 +327,8 @@ static inline uint32_t ozzy_midi_ring_push(ozzy_midi_ring *ring, const uint8_t *
 
 static inline uint32_t ozzy_midi_ring_pop(ozzy_midi_ring *ring, uint8_t *dst, uint32_t max)
 {
-	uint32_t r = ring->read_index.load(std::memory_order_relaxed);
-	uint32_t w = ring->write_index.load(std::memory_order_acquire);
+	uint32_t r = ring->read_index.load(std::memory_order_relaxed) & OZZY_MIDI_RING_MASK;
+	uint32_t w = ring->write_index.load(std::memory_order_acquire) & OZZY_MIDI_RING_MASK;
 	uint32_t i;
 
 	for (i = 0; i < max && r != w; i++) {
