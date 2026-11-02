@@ -78,8 +78,9 @@ static CFRunLoopTimerRef gScanTimer = nullptr;
 /* The device of @port for the device in @shm on USB port @locationID: the port's own (renamed if
  * it was another's), else a new one, added to the MIDI setup */
 static void SetPortDevice(OzzyMidiPort* port, const ozzy_shared_memory* shm, uint32_t locationID) {
-	const char* name = shm->product_name[0] ? shm->product_name : "Ozzy MIDI";
-	const char* mfg = shm->manufacturer_name[0] ? shm->manufacturer_name : "Ozzy";
+	char nameBuf[sizeof(shm->product_name) + 1], mfgBuf[sizeof(shm->manufacturer_name) + 1];
+	const char* name = OzzyCopyName(nameBuf, shm->product_name, "Ozzy MIDI");
+	const char* mfg = OzzyCopyName(mfgBuf, shm->manufacturer_name, "Ozzy");
 	CFStringRef deviceName = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
 	CFStringRef vendorName = CFStringCreateWithCString(NULL, mfg, kCFStringEncodingUTF8);
 

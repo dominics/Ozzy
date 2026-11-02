@@ -120,8 +120,9 @@ void OzzyHALDevice::RebuildStreamConfigs() {
  * macOS does for other serial-less USB audio devices; moving the device to another port
  * makes it a new device to CoreAudio. */
 void OzzyHALDevice::MakeDeviceUID(const ozzy_shared_memory* shm, uint32_t locationID, char* buf, size_t size) {
-    bool hasSerial = shm->serial_number[0] != 0 && strcmp(shm->serial_number, "no serial number") != 0;
-    if (hasSerial) snprintf(buf, size, "OzzyHAL.%s", shm->serial_number);
+    char serial[sizeof(shm->serial_number) + 1];
+    bool hasSerial = OzzyCopyName(serial, shm->serial_number, nullptr) && strcmp(serial, "no serial number") != 0;
+    if (hasSerial) snprintf(buf, size, "OzzyHAL.%s", serial);
     else snprintf(buf, size, "OzzyHAL.%04X:%04X.%08X", shm->vendor_id, shm->product_id, locationID);
 }
 
@@ -483,13 +484,14 @@ OSStatus OzzyHALDevice::PerformConfigurationChange(AudioServerPlugInHostRef host
 
 void OzzyHALDevice::UpdateMetadata() {
     ozzy_shared_memory* shm = mSHM.load(std::memory_order_relaxed);
-    if (shm->product_name[0] != 0) {
+    char name[sizeof(shm->product_name) + 1];
+    if (OzzyCopyName(name, shm->product_name, nullptr)) {
         if (mModelUID) CFRelease(mModelUID);
-        mModelUID = SafeCreateString(shm->product_name);
+        mModelUID = SafeCreateString(name);
     }
-    if (shm->manufacturer_name[0] != 0) {
+    if (OzzyCopyName(name, shm->manufacturer_name, nullptr)) {
         if (mManufacturerUID) CFRelease(mManufacturerUID);
-        mManufacturerUID = SafeCreateString(shm->manufacturer_name);
+        mManufacturerUID = SafeCreateString(name);
     }
     char uid[128];
     MakeDeviceUID(shm, mLocationID, uid, sizeof(uid));
