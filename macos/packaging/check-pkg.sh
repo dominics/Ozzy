@@ -53,8 +53,8 @@ for b in "$P/Library/Audio/Plug-Ins/HAL/OzzyHAL.driver" "$P/Library/Audio/MIDI D
 	[ "$archs" = "arm64" ] || fail "$(basename "$b") has architectures $archs, expected arm64"
 done
 # The signing identifier comes from the daemon's embedded Info.plist; a bare binary would get its file name
-codesign -dv "$P/Library/Application Support/Ozzy/OzzyDaemon" 2>&1 | grep -qx 'Identifier=com.ozzy.daemon' \
-	|| fail "OzzyDaemon is not signed as com.ozzy.daemon"
+sig="$(codesign -dv "$P/Library/Application Support/Ozzy/OzzyDaemon" 2>&1)"
+grep -qx 'Identifier=com.ozzy.daemon' <<<"$sig" || fail "OzzyDaemon is not signed as com.ozzy.daemon"
 
 plutil -lint "$P/Library/LaunchAgents/com.ozzy.daemon.plist" >/dev/null || fail "LaunchAgent plist invalid"
 grep -q -- '--log-file' "$P/Library/LaunchAgents/com.ozzy.daemon.plist" || fail "LaunchAgent lacks --log-file"
