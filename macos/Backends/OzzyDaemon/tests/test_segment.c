@@ -92,5 +92,17 @@ int main(void)
 	segment_destroy(&a);
 	CHECK(!exists(), "all gone");
 
+	/* Clearing a crashed daemon's segment: nothing there, live, then stale */
+	CHECK(!segment_clear_stale(name, 50), "nothing to clear");
+	CHECK(segment_create(&a, name, 50) == SEGMENT_CREATED, "create a fourth time");
+	__atomic_store_n(&ticking, true, __ATOMIC_RELEASE);
+	pthread_create(&thread, NULL, ticker, &a);
+	CHECK(!segment_clear_stale(name, 100) && exists(), "a live segment stays");
+	__atomic_store_n(&ticking, false, __ATOMIC_RELEASE);
+	pthread_join(thread, NULL);
+	munmap(a.base, a.size);   /* a crash: mapped by nobody, heartbeat still */
+	close(a.fd);
+	CHECK(segment_clear_stale(name, 50) && !exists(), "a stale segment is removed");
+
 	return CHECK_DONE("segment");
 }

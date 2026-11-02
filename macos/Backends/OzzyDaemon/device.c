@@ -341,6 +341,15 @@ fail:
 	return HANDOVER_FAILED;
 }
 
+void device_clear_stale(struct daemon_device *d)
+{
+	char name[OZZY_DAEMON_SEGMENT_NAME_MAX];
+
+	ozzy_daemon_segment_name(name, d->location_id);
+	if (segment_clear_stale(name, SEGMENT_STALE_MS))
+		ozzy_log("  removed segment %s, left by a previous daemon", name);
+}
+
 void device_release(struct daemon_device *d)
 {
 	if (!d->driving)

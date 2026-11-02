@@ -51,6 +51,13 @@ struct daemon_device *device_new(io_service_t service, const struct ozzy_device 
  */
 enum handover_start device_drive(struct daemon_device *d);
 
+/*
+ * device_clear_stale - Remove the device's segment if a crashed daemon of this user left it, so
+ * the user in front can take the device. For a daemon that won't drive the device itself (one
+ * that does replaces it in device_drive).
+ */
+void device_clear_stale(struct daemon_device *d);
+
 /* Stop driving: stop the engine, close the device, remove the segment. Safe when not driving. */
 void device_release(struct daemon_device *d);
 

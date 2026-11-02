@@ -168,6 +168,19 @@ enum segment_result segment_create(struct segment *seg, const char *name, unsign
 	return SEGMENT_ERROR;
 }
 
+bool segment_clear_stale(const char *name, unsigned int stale_after_ms)
+{
+	struct stat sb;
+	bool stale;
+	int fd = shm_open(name, O_RDONLY, 0);
+
+	if (fd < 0)
+		return false;
+	stale = fstat(fd, &sb) == 0 && sb.st_uid == getuid() && !is_live(fd, stale_after_ms);
+	close(fd);
+	return stale && shm_unlink(name) == 0;
+}
+
 void segment_tick(struct segment *seg)
 {
 	if (seg->shm)

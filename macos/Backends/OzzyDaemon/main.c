@@ -199,9 +199,11 @@ static void device_added(void *refcon, io_iterator_t it)
 				devices = d;
 				handover_init(&d->handover, getuid());
 				handover_console(&d->handover, console_uid);
-				if (!d->handover.front)
+				if (!d->handover.front) {
 					ozzy_log("%s at 0x%08x: another user is in front, leaving it to them", model->name,
 						 d->location_id);
+					device_clear_stale(d);
+				}
 				apply(d, handover_device(&d->handover, true));
 			}
 		}

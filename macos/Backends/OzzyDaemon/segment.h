@@ -38,6 +38,14 @@ struct segment {
  */
 enum segment_result segment_create(struct segment *seg, const char *name, unsigned int stale_after_ms);
 
+/*
+ * segment_clear_stale - Unlink the segment @name if this user owns it and its heartbeat stands
+ * still for @stale_after_ms: one left by this user's crashed daemon, which would otherwise keep
+ * the device from the user in front. True if it removed one. Blocks up to @stale_after_ms when
+ * there is one of ours to inspect.
+ */
+bool segment_clear_stale(const char *name, unsigned int stale_after_ms);
+
 /* Advance the heartbeat (what tells a live segment from a stale one) */
 void segment_tick(struct segment *seg);
 
