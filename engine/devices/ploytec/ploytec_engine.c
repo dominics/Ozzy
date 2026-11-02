@@ -278,7 +278,8 @@ static bool ploytec_start(struct ozzy_engine *e)
 	/* 3. The clock from 0 */
 	pe->hw_sample_time = 0;
 	pe->period_count = 0;
-	shm->audio.timestamp.sample_time = 0;
+	if (e->anchors)   /* no anchor until the first new one */
+		ozzy_timestamp_write(&shm->audio.timestamp, 0, 0);
 
 	/* 4. Every PCM out place: silence and idle MIDI bytes; the converter settings to send */
 	for (i = 0; i < out_places; i++)
