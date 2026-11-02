@@ -358,6 +358,7 @@ enum handover_start device_drive(struct daemon_device *d)
 	const struct ozzy_device *model = d->model;
 	char name[OZZY_DAEMON_SEGMENT_NAME_MAX], why[160];
 	enum segment_result made;
+	bool io, configured;
 	size_t size;
 	IOReturn kr;
 
@@ -406,10 +407,14 @@ enum handover_start device_drive(struct daemon_device *d)
 	registry_string(d->service, kUSBSerialNumberString, d->seg.shm->serial_number,
 			sizeof(d->seg.shm->serial_number));
 
-	if (!ubus_start_io(&d->bus))
-		goto fail_config;
-	if (!ubus_configure(&d->bus, d->engine)) {
-		if (d->bus.busy)
+	/* Its settle times (0.5 s after setting the configuration, 50 ms per alternate setting) hold
+	 * up the control thread too: the heartbeat moves through them as through the start */
+	segment_hold(&d->seg);
+	io = ubus_start_io(&d->bus);
+	configured = io && ubus_configure(&d->bus, d->engine);
+	segment_release(&d->seg);
+	if (!configured) {
+		if (io && d->bus.busy)
 			return busy(d, "an interface is held by another driver or process");
 		goto fail_config;
 	}
