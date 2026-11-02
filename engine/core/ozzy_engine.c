@@ -414,10 +414,14 @@ const struct ozzy_pcm_ring *ozzy_engine_take_pcm_ring(struct ozzy_engine *e, enu
 {
 	const struct ozzy_pcm_ring *ring = (const struct ozzy_pcm_ring *)
 		ozzy_load_acquire_ptr((const void *const volatile *)&e->pcm_ring_set[dir]);
+	/* After the ring: at least the count that came with it. A newer one (an attach under
+	 * way) only means starting this ring from its @start once more. */
+	uint32_t attach = ozzy_load_acquire_u32(&e->pcm_attach_set[dir]);
 	uint32_t channels = dir == OZZY_PCM_OUT ? e->model->out_channels : e->model->in_channels;
 
-	if (ring != e->pcm_ring[dir]) {
+	if (ring != e->pcm_ring[dir] || attach != e->pcm_attach[dir]) {
 		e->pcm_ring[dir] = ring;
+		e->pcm_attach[dir] = attach;
 		if (ring)
 			e->pcm_pos[dir] = ring->start;
 	}

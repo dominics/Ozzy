@@ -224,8 +224,11 @@ struct ozzy_engine_report {
  * @rate:         the rate start() asks for (ozzy_engine_set_rate; 0: the highest the device
  *                lists)
  * @pcm_ring_set: ozzy_engine_set_pcm_ring(); the completion path picks it up
- * @pcm_ring/@pcm_pos: the rings as the completion path has them, and the ring position of
- *                each one's next frame (ozzy_engine_take_pcm_ring; completion path only)
+ * @pcm_attach_set: per direction, attaches so far (ozzy_engine_set_pcm_ring), so that a ring
+ *                attached again at the same address still starts from its @start
+ * @pcm_ring/@pcm_attach/@pcm_pos: the rings and attach counts as the completion path has
+ *                them, and the ring position of each one's next frame (ozzy_engine_take_pcm_ring;
+ *                completion path only)
  * @mem:          where the transfers go (struct ozzy_engine_memory)
  * @pipe:         each role's endpoint as ozzy_engine_set_endpoint() gave it (address 0: none)
  * @allocator:    what @mem came from (ozzy_engine_alloc_memory), NULL: the shared memory
@@ -249,7 +252,9 @@ struct ozzy_engine {
 	struct ozzy_route out_route;
 	uint32_t rate;
 	const struct ozzy_pcm_ring *volatile pcm_ring_set[OZZY_PCM_DIRS];
+	volatile uint32_t pcm_attach_set[OZZY_PCM_DIRS];
 	const struct ozzy_pcm_ring *pcm_ring[OZZY_PCM_DIRS];
+	uint32_t pcm_attach[OZZY_PCM_DIRS];
 	uint64_t pcm_pos[OZZY_PCM_DIRS];
 	struct ozzy_engine_memory mem;
 	struct ozzy_engine_pipe pipe[OZZY_PIPE_ROLES];
@@ -443,11 +448,14 @@ static inline void ozzy_engine_timer(struct ozzy_engine *e)
 }
 
 /* Attach @ring for @dir (NULL detaches). The completion path picks it up with the next
- * packet. The ring must stay valid until the caller has waited out the completions in
- * progress after detaching. */
+ * packet and starts it from its @start, also when the same ring is attached again before
+ * the completion path saw it detached (a quick stop, prepare and start). The ring must stay
+ * valid until the caller has waited out the completions in progress after detaching. One
+ * caller at a time per direction. */
 static inline void ozzy_engine_set_pcm_ring(struct ozzy_engine *e, enum ozzy_pcm_dir dir,
 					    const struct ozzy_pcm_ring *ring)
 {
+	ozzy_store_relaxed_u32(&e->pcm_attach_set[dir], e->pcm_attach_set[dir] + 1);
 	ozzy_store_release_ptr((const void *volatile *)&e->pcm_ring_set[dir], ring);
 }
 

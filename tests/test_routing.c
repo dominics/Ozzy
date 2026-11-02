@@ -100,6 +100,27 @@ int main(void)
 	CHECK(outs > 8 && ins > 8, "%u out, %u in completions", outs, ins);
 	CHECK(!wrong_out, "%u of the encoded output frames aren't the routed ring frames", wrong_out);
 	CHECK(!wrong_in, "%u of the captured frames aren't the routed decoded frames", wrong_in);
+
+	/* A quick stop, prepare and start (an xrun recovery) attaches the same ring again before the
+	 * completion path saw it detached: it still starts from its new start */
+	{
+		struct ozzy_pcm_ring q = ro;
+
+		q.start = 0;
+		ozzy_engine_set_pcm_ring(e, OZZY_PCM_OUT, &q);
+		CHECK(ozzy_engine_take_pcm_ring(e, OZZY_PCM_OUT) == &q, "ring taken");
+		e->pcm_pos[OZZY_PCM_OUT] = 100;   /* it played on */
+		ozzy_engine_set_pcm_ring(e, OZZY_PCM_OUT, NULL);
+		q.start = 7;
+		ozzy_engine_set_pcm_ring(e, OZZY_PCM_OUT, &q);
+		ozzy_engine_take_pcm_ring(e, OZZY_PCM_OUT);
+		CHECK(e->pcm_pos[OZZY_PCM_OUT] == 7, "the same ring attached again goes on from %llu, not 7",
+		      (unsigned long long)e->pcm_pos[OZZY_PCM_OUT]);
+		e->pcm_pos[OZZY_PCM_OUT] = 50;
+		ozzy_engine_take_pcm_ring(e, OZZY_PCM_OUT);
+		CHECK(e->pcm_pos[OZZY_PCM_OUT] == 50, "an unchanged ring went back to its start");
+		ozzy_engine_set_pcm_ring(e, OZZY_PCM_OUT, NULL);
+	}
 	free(e);
 	return CHECK_DONE("routing");
 }
