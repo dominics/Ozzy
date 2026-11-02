@@ -144,21 +144,33 @@ enum segment_result segment_create(struct segment *seg, const char *name, unsign
 		close(fd);
 		return SEGMENT_IN_USE;
 	}
-	if (sb.st_uid != getuid()) {
-		close(fd);
-		snprintf(seg->reason, sizeof(seg->reason), "owned by uid %u", (unsigned int)sb.st_uid);
-		return SEGMENT_IN_USE;
-	}
 	live = is_live(fd, stale_after_ms);
 	close(fd);
-	if (live) {
+	if (sb.st_uid != getuid()) {
+		/* Another user's: left alone while live; stale (their daemon crashed), removed if the
+		 * system lets this user */
+		if (live) {
+			snprintf(seg->reason, sizeof(seg->reason), "owned by uid %u", (unsigned int)sb.st_uid);
+			return SEGMENT_IN_USE;
+		}
+		if (shm_unlink(seg->name) != 0 && errno != ENOENT) {
+			snprintf(seg->reason, sizeof(seg->reason), "stale, owned by uid %u: shm_unlink: %s",
+				 (unsigned int)sb.st_uid, strerror(errno));
+			return SEGMENT_IN_USE;
+		}
+	} else if (live) {
 		set_reason(seg, "in use by a live daemon", 0);
 		return SEGMENT_IN_USE;
+	} else {
+		shm_unlink(seg->name);
 	}
 
-	shm_unlink(seg->name);
 	if (map_new(seg)) {
-		set_reason(seg, "replaced a stale segment", 0);
+		if (sb.st_uid != getuid())
+			snprintf(seg->reason, sizeof(seg->reason), "replaced a stale segment of uid %u",
+				 (unsigned int)sb.st_uid);
+		else
+			set_reason(seg, "replaced a stale segment", 0);
 		return SEGMENT_REPLACED_STALE;
 	}
 	if (errno == EEXIST) {
