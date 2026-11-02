@@ -38,6 +38,7 @@ struct fake_bus {
 	uint64_t ticks;
 	uint64_t hz;                       /* 0: the clock ticks once per call; else it reads @now */
 	uint64_t now;                      /* the clock, in @hz ticks a second, as the test sets it */
+	uint64_t packet_lead;              /* isoc packet times this far after @now (a bus clock ahead) */
 	unsigned int stats_changed;        /* stats_changed calls */
 	unsigned int pcm_stalled;          /* pcm_stalled calls */
 	bool timer_on;
