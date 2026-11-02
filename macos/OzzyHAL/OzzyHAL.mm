@@ -13,6 +13,13 @@ static CFStringRef SafeCreateString(const char* str) {
     return s;
 }
 
+/* Clamp @frames to @max frames; false if it didn't fit */
+static bool FitFrames(uint32_t* frames, uint32_t max) {
+    if (*frames <= max) return true;
+    *frames = max;
+    return false;
+}
+
 static UInt32 GetAudioBufferListSize(UInt32 numBuffers) {
     return (UInt32)(offsetof(AudioBufferList, mBuffers) + (numBuffers * sizeof(AudioBuffer)));
 }
@@ -228,6 +235,16 @@ void OzzyHALDevice::ApplyDeviceConfig() {
         mReadInput = plainIn ? PloytecPlainInputReader(8) : PloytecInputReader(8);
     }
     mClearOutput = plain ? PloytecClearOutputPlain : isBulk ? PloytecClearOutputBulk : PloytecClearOutputInterrupt;
+    // The codecs index the rings by frame: they must fit the shared memory's buffers in the
+    // layout picked above, and the clock spacing the output ring, whatever was published
+    uint32_t outMax = plain ? OZZY_PCM_RING_BYTES / (mOutputChannels * 3)
+        : OZZY_PCM_RING_BYTES / ploytec_out_subpkt_size(isBulk ? PLOYTEC_OUT_LAYOUT_BULK : PLOYTEC_OUT_LAYOUT_INT) *
+          PLOYTEC_FRAMES_PER_OUT_SUBPKT;
+    uint32_t inMax = OZZY_PCM_RING_BYTES / (plainIn ? mInputChannels * 3 : PLOYTEC_IN_FRAME_SIZE);
+    bool fits = FitFrames(&mOutRingFrames, outMax) & FitFrames(&mInRingFrames, inMax);
+    if (!(FitFrames(&mTimestampFrames, mOutRingFrames) & fits))
+        LogOzzyHALError("device %{public}u: the driver's ring layout doesn't fit its buffers, cut to %{public}u out / %{public}u in frames, anchors every %{public}u",
+                        mSlot, mOutRingFrames, mInRingFrames, mTimestampFrames);
     RebuildStreamConfigs();
     LogOzzyHAL("device %{public}u: Ploytec codec (%{public}s output, %{public}s input, %{public}u in / %{public}u out) for VID:0x%{public}04X",
                mSlot, plain ? "plain" : isBulk ? "bulk" : "interrupt", plainIn ? "plain" : "Ploytec", mInputChannels,
