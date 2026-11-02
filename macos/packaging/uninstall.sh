@@ -33,6 +33,16 @@ rm -f "/Library/LaunchAgents/$LABEL.plist"
 rm -f "/Library/Application Support/Ozzy/uninstall.sh"
 rmdir "/Library/Application Support/Ozzy" 2>/dev/null || true
 pkgutil --forget com.ozzy.userspace >/dev/null 2>&1 || true
-killall -9 coreaudiod 2>/dev/null || true
+# SIGTERM so coreaudiod shuts down in order (launchd starts it again on demand
+# without the plug-ins); SIGKILL only if it is still there after 5 s.
+pid="$(pgrep -x coreaudiod || true)"
+if [ -n "$pid" ]; then
+	kill -TERM $pid 2>/dev/null || true
+	for _ in $(seq 50); do
+		kill -0 $pid 2>/dev/null || break
+		sleep 0.1
+	done
+	kill -KILL $pid 2>/dev/null || true
+fi
 killall MIDIServer 2>/dev/null || true
 echo "Ozzy userspace driver removed."

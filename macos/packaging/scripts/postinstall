@@ -7,5 +7,15 @@ for uid in $(ps -axo uid=,comm= | awk '$1 != 0 && $2 ~ /\/loginwindow$/ {print $
 	launchctl bootstrap "gui/$uid" "/Library/LaunchAgents/$LABEL.plist" \
 		|| echo "Could not start $LABEL for uid $uid; it starts at the next login."
 done
-killall -9 coreaudiod 2>/dev/null || true
+# SIGTERM so coreaudiod shuts down in order (launchd starts it again on demand
+# with the new plug-ins); SIGKILL only if it is still there after 5 s.
+pid="$(pgrep -x coreaudiod || true)"
+if [ -n "$pid" ]; then
+	kill -TERM $pid 2>/dev/null || true
+	for _ in $(seq 50); do
+		kill -0 $pid 2>/dev/null || break
+		sleep 0.1
+	done
+	kill -KILL $pid 2>/dev/null || true
+fi
 killall MIDIServer 2>/dev/null || true
