@@ -60,6 +60,10 @@ static void ozzy_urb_complete(struct urb *urb)
 	unsigned int i;
 
 	atomic_inc(&bus->in_completion);
+	/* Pairs with the smp_mb() in ozzy_urb_wait_completions: the count is visible before this
+	 * completion reads the attached ring, so a waiter that sees it 0 has a detach that any
+	 * later completion sees */
+	smp_mb__after_atomic();
 	if (p->type == USB_ENDPOINT_XFER_ISOC) {
 		struct ozzy_isoc_packet *packets = u->packets;
 		uint64_t now = ktime_get_ns();
@@ -385,6 +389,9 @@ void ozzy_urb_wait_completions(struct ozzy_urb_bus *bus)
 {
 	unsigned int i;
 
+	/* The detach (trigger's store) before the first read of the count; pairs with the
+	 * smp_mb__after_atomic() in ozzy_urb_complete */
+	smp_mb();
 	for (i = 0; i < 100 && atomic_read_acquire(&bus->in_completion); i++)
 		usleep_range(500, 1000);
 }
