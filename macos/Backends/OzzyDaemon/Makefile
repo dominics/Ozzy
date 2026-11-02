@@ -27,10 +27,10 @@ ENGINE   := $(OZZY)/engine/core/ozzy_engine.c $(OZZY)/engine/core/ozzy_isoc_outp
             $(OZZY)/engine/devices/usbmidi/usb_midi_engine.c \
             $(OZZY)/common/devices/ploytec/ploytec_handshake.c $(OZZY)/common/devices/ploytec/ploytec_codec.c \
             $(OZZY)/common/usb_midi.c $(OZZY)/common/midi_ump.c
-DAEMON   := main.c device.c user_bus.c segment.c isoc_plan.c
+DAEMON   := main.c device.c handover.c user_bus.c segment.c isoc_plan.c
 HEADERS  := $(wildcard *.h $(OZZY)/engine/*/*.h $(OZZY)/engine/devices/*/*.h $(OZZY)/common/*.h \
             $(OZZY)/common/devices/*/*.h) $(OZZY)/macos/Shared/OzzyDaemonShared.h
-TESTS    := test_isoc_plan test_mailbox test_segment
+TESTS    := test_isoc_plan test_mailbox test_segment test_handover
 
 all: $(BUILD)/ozzy-daemon
 
@@ -50,6 +50,9 @@ $(BUILD)/test_isoc_plan: tests/test_isoc_plan.c isoc_plan.c $(HEADERS) | $(BUILD
 
 $(BUILD)/test_mailbox: tests/test_mailbox.c $(HEADERS) | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/test_mailbox.c
+
+$(BUILD)/test_handover: tests/test_handover.c handover.c handover.h | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/test_handover.c handover.c
 
 $(BUILD)/test_segment: tests/test_segment.c segment.c $(HEADERS) | $(BUILD)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/test_segment.c segment.c
