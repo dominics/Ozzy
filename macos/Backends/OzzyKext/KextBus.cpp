@@ -1,409 +1,504 @@
-/* SPDX-License-Identifier: MIT */
 #include "KextBus.h"
-#include "KextStatus.h"
-#include "../../Shared/OzzyLog.h"
+#include "OzzyKext.h"
+#include "../../../engine/shared/ozzy_log.h"
 #include <stdarg.h>
+#include <Availability.h>
+#include <IOKit/IOMultiMemoryDescriptor.h>
+#include <libkern/version.h>
 
-// --- Bulk context (keeps a shm slice alive until completion) ---
+// --- Context Wrapper (Keeps the SLICE alive) ---
 struct TransferContext {
-    IOMemoryDescriptor* slice;   /* a shm slice to complete/release, or null for a cached buffer */
-    void* userContext;
+    IOMemoryDescriptor* slice; 
+    void* userContext;       
     uint8_t pipeID;
     KextBus* busInstance;
 };
 
-static void KextBus_BulkCompletion(void* owner, void* parameter, IOReturn status, uint32_t bytesTransferred)
-{
+// --- Global Callback ---
+void KextBus_GlobalCompletion(void* owner, void* parameter, IOReturn status, uint32_t bytesTransferred) {
     TransferContext* ctx = (TransferContext*)parameter;
     if (!ctx) {
-        LogOzzyKext("callback: NULL context");
+        ozzy_log("callback: NULL context");
         return;
     }
-    ctx->busInstance->EnterCallback();
-    if (status != kIOReturnSuccess && status != kIOReturnAborted && status != kIOReturnUnderrun)
-        LogOzzyKext("pipe 0x%02x error: 0x%x", ctx->pipeID, status);
+
+    KextBus* bus = ctx->busInstance;
+
+    /*
+    // --- DIAGNOSTIC LOGGING ---
+    static int sTotalCallbacks = 0;
+    sTotalCallbacks++;
+
+    // Log the first 50 callbacks of ANY kind immediately
+    if (sTotalCallbacks < 50) {
+        ozzy_log("Callback #%d | Pipe: 0x%02X | Status: 0x%x | Bytes: %u", 
+              sTotalCallbacks, ctx->pipeID, status, bytesTransferred);
+    }
+    */
+    // Log errors immediately
+    if (status != kIOReturnSuccess && status != kIOReturnAborted) {
+        ozzy_log("pipe 0x%02x error: 0x%x", ctx->pipeID, status);
+    }
+    // ---------------------------
+
+    // 1. RELEASE SLICE (Zero Copy Cleanup)
     if (ctx->slice) {
-        ctx->slice->complete((ctx->pipeID & 0x80) ? kIODirectionIn : kIODirectionOut);
+        IODirection dir = (ctx->pipeID & 0x80) ? kIODirectionIn : kIODirectionOut;
+        ctx->slice->complete(dir);
         ctx->slice->release();
     }
-    KextBus::Completion c = { ctx->pipeID, false, ctx->userContext, KextTransferStatus(ctx->pipeID, status),
-                              bytesTransferred, nullptr };
+
+    // 2. Extract Info
+    void* originalUserContext = ctx->userContext;
+    uint8_t pipeID = ctx->pipeID;
+    delete ctx; 
+
+    /*
+    // 3. Keep the Heartbeat for long-term monitoring
+    if (status == kIOReturnSuccess && pipeID == 0x05) {
+        if ((sTotalCallbacks % 4000) == 0) { 
+            ozzy_log("Stream Running (Count: %d)", sTotalCallbacks);
+        }
+    }
+    */
+
+    // 4. NOTIFY ENGINE
+    if (bus) {
+        bus->NoteCompletion(pipeID);
+        struct ozzy_engine* engine = bus->GetEngine();
+        if (engine) {
+            ozzy_engine_complete(engine, pipeID, originalUserContext, status, bytesTransferred);
+        }
+    }
+}
+
+// --- Isochronous transfers ---
+/* macOS 12 added the transaction io() (IOUSBHostPipe slot 50): every packet has its own offset
+ * and may wrap. Older kernels only have the frame io() (deprecated since), whose frames sit back
+ * to back in the memory descriptor. Calling slot 50 on an older kernel panics, so the transaction
+ * io() needs both an SDK that declares it and a kernel that has it (Darwin 21). */
+static bool UseIsocTransactions() {
+#ifdef __MAC_12_0
+    return version_major >= 21;
+#else
+    return false;
+#endif
+}
+
+struct IsocContext {
+    IOMemoryDescriptor* slice;
+    void* userContext;
+    uint8_t pipeID;
+    KextBus* busInstance;
+    struct ozzy_isoc_packet* packets;
+    uint32_t count;
+    union {
+#ifdef __MAC_12_0
+        IOUSBHostIsochronousTransaction transactions[OZZY_MAX_ISOC_PACKETS];
+#endif
+        IOUSBHostIsochronousFrame frames[OZZY_MAX_ISOC_PACKETS];
+    };
+};
+
+/* Release the slice, then hand the packets (results copied in) to the engine */
+static void KextBus_IsocFinish(IsocContext* ctx, IOReturn status) {
+    if (status != kIOReturnSuccess && status != kIOReturnAborted)
+        ozzy_log("isoc pipe 0x%02x error: 0x%x", ctx->pipeID, status);
+
+    IODirection dir = (ctx->pipeID & 0x80) ? kIODirectionIn : kIODirectionOut;
+    ctx->slice->complete(dir);
+    ctx->slice->release();
+
     KextBus* bus = ctx->busInstance;
+    void* userContext = ctx->userContext;
+    uint8_t pipeID = ctx->pipeID;
+    struct ozzy_isoc_packet* packets = ctx->packets;
+    uint32_t count = ctx->count;
     delete ctx;
-    bus->Post(c);
+
+    if (bus) bus->NoteCompletion(pipeID);
+    struct ozzy_engine* engine = bus ? bus->GetEngine() : nullptr;
+    if (engine) ozzy_engine_isoc_complete(engine, pipeID, userContext, status, packets, count);
 }
 
-static void KextBus_IsochCompletion(void* owner, void* parameter, IOReturn status,
-                                    IOUSBHostIsochronousTransaction* txns)
-{
-    KextBus* bus = (KextBus*)owner;
-    KextBus::IsochSlot* s = (KextBus::IsochSlot*)parameter;
-    bus->EnterCallback();
-    for (uint32_t i = 0; i < s->count; i++) {
-        /* Never report more than was asked for; the engine sizes reads by it. */
-        uint32_t got = txns[i].completeCount;
-        s->frames[i].actCount = (uint16_t)(got < s->frames[i].reqCount ? got : s->frames[i].reqCount);
-        s->frames[i].status = KextTransferStatus(s->pipe, txns[i].status);
+#ifdef __MAC_12_0
+/* Copy each transaction's result back to the engine's packets */
+static void KextBus_IsocCompletion(void* owner, void* parameter, IOReturn status,
+                                   IOUSBHostIsochronousTransaction* transactions) {
+    IsocContext* ctx = (IsocContext*)parameter;
+    if (!ctx) return;
+    for (uint32_t i = 0; i < ctx->count; i++) {
+        ctx->packets[i].actual = ctx->transactions[i].completeCount;
+        ctx->packets[i].status = ctx->transactions[i].status;
+        memcpy(&ctx->packets[i].time, &ctx->transactions[i].timeStamp, sizeof(uint64_t));
     }
-    KextBus::Completion c = { s->pipe, true, s->ctx, KextTransferStatus(s->pipe, status), 0, s };
-    bus->Post(c);
+    KextBus_IsocFinish(ctx, status);
 }
+#endif
 
-KextBus::KextBus(IOUSBHostDevice* device, IOService* driver)
-    : mDevice(device), mDriver(driver), mEngine(nullptr), mMainShmDesc(nullptr), mShmBase(0), mShmSize(0),
-      mPipeCount(0), mBufferCount(0), mDepth(0), mQueueHead(0), mQueueLen(0), mOutstanding(0),
-      mInCallbacks(0)
-{
-    bzero(mPipes, sizeof(mPipes));
-    bzero(mBuffers, sizeof(mBuffers));
-    bzero(mIsoch, sizeof(mIsoch));
-    mLock = IORecursiveLockAlloc();
-    mQueueLock = IOSimpleLockAlloc();
-}
-
-KextBus::~KextBus()
-{
-    ClearPipes();
-    if (Busy()) {
-        LogOzzyKext("transfers still outstanding: leaking the bus locks");
-        return;
+/* Copy each frame's result back to the engine's packets */
+static void KextBus_IsocFrameCompletion(void* owner, void* parameter, IOReturn status,
+                                        IOUSBHostIsochronousFrame* frames) {
+    IsocContext* ctx = (IsocContext*)parameter;
+    if (!ctx) return;
+    for (uint32_t i = 0; i < ctx->count; i++) {
+        ctx->packets[i].actual = ctx->frames[i].completeCount;
+        ctx->packets[i].status = ctx->frames[i].status;
+        memcpy(&ctx->packets[i].time, &ctx->frames[i].timeStamp, sizeof(uint64_t));
     }
-    if (mQueueLock) IOSimpleLockFree(mQueueLock);
-    if (mLock) IORecursiveLockFree(mLock);
+    KextBus_IsocFinish(ctx, status);
 }
 
-void KextBus::SetEngine(OzzyEngine* engine) { mEngine = engine; }
-OzzyEngine* KextBus::GetEngine() { return mEngine; }
+// --- Class Implementation ---
 
-void KextBus::SetSharedMemory(IOBufferMemoryDescriptor* mainDesc, void* virtBase)
-{
-    mMainShmDesc = mainDesc;
-    mShmBase = (uintptr_t)virtBase;
-    mShmSize = mainDesc ? mainDesc->getLength() : 0;
+// --- struct ozzy_bus_ops: the engine's calls, to the methods ---
+static bool OpsSubmit(void* ctx, uint8_t pipe, void* buf, uint32_t size, void* xfer) {
+    return ((KextBus*)ctx)->SubmitUSBPacket(pipe, buf, size, xfer);
+}
+static bool OpsSubmitIsoc(void* ctx, uint8_t pipe, void* buf, uint32_t bufSize, struct ozzy_isoc_packet* packets,
+                          uint32_t count, void* xfer) {
+    return ((KextBus*)ctx)->SubmitIsoc(pipe, buf, bufSize, packets, count, xfer);
+}
+static bool OpsControl(void* ctx, uint8_t type, uint8_t req, uint16_t val, uint16_t idx, void* data, uint16_t len) {
+    return ((KextBus*)ctx)->VendorRequest(type, req, val, idx, data, len);
+}
+static int OpsClearHalt(void* ctx, uint8_t endpoint) { return ((KextBus*)ctx)->ClearHalt(endpoint); }
+static bool OpsStartTimer(void* ctx, uint32_t intervalUs) { return ((KextBus*)ctx)->StartTimer(intervalUs); }
+static void OpsStopTimer(void* ctx) { ((KextBus*)ctx)->StopTimer(); }
+static void OpsSleep(void* ctx, unsigned int ms) { ((KextBus*)ctx)->Sleep(ms); }
+static uint64_t OpsTime(void* ctx) { return ((KextBus*)ctx)->GetTime(); }
+static void OpsAbort(void* ctx) { ((KextBus*)ctx)->Abort(); }
+/* The interfaces and pipes are the driver's (OzzyKext::Reselect) */
+static bool OpsReselect(void* ctx, const uint8_t alts[4]) { return ((KextBus*)ctx)->Reselect(alts); }
+static uint64_t OpsTimeHz(void* ctx) {
+    uint64_t ticks = 0;
+    nanoseconds_to_absolutetime(1000000000ULL, &ticks);   // mach_absolute_time ticks a second
+    return ticks;
 }
 
-bool KextBus::AddPipe(uint8_t address, IOUSBHostPipe* pipe)
-{
-    if (!pipe || mPipeCount >= kMaxPipes) return false;
-    const StandardUSB::EndpointDescriptor* d = pipe->getEndpointDescriptor();
-    PipeEntry& e = mPipes[mPipeCount++];
-    e = PipeEntry();
-    e.address = address;
-    e.pipe = pipe;
-    e.maxPacket = d ? (d->wMaxPacketSize & 0x7FF) : 0;
-    /* High-speed periodic interval: 2^(bInterval-1) microframes */
-    e.intervalUframes = (d && d->bInterval >= 1 && d->bInterval <= 16) ? (1u << (d->bInterval - 1)) : 8;
+// No PCM rings on macOS: the HAL writes the shared memory itself. No stats_changed: the HAL
+// reads the stats from the shared memory and tells its clients (OzzyHAL's monitor thread).
+const struct ozzy_bus_ops KextBus::sOps = {
+    OpsSubmit, OpsSubmitIsoc, OpsControl, OpsClearHalt, OpsStartTimer, OpsStopTimer, nullptr, OpsSleep, OpsTime,
+    OpsAbort, OpsTimeHz, nullptr, OpsReselect
+};
+
+KextBus::KextBus(IOUSBHostDevice* device, IOService* driver) 
+    : mDevice(device), mDriver(driver), mPipes(nullptr), mPipeCount(0), mEngine(nullptr), mMainShmDesc(nullptr), mShmBase(0) {
+    for (int i = 0; i < kPipeSlots; i++) mPipeByAddress[i] = nullptr;
+    for (int i = 0; i < kPipeSlots; i++) mIsocNextFrame[i] = 0;
+    for (int i = 0; i < kPipeSlots; i++) mLastDone[i] = 0;
+    for (int i = 0; i < kPipeSlots; i++) mSubmitted[i] = false;
+    mOzzyBus.ops = &sOps;
+    mOzzyBus.ctx = this;
+}
+
+KextBus::~KextBus() {
+    StopTimer();
+    if (mTimer) thread_call_free(mTimer);
+}
+
+bool KextBus::StartTimer(uint32_t intervalUs) {
+    // _with_priority is private KPI, _with_options is public (com.apple.kpi.mach)
+    if (!mTimer) mTimer = thread_call_allocate_with_options(&KextBus::TimerFired, this, THREAD_CALL_PRIORITY_HIGH, 0);
+    if (!mTimer) return false;
+    nanoseconds_to_absolutetime((uint64_t)intervalUs * 1000, &mTimerInterval);
+    mTimerDeadline = mach_absolute_time() + mTimerInterval;
+    mTimerOn = true;
+    mTimerArmed = true;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    thread_call_enter_delayed(mTimer, mTimerDeadline);
     return true;
 }
 
-KextBus::PipeEntry* KextBus::FindPipe(uint8_t address)
-{
-    for (uint32_t i = 0; i < mPipeCount; i++)
-        if (mPipes[i].address == address) return &mPipes[i];
-    return nullptr;
+void KextBus::StopTimer() {
+    mTimerOn = false;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (!mTimer) return;
+    // A cancelled call never runs; one already dequeued runs, sees mTimerOn false and doesn't
+    // re-arm. Wait until neither is left.
+    for (;;) {
+        if (thread_call_cancel(mTimer)) mTimerArmed = false;
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        if (!mTimerArmed && !mTimerBusy) break;
+        IOSleep(1);
+    }
 }
 
-void KextBus::ClearPipes()
-{
-    /* In-flight transfers may still reference the descriptors: leak them. */
-    if (Busy()) {
-        LogOzzyKext("%d transfers outstanding: leaking %u buffer descriptors",
-                    (int)__atomic_load_n(&mOutstanding, __ATOMIC_SEQ_CST), mBufferCount);
-    } else {
-        for (uint32_t i = 0; i < mBufferCount; i++) {
-            mBuffers[i].md->complete();
-            mBuffers[i].md->release();
-        }
+void KextBus::TimerFired(thread_call_param_t param, thread_call_param_t) {
+    KextBus* bus = (KextBus*)param;
+    bus->mTimerBusy = true;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    bus->mTimerArmed = false;
+    if (!bus->mTimerOn) {
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        bus->mTimerBusy = false;
+        return;
     }
-    mBufferCount = 0;
-    mPipeCount = 0;
+    if (bus->mEngine) ozzy_engine_timer(bus->mEngine);
+
+    // Next deadline from the last one; if we fell behind, skip to the next one ahead
+    uint64_t now = mach_absolute_time();
+    bus->mTimerDeadline += bus->mTimerInterval;
+    if (bus->mTimerDeadline <= now) bus->mTimerDeadline = now + bus->mTimerInterval;
+    if (bus->mTimerOn) {
+        bus->mTimerArmed = true;
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        thread_call_enter_delayed(bus->mTimer, bus->mTimerDeadline);
+    }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    bus->mTimerBusy = false;
 }
 
-/* A prepared descriptor over an engine-owned buffer, created once and reused.
- * Engine buffers live as long as the engine, which outlives the pipes. */
-IOMemoryDescriptor* KextBus::DescriptorFor(void* buffer, uint32_t len, uint8_t pipeID)
-{
-    for (uint32_t i = 0; i < mBufferCount; i++)
-        if (mBuffers[i].addr == buffer && mBuffers[i].len >= len) return mBuffers[i].md;
-    if (mBufferCount >= kMaxBuffers) {
-        LogOzzyKext("too many transfer buffers");
-        return nullptr;
+/* Index pipes by endpoint address so SubmitUSBPacket finds them without searching. Pipes
+ * renewed (a reselect) start their isochronous schedule afresh. */
+void KextBus::SetPipePool(IOUSBHostPipe** pipes, int count) {
+    mPipes = pipes;
+    mPipeCount = count;
+    for (int i = 0; i < kPipeSlots; i++) mPipeByAddress[i] = nullptr;
+    for (int i = 0; i < kPipeSlots; i++) mIsocNextFrame[i] = 0;
+    for (int i = 0; i < count; i++) {
+        if (!pipes[i]) continue;
+        const StandardUSB::EndpointDescriptor* d = pipes[i]->getEndpointDescriptor();
+        if (d) mPipeByAddress[PipeSlot(d->bEndpointAddress)] = pipes[i];
     }
-    IODirection dir = (pipeID & 0x80) ? kIODirectionIn : kIODirectionOut;
-    IOMemoryDescriptor* md = IOMemoryDescriptor::withAddress(buffer, len, dir);
-    if (!md) return nullptr;
-    if (md->prepare(dir) != kIOReturnSuccess) {
-        md->release();
-        return nullptr;
-    }
-    mBuffers[mBufferCount++] = { buffer, len, md };
-    return md;
 }
 
-bool KextBus::SubmitUSBPacket(uint8_t pipeID, void* buffer, uint32_t size, void* contextID)
-{
-    PipeEntry* pe = FindPipe(pipeID);
-    if (!pe) return false;
-    IODirection dir = (pipeID & 0x80) ? kIODirectionIn : kIODirectionOut;
+bool KextBus::Reselect(const uint8_t alts[4]) {
+    OzzyKext* driver = OSDynamicCast(OzzyKext, mDriver);
+    return driver && driver->Reselect(alts);
+}
+
+void KextBus::WatchReset() {
+    uint64_t now = mach_absolute_time();
+    for (int i = 0; i < kPipeSlots; i++) mLastDone[i] = now;
+    for (int i = 0; i < kPipeSlots; i++) mSubmitted[i] = false;
+}
+
+void KextBus::SetEngine(struct ozzy_engine* engine) {
+    mEngine = engine;
+}
+
+// NEW: Store the Master Descriptor references
+void KextBus::SetSharedMemory(IOBufferMemoryDescriptor* mainDesc, void* virtBase) {
+    mMainShmDesc = mainDesc;
+    mShmBase = (uintptr_t)virtBase;
+}
+
+struct ozzy_engine* KextBus::GetEngine() {
+    return mEngine;
+}
+
+IOUSBHostPipe* KextBus::FindPipe(uint8_t address) {
+    return mPipeByAddress[PipeSlot(address)];
+}
+
+bool KextBus::SubmitUSBPacket(uint8_t pipeID, void* buffer, uint32_t size, void* contextID) {
+    IOUSBHostPipe* pipe = FindPipe(pipeID);
+    if (!pipe) return false;
+    
+    // Safety check: Ensure we have the master memory configured
+    if (!mMainShmDesc || mShmBase == 0) return false;
+
+    // 1. Calculate Offset (Zero Copy Logic)
     uintptr_t ptr = (uintptr_t)buffer;
-    IOMemoryDescriptor* md;
-    IOMemoryDescriptor* slice = nullptr;
+    IOByteCount offset = ptr - mShmBase;
 
-    if (mMainShmDesc && ptr >= mShmBase && ptr + size <= mShmBase + mShmSize) {
-        // Zero copy: a sub-descriptor viewing the shared memory
-        slice = IOSubMemoryDescriptor::withSubRange(mMainShmDesc, ptr - mShmBase, size, dir);
-        if (!slice) return false;
-        slice->prepare(dir);
-        md = slice;
-    } else {
-        md = DescriptorFor(buffer, size, pipeID);
-        if (!md) return false;
-    }
+    IODirection dir = (pipeID & 0x80) ? kIODirectionIn : kIODirectionOut;
+    
+    // 2. Create Sub-Descriptor (The Slice)
+    // Uses IOSubMemoryDescriptor to view existing memory. No allocations, no copies.
+    IOSubMemoryDescriptor* slice = IOSubMemoryDescriptor::withSubRange(
+        mMainShmDesc, offset, size, dir);
+    
+    if (!slice) return false;
+    
+    // 3. Prepare DMA
+    if (slice->prepare(dir) != kIOReturnSuccess) { slice->release(); return false; }
 
+    // 4. Create Context (Keep 'slice' alive)
     TransferContext* ctx = new TransferContext;
-    if (!ctx) {
-        if (slice) { slice->complete(dir); slice->release(); }
-        return false;
-    }
+    if (!ctx) { slice->complete(dir); slice->release(); return false; }
+    
     ctx->slice = slice;
     ctx->userContext = contextID;
     ctx->pipeID = pipeID;
     ctx->busInstance = this;
-
+    
     IOUSBHostCompletion completion;
     completion.owner = this;
-    completion.action = &KextBus_BulkCompletion;
+    completion.action = &KextBus_GlobalCompletion;
     completion.parameter = ctx;
-
-    __atomic_add_fetch(&mOutstanding, 1, __ATOMIC_SEQ_CST);
-    IOReturn err = pe->pipe->io(md, size, &completion, 0);
+    
+    // 5. Submit
+    IOReturn err = pipe->io(slice, size, &completion, 0);
+    
     if (err != kIOReturnSuccess) {
-        __atomic_sub_fetch(&mOutstanding, 1, __ATOMIC_SEQ_CST);
-        if (slice) { slice->complete(dir); slice->release(); }
+        slice->complete(dir);
+        slice->release();
         delete ctx;
         return false;
     }
+    mSubmitted[PipeSlot(pipeID)] = true;
     return true;
 }
 
-/* Called with the engine lock held (from Start or an engine callback). */
-bool KextBus::SubmitIsochPacket(uint8_t pipeID, void* buffer, OzzyIsochFrame* frames, uint32_t frameCount, void* contextID)
-{
-    PipeEntry* pe = FindPipe(pipeID);
-    if (!pe || frameCount == 0 || frameCount > kMaxIsochTxns || pe->maxPacket == 0) return false;
-    uint32_t uframes = frameCount * pe->intervalUframes;
-    if (uframes % 8) {
-        LogOzzyKext("pipe 0x%02x: %u intervals is not a whole number of frames", pipeID, frameCount);
-        return false;
-    }
-    IOMemoryDescriptor* md = DescriptorFor(buffer, frameCount * pe->maxPacket, pipeID);
-    if (!md) return false;
+/* Zero copy like SubmitUSBPacket: the packets point into a slice of the shared memory.
+ * A packet that runs past the end of the buffer wraps to its start (XHCI). */
+bool KextBus::SubmitIsoc(uint8_t pipeID, void* buffer, uint32_t bufferSize,
+                         struct ozzy_isoc_packet* packets, uint32_t count, void* contextID) {
+    IOUSBHostPipe* pipe = FindPipe(pipeID);
+    if (!pipe || !mMainShmDesc || mShmBase == 0 || count == 0 || count > OZZY_MAX_ISOC_PACKETS) return false;
 
-    IsochSlot* s = nullptr;
-    for (uint32_t i = 0; i < kMaxIsochSlots && !s; i++)
-        if (!mIsoch[i].used) s = &mIsoch[i];
-    if (!s) {
-        LogOzzyKext("no free isoch slot");
-        return false;
-    }
+    IODirection dir = (pipeID & 0x80) ? kIODirectionIn : kIODirectionOut;
+    bool transactions = UseIsocTransactions();
+    IOMemoryDescriptor* slice = transactions
+        ? IOSubMemoryDescriptor::withSubRange(mMainShmDesc, (uintptr_t)buffer - mShmBase, bufferSize, dir)
+        : IsocFrameSlice(pipeID, buffer, bufferSize, packets, count, dir);
+    if (!slice) return false;
+    if (slice->prepare(dir) != kIOReturnSuccess) { slice->release(); return false; }
 
-    uint32_t off = 0;
-    for (uint32_t i = 0; i < frameCount; i++) {
-        /* Keeps every packed offset inside the frameCount * maxPacket descriptor */
-        if (frames[i].reqCount > pe->maxPacket) {
-            LogOzzyKext("pipe 0x%02x: interval of %u bytes exceeds %u", pipeID, frames[i].reqCount, pe->maxPacket);
-            return false;
+    IsocContext* ctx = new IsocContext;
+    if (!ctx) { slice->complete(dir); slice->release(); return false; }
+    ctx->slice = slice;
+    ctx->userContext = contextID;
+    ctx->pipeID = pipeID;
+    ctx->busInstance = this;
+    ctx->packets = packets;
+    ctx->count = count;
+
+    uint64_t frame = IsocFrameNumber(pipe, pipeID, count);
+    IOReturn err;
+#ifdef __MAC_12_0
+    if (transactions) {
+        for (uint32_t i = 0; i < count; i++) {
+            IOUSBHostIsochronousTransaction& t = ctx->transactions[i];
+            memset(&t, 0, sizeof(t));
+            t.requestCount = packets[i].length;
+            t.offset = packets[i].offset;
+            t.options = (packets[i].offset + packets[i].length > bufferSize) ? kIsochronousTransactionOptionsWrap
+                                                                            : kIsochronousTransactionOptionsNone;
         }
-        s->txn[i] = IOUSBHostIsochronousTransaction();
-        s->txn[i].requestCount = frames[i].reqCount;
-        s->txn[i].offset = off;
-        off += frames[i].reqCount;
-    }
-    if (!pe->running) {
-        pe->nextFrame = mDevice->getFrameNumber() + kIsochLeadFrames;
-        pe->running = true;
-    }
-    s->used = true;
-    s->pipe = pipeID;
-    s->ctx = contextID;
-    s->frames = frames;
-    s->count = frameCount;
-    s->startFrame = pe->nextFrame;
 
-    IOUSBHostIsochronousTransactionCompletion completion;
-    completion.owner = this;
-    completion.action = &KextBus_IsochCompletion;
-    completion.parameter = s;
+        IOUSBHostIsochronousTransactionCompletion completion;
+        completion.owner = this;
+        completion.action = &KextBus_IsocCompletion;
+        completion.parameter = ctx;
+        err = pipe->io(slice, ctx->transactions, count, frame, kIsochronousTransferOptionsNone, &completion);
+    } else
+#endif
+    {
+        for (uint32_t i = 0; i < count; i++) {
+            IOUSBHostIsochronousFrame& f = ctx->frames[i];
+            memset(&f, 0, sizeof(f));
+            f.requestCount = packets[i].length;
+        }
 
-    __atomic_add_fetch(&mOutstanding, 1, __ATOMIC_SEQ_CST);
-    IOReturn err = pe->pipe->io(md, s->txn, frameCount, s->startFrame, kIsochronousTransferOptionsNone, &completion);
+        IOUSBHostIsochronousCompletion completion;
+        completion.owner = this;
+        completion.action = &KextBus_IsocFrameCompletion;
+        completion.parameter = ctx;
+        err = pipe->io(slice, ctx->frames, count, frame, &completion);
+    }
     if (err != kIOReturnSuccess) {
-        __atomic_sub_fetch(&mOutstanding, 1, __ATOMIC_SEQ_CST);
-        s->used = false;
-        pe->running = false;   /* the next submit starts a fresh run */
-        LogOzzyKext("pipe 0x%02x isoch submit at frame %llu failed: 0x%x", pipeID, s->startFrame, err);
+        ozzy_log("isoc pipe 0x%02x submit failed: 0x%x", pipeID, err);
+        mIsocNextFrame[PipeSlot(pipeID)] = frame;
+        slice->complete(dir);
+        slice->release();
+        delete ctx;
         return false;
     }
-    pe->nextFrame += uframes / 8;
+    mSubmitted[PipeSlot(pipeID)] = true;
     return true;
 }
 
-bool KextBus::GetBusFrame(uint64_t* frame, uint64_t* hostTime)
-{
-    AbsoluteTime t = 0;
-    uint64_t f = mDevice->getFrameNumber(&t);
-    if (f == 0 || t == 0) return false;
-    *frame = f;
-    *hostTime = t;
-    return true;
+/* Where an isochronous transfer of @count packets starts, for either io(). Frame number 0 (as soon
+ * as possible) is XHCI only, so like the EMU USB audio kext each transfer starts where the pipe's
+ * previous one ended, the first kIsocStartFrames ahead of the bus. Frame numbers count 1 ms
+ * frames, a packet is one service interval (a microframe at High Speed bInterval 1); the engine's
+ * transfers fill whole frames (ISOC_TRANSFER_UFRAMES). */
+uint64_t KextBus::IsocFrameNumber(IOUSBHostPipe* pipe, uint8_t pipeID, uint32_t count) {
+    const StandardUSB::EndpointDescriptor* d = pipe->getEndpointDescriptor();
+    uint32_t intervals = count << ((d && d->bInterval ? d->bInterval : 1) - 1);
+    uint64_t frames = mDevice->getSpeed() >= kUSBHostConnectionSpeedHigh ? (intervals + 7) / 8 : intervals;
+
+    uint64_t now = mDevice->getFrameNumber();
+    uint64_t& next = mIsocNextFrame[PipeSlot(pipeID)];
+    if (next <= now) next = now + kIsocStartFrames;  /* the first transfer, or the pipe ran dry */
+    uint64_t first = next;
+    next += frames;
+    return first;
 }
 
-void KextBus::Post(const Completion& c)
-{
-    bool dropped = false;
-    IOSimpleLockLock(mQueueLock);
-    if (mQueueLen < kQueueLen) {
-        mQueue[(mQueueHead + mQueueLen) % kQueueLen] = c;
-        mQueueLen++;
-    } else {
-        dropped = true;
-    }
-    IOSimpleLockUnlock(mQueueLock);
-    if (dropped) {
-        __atomic_sub_fetch(&mOutstanding, 1, __ATOMIC_SEQ_CST);
-        LogOzzyKext("completion queue full; dropping pipe 0x%02x", c.pipe);
-    } else if (IORecursiveLockTryLock(mLock)) {
-        /* Deliver now unless another thread holds the engine lock; that
-         * thread delivers it in Unlock(). */
-        mDepth++;
-        Unlock();
-    }
-    /* The callback's last access to the bus */
-    __atomic_sub_fetch(&mInCallbacks, 1, __ATOMIC_SEQ_CST);
-}
-
-void KextBus::EnterCallback()
-{
-    __atomic_add_fetch(&mInCallbacks, 1, __ATOMIC_SEQ_CST);
-}
-
-/* A callback enters before it queues and leaves after its delivery, so once
- * mOutstanding reads 0 any callback still running shows in mInCallbacks. */
-bool KextBus::Busy()
-{
-    if (__atomic_load_n(&mOutstanding, __ATOMIC_SEQ_CST) != 0) return true;
-    return __atomic_load_n(&mInCallbacks, __ATOMIC_SEQ_CST) != 0;
-}
-
-bool KextBus::PopQueued(Completion* c)
-{
-    bool got = false;
-    IOSimpleLockLock(mQueueLock);
-    if (mQueueLen) {
-        *c = mQueue[mQueueHead];
-        mQueueHead = (mQueueHead + 1) % kQueueLen;
-        mQueueLen--;
-        got = true;
-    }
-    IOSimpleLockUnlock(mQueueLock);
-    return got;
-}
-
-void KextBus::Dispatch(const Completion& c)
-{
-    if (c.isoch) {
-        IsochSlot* s = c.slot;
-        uint8_t pipe = s->pipe;
-        void* ctx = s->ctx;
-        uint64_t start = s->startFrame;
-        OzzyIsochFrame* frames = s->frames;
-        uint32_t count = s->count;
-        s->used = false;   /* free before the engine resubmits */
-        if (mEngine) mEngine->OnIsochComplete(pipe, ctx, c.status, start, frames, count);
-    } else if (mEngine) {
-        mEngine->OnPacketComplete(c.pipe, c.ctx, c.status, c.bytes);
-    }
-    __atomic_sub_fetch(&mOutstanding, 1, __ATOMIC_SEQ_CST);
-}
-
-void KextBus::Lock()
-{
-    IORecursiveLockLock(mLock);
-    mDepth++;
-}
-
-/* At depth 1, deliver everything queued before releasing, then re-check:
- * a completion may have queued after our last pop and failed its try-lock
- * while we still held the lock. Nested unlocks never deliver and return at
- * once (the outer holder's drain picks up anything they queued), so the
- * engine is never re-entered from inside one of its own calls. */
-void KextBus::Unlock()
-{
-    for (;;) {
-        bool outermost = mDepth == 1;
-        if (outermost) {
-            Completion c;
-            while (PopQueued(&c)) Dispatch(c);
+/* The frame io() reads the frames back to back from the descriptor, so it gets exactly the
+ * packets' bytes: from the first packet's offset on, continued at the buffer's start if they
+ * wrap (the ring's tail and head as one descriptor). Fails for packets that aren't contiguous. */
+IOMemoryDescriptor* KextBus::IsocFrameSlice(uint8_t pipeID, void* buffer, uint32_t bufferSize,
+                                            const struct ozzy_isoc_packet* packets, uint32_t count,
+                                            IODirection dir) {
+    uint32_t start = packets[0].offset;
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (packets[i].offset != (start + total) % bufferSize) {
+            ozzy_log("isoc pipe 0x%02x: packet %u not contiguous, the frame io() can't send it", pipeID, i);
+            return nullptr;
         }
-        mDepth--;
-        IORecursiveLockUnlock(mLock);
-        if (!outermost) return;
-        IOSimpleLockLock(mQueueLock);
-        bool more = mQueueLen > 0;
-        IOSimpleLockUnlock(mQueueLock);
-        if (!more || !IORecursiveLockTryLock(mLock)) return;
-        mDepth++;
+        total += packets[i].length;
     }
+    if (start >= bufferSize || total > bufferSize) return nullptr;
+
+    IOByteCount base = (uintptr_t)buffer - mShmBase;
+    if (total == 0)  /* only empty frames: they read nothing, any descriptor will do */
+        return IOSubMemoryDescriptor::withSubRange(mMainShmDesc, base, bufferSize, dir);
+    if (start + total <= bufferSize)
+        return IOSubMemoryDescriptor::withSubRange(mMainShmDesc, base + start, total, dir);
+
+    IOMemoryDescriptor* parts[2] = {
+        IOSubMemoryDescriptor::withSubRange(mMainShmDesc, base + start, bufferSize - start, dir),
+        IOSubMemoryDescriptor::withSubRange(mMainShmDesc, base, start + total - bufferSize, dir),
+    };
+    IOMemoryDescriptor* slice = (parts[0] && parts[1])
+        ? IOMultiMemoryDescriptor::withDescriptors(parts, 2, dir, false) : nullptr;
+    if (parts[0]) parts[0]->release();
+    if (parts[1]) parts[1]->release();
+    return slice;
 }
 
-bool KextBus::AbortAndDrain(uint32_t timeoutMs)
-{
-    /* Returns once each aborted transfer's callback has run */
-    for (uint32_t i = 0; i < mPipeCount; i++) {
-        IOReturn err = mPipes[i].pipe->abort(IOUSBHostIOSource::kAbortSynchronous, kIOReturnAborted, nullptr);
-        if (err != kIOReturnSuccess)
-            LogOzzyKext("pipe 0x%02x abort failed: 0x%x", mPipes[i].address, err);
-    }
-    Lock();
-    Unlock();   /* deliver anything queued while nobody held the lock */
-    for (uint32_t t = 0; t < timeoutMs && Busy(); t++) {
-        IOSleep(1);
-        Lock();
-        Unlock();
-    }
-    for (uint32_t i = 0; i < mPipeCount; i++)
-        mPipes[i].running = false;
-    if (Busy()) {
-        LogOzzyKext("%d transfers, %d callbacks still outstanding after %u ms",
-                    (int)__atomic_load_n(&mOutstanding, __ATOMIC_SEQ_CST),
-                    (int)__atomic_load_n(&mInCallbacks, __ATOMIC_SEQ_CST), timeoutMs);
-        return false;
-    }
-    return true;
-}
-
-bool KextBus::VendorRequest(uint8_t type, uint8_t req, uint16_t val, uint16_t idx, void* data, uint16_t len)
-{
+bool KextBus::VendorRequest(uint8_t type, uint8_t req, uint16_t val, uint16_t idx, void* data, uint16_t len) {
     if (!mDevice || !mDriver) return false;
+    
     StandardUSB::DeviceRequest dr;
     dr.bmRequestType = type;
     dr.bRequest = req;
     dr.wValue = val;
     dr.wIndex = idx;
     dr.wLength = len;
+    
     uint32_t bytesTransferred = 0;
+    
     // Use Raw Pointer (Fixed 0 Samplerate issue)
     IOReturn err = mDevice->deviceRequest(mDriver, dr, data, bytesTransferred, 5000);
+    
     return (err == kIOReturnSuccess);
+}
+
+/* CLEAR_FEATURE(ENDPOINT_HALT) to the device and a reset of the host side of the pipe */
+int KextBus::ClearHalt(uint8_t address) {
+    IOUSBHostPipe* pipe = FindPipe(address);
+    if (!pipe) return -ENODEV;
+    IOReturn err = pipe->clearStall(true);
+    return err == kIOReturnSuccess ? 0 : -EIO;
+}
+
+/* Every pipe, synchronously: the completions have run (kIOReturnAborted) when it returns */
+void KextBus::Abort() {
+    for (int i = 0; i < mPipeCount; i++) {
+        if (mPipes[i]) mPipes[i]->abort(IOUSBHostIOSource::kAbortSynchronous);
+    }
 }
 
 void KextBus::Sleep(uint32_t ms) { IOSleep(ms); }
 uint64_t KextBus::GetTime() { return mach_absolute_time(); }
 
-void KextBus::Log(const char* fmt, ...)
-{
-    va_list args;
-    va_start(args, fmt);
-    IOLogv(fmt, args);
-    va_end(args);
-}
+// Stub
+void KextBus::StaticCompletion(void* owner, void* parameter, IOReturn status, uint32_t bytesTransferred) {}

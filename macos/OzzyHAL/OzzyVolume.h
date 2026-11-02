@@ -1,49 +1,64 @@
 /* SPDX-License-Identifier: MIT */
-#pragma once
-#include <cmath>
-#include <cstdint>
+/*
+ * The output volume curve of OzzyHAL's volume control. The scalar that the menu bar slider and
+ * the volume keys move is linear in decibels across [OZZY_VOLUME_MIN_DB, OZZY_VOLUME_MAX_DB],
+ * so each step changes the level by the same amount; scalar 0 is silence rather than
+ * OZZY_VOLUME_MIN_DB. C, usable from C++ (OzzyHAL) and the host tests (tests/test_volume.c).
+ */
 
-/* Output volume curve for the HAL's volume control. The scalar the menu bar
- * slider and volume keys move is linear in decibels across
- * [kOzzyVolumeMinDB, kOzzyVolumeMaxDB], so each step changes the level by the
- * same amount. Scalar 0 is silence rather than kOzzyVolumeMinDB. */
-constexpr float kOzzyVolumeMinDB = -60.0f;
-constexpr float kOzzyVolumeMaxDB = 0.0f;
+#ifndef OZZY_VOLUME_H
+#define OZZY_VOLUME_H
 
-/* Clamps to [0, 1]; NaN reads as 0. */
-inline float OzzyVolumeClampScalar(float scalar)
+#include <math.h>
+#include <stdint.h>
+
+static const float ozzy_volume_min_db = -60.0f;
+static const float ozzy_volume_max_db = 0.0f;
+
+/* @scalar clamped to [0, 1]; NaN reads as 0 */
+static inline float ozzy_volume_clamp(float scalar)
 {
-	if (!(scalar > 0.0f)) return 0.0f;
+	if (!(scalar > 0.0f))
+		return 0.0f;
 	return scalar < 1.0f ? scalar : 1.0f;
 }
 
-inline float OzzyVolumeScalarToDB(float scalar)
+static inline float ozzy_volume_scalar_to_db(float scalar)
 {
-	return kOzzyVolumeMinDB + OzzyVolumeClampScalar(scalar) * (kOzzyVolumeMaxDB - kOzzyVolumeMinDB);
+	return ozzy_volume_min_db + ozzy_volume_clamp(scalar) * (ozzy_volume_max_db - ozzy_volume_min_db);
 }
 
-inline float OzzyVolumeDBToScalar(float db)
+static inline float ozzy_volume_db_to_scalar(float db)
 {
-	return OzzyVolumeClampScalar((db - kOzzyVolumeMinDB) / (kOzzyVolumeMaxDB - kOzzyVolumeMinDB));
+	return ozzy_volume_clamp((db - ozzy_volume_min_db) / (ozzy_volume_max_db - ozzy_volume_min_db));
 }
 
-/* Linear amplitude for a scalar. */
-inline float OzzyVolumeScalarToGain(float scalar)
+/* The linear amplitude for @scalar (0 for silence) */
+static inline float ozzy_volume_gain(float scalar)
 {
-	scalar = OzzyVolumeClampScalar(scalar);
-	if (scalar == 0.0f) return 0.0f;
-	return std::pow(10.0f, OzzyVolumeScalarToDB(scalar) / 20.0f);
+	scalar = ozzy_volume_clamp(scalar);
+	if (scalar == 0.0f)
+		return 0.0f;
+	return powf(10.0f, ozzy_volume_scalar_to_db(scalar) / 20.0f);
 }
 
-/* Scales interleaved samples in place, ramping linearly from gain `from` to
- * gain `to` across the buffer so a volume change does not click. The last
- * frame gets exactly `to`. */
-inline void OzzyApplyGainRamp(float* samples, uint32_t frames, uint32_t channels, float from, float to)
+/*
+ * ozzy_volume_ramp - Scale @frames interleaved frames of @channels samples in place, ramping
+ * linearly from gain @from to gain @to across them so a change doesn't click. The last frame
+ * gets exactly @to. Nothing to do at unity.
+ */
+static inline void ozzy_volume_ramp(float *samples, uint32_t frames, uint32_t channels, float from, float to)
 {
-	if (from == 1.0f && to == 1.0f) return;
-	for (uint32_t f = 0; f < frames; f++) {
-		const float g = from + (to - from) * (float)(f + 1) / (float)frames;
-		for (uint32_t c = 0; c < channels; c++)
+	uint32_t f, c;
+
+	if (from == 1.0f && to == 1.0f)
+		return;
+	for (f = 0; f < frames; f++) {
+		float g = f + 1 == frames ? to : from + (to - from) * (float)(f + 1) / (float)frames;
+
+		for (c = 0; c < channels; c++)
 			samples[f * channels + c] *= g;
 	}
 }
+
+#endif

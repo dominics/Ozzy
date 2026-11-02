@@ -5,7 +5,7 @@
 #include "device.h"
 #include "meter.h"
 #include "ring.h"
-#include "ploytec_defs.h"
+#include "dynacord_defs.h"
 
 struct stats {
 	unsigned long long frames_sent, fb_sum, fb_count, underruns, iso_errors, in_bytes;

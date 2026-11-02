@@ -1,16 +1,32 @@
 # 🎛️ Ozzy - USB Audio & MIDI Driver for Non-Class Compliant Devices
 
+<!-- fork: dominics/Ozzy -->
 ## About this fork
 
-This is [dominics/Ozzy](https://github.com/dominics/Ozzy), a fork of [mischa85/Ozzy](https://github.com/mischa85/Ozzy). It adds two things on macOS:
+This is [dominics/Ozzy](https://github.com/dominics/Ozzy), a fork of [mischa85/Ozzy](https://github.com/mischa85/Ozzy) for the Dynacord CMS 600-3 mixer (USB ID `0562:03eb`) on macOS. The fork's own work lives on its `release` branch; the rest of this README is upstream's.
 
-**Dynacord CMS 600-3 support.** The older CMS 600-3 mixer (USB ID `0562:03eb`) uses a Ploytec USB interface like the Xone mixers, but Dynacord's own driver no longer works on Apple silicon or current macOS. This fork drives its 4 inputs and 4 outputs at 44.1, 48 and 96 kHz, plus USB-MIDI (the mixer's DIN MIDI ports) and its control port. The protocol was reverse-engineered from USB captures, which are kept at [dominics/dynacord-cms-pcap](https://github.com/dominics/dynacord-cms-pcap).
+**A userspace driver.** Upstream's macOS driver is a kernel extension, which on Apple silicon means lowering the Mac's security settings. This fork adds OzzyDaemon, a background process that talks to the mixer through macOS's userspace USB API and feeds the same Core Audio (OzzyHAL) and MIDI (OzzyMIDI) plug-ins. It needs no kext and no changes to System Integrity Protection. For now the package drives the CMS 600-3 only.
 
-**A userspace driver.** Upstream's macOS driver is a kernel extension, which on Apple silicon means lowering the Mac's security settings. This fork adds OzzyDaemon, a background process that talks to the mixer through macOS's userspace USB API and feeds the same Core Audio (OzzyHAL) and MIDI (OzzyMIDI) plug-ins. It needs no kext and no changes to System Integrity Protection. For now it supports the CMS 600-3 only.
+**CMS 600-3 extras.** Both of the mixer's MIDI ports ("USB-MIDI" for the DIN sockets, "SystemCtrl" for FX control), named channels, output volume and mute, and the MON and AUX inputs as separate devices. The protocol was reverse-engineered from USB captures, kept at [dominics/dynacord-cms-pcap](https://github.com/dominics/dynacord-cms-pcap).
 
-Installer packages for Apple silicon Macs on macOS 26.1 or later are on the [releases page](https://github.com/dominics/Ozzy/releases). To install the latest with Homebrew, run `brew install --cask dominics/tap/ozzy-cms600`. The [macOS README](macos/README.md#install-dynacord-cms-600-3) covers installing the package by hand and uninstalling.
+### Install (CMS 600-3, Apple silicon, macOS 26.1 or later)
+
+```bash
+brew install --cask dominics/tap/ozzy-cms600
+```
+
+Or download `Ozzy-CMS600-<version>.pkg` from the [releases page](https://github.com/dominics/Ozzy/releases). The package is not signed with an Apple Developer ID, so Gatekeeper blocks it the first time you open it. Double-click it and close the warning, then open System Settings > Privacy & Security, click **Open Anyway** next to the message about the package, and confirm the warnings that follow. Or skip Gatekeeper from Terminal with `sudo installer -pkg Ozzy-CMS600-*.pkg -target /`.
+
+From source: `macos/install-userspace.command` builds the same package with `macos/packaging/build-pkg.sh` and installs it.
+
+The package installs `/Library/Audio/Plug-Ins/HAL/OzzyHAL.driver`, `/Library/Audio/MIDI Drivers/OzzyMIDI.plugin` and `/Library/Application Support/Ozzy/OzzyDaemon`, which `/Library/LaunchAgents/com.ozzy.daemon.plist` starts in each GUI session (log: `~/Library/Logs/OzzyDaemon.log`). It refuses to install over upstream's kext driver: both drivers claim the mixer, so run `macos/uninstall.command` and reboot first.
+
+Uninstall: `brew uninstall --cask ozzy-cms600`, `macos/uninstall-userspace.command`, or `sudo "/Library/Application Support/Ozzy/uninstall.sh"`.
+
+**Power-cycle quirk**: the mixer only enumerates if it is powered on with the USB cable already plugged in. If it does not show up, power it off, plug in the cable, then power it on.
 
 ---
+<!-- /fork -->
 
 **Bringing legacy professional audio hardware back to life.**
 
@@ -22,6 +38,9 @@ This is an open-source, reverse-engineered driver supporting non-class compliant
 
 **Currently Supported Devices:**
 * **Allen & Heath Xone:DB4, DB2, DX, 4D** (Ploytec-based protocol)
+* **Tascam US-1641**
+* **Numark Omni Control**
+* **Experimental:** 30+ more Ploytec-based interfaces and DJ controllers from Allen & Heath, Reloop, ESI, Midiplus, Smyth Research, Akai, M-Audio, Lexicon, Numark and Tascam ([full list](#️-supported-devices))
 
 More devices can be added—the architecture separates the audio engine from device protocols.
 
@@ -44,12 +63,71 @@ Ozzy reverses the protocol and provides modern drivers—so your equipment keeps
 
 ## 🎚️ Supported Devices
 
-| Device | Channels | Sample Rates | Status |
+Every device below comes from one list in [`common/ozzy_devices.def`](common/ozzy_devices.def), which the Linux module, the macOS driver and the Windows driver are built from.
+
+### ✅ Supported (tested on hardware)
+
+| Device | In / out | Sample rates |
+| :--- | :--- | :--- |
+| **Allen & Heath Xone:DB4** | 8 / 8 | 44.1–96 kHz |
+| **Allen & Heath Xone:DB2** | 8 / 8 | 48 kHz |
+| **Allen & Heath Xone:DX** | 8 / 8 | 44.1–96 kHz |
+| **Allen & Heath Xone:4D** | 8 / 8 | 44.1–96 kHz |
+| **Tascam US-1641** | 16 / 4 | 44.1–96 kHz |
+| **Numark Omni Control** (first MIDI port only) | 4 / 4 | 44.1–96 kHz |
+
+### 🧪 Experimental (needs testers)
+
+These use the same Ploytec chip. Their channels, rates and setup requests come from the manufacturers' own drivers, but they haven't been confirmed working with Ozzy yet. If you own one, please [try it and report back](#-testing-an-experimental-device).
+
+| Device | In / out | Sample rates | Notes |
 | :--- | :--- | :--- | :--- |
-| **Allen & Heath Xone:DB4** | 8×8 | 44.1/48/88.2/96 kHz | ✅ Perfect |
-| **Allen & Heath Xone:DB2** | 8×8 | 44.1/48/88.2/96 kHz | ✅ Perfect |
-| **Allen & Heath Xone:DX** | 8×8 | 44.1/48/88.2/96 kHz | ✅ Perfect |
-| **Allen & Heath Xone:4D** | 8×8 | 44.1/48/88.2/96 kHz | ✅ Perfect |
+| **Akai EIE Pro** | 4 / 4 | 44.1–96 kHz |  |
+| **Akai MPC Renaissance** | 2 / 4 | 44.1–96 kHz | First MIDI port only |
+| **Allen & Heath MixWizard WZ4 USB** | 16 / 2 | 44.1–96 kHz |  |
+| **Alesis MultiMix 8 / 8 FX / 16 USB 2.0** | 10 / 2 | 44.1/48 kHz | Channels from a MultiMix 8; the 16 may have more inputs |
+| **Allen & Heath Xone:2D** | 8 / 8 | 44.1–96 kHz |  |
+| **Dynacord CMS 600-3** (Ploytec revision) | 4 / 4 | 44.1/48/96 kHz | First MIDI port (DIN) only. The later class-compliant revision needs no driver; on Windows, don't install Ozzy for it |
+| **ESI ESU1808** | 16 / 8 | 44.1–96 kHz | S/PDIF out mirrors outputs 1/2 |
+| **ESI U86 XT** | 8 / 6 | 44.1–96 kHz |  |
+| **ESI U108 PRE** | 10 / 8 | 44.1–96 kHz |  |
+| **ESI U168 XT** | 16 / 8 | 44.1–96 kHz |  |
+| **Lexicon I-ONIX U22 / IO22** | 2 / 2 | 44.1–96 kHz |  |
+| **Lexicon I-ONIX U42S / IO42** | 6 / 4 | 44.1–96 kHz |  |
+| **Lexicon I-ONIX U82S / IO82** | 10 / 4 | 44.1–96 kHz |  |
+| **M-Audio M-Track Quad** | 4 / 4 | 44.1–96 kHz |  |
+| **Midiplus AudioLink PLUS 4x4** | 6 / 6 | 44.1–96 kHz |  |
+| **Musonik PHASE X64 USB** | 6 / 4 | 44.1–96 kHz | Inputs 1/2 and 3/4 selectable (Phono recorded flat, without RIAA); 5/6 record outputs 1/2 |
+| **Numark 4Trak** | 2 / 4 | 44.1 kHz |  |
+| **Numark MixDeck** | 4 / 4 | 44.1/88.2 kHz |  |
+| **Numark NS6** | 4 / 4 | 44.1 kHz |  |
+| **Numark NS7** | 4 / 4 | 44.1 kHz |  |
+| **Numark V7** | 4 / 4 | 44.1 kHz |  |
+| **Reloop Contour Interface Edition** | 2 / 10 | 44.1 kHz |  |
+| **Reloop Digital Jockey 2 Master Edition** | 6 / 4 | 44.1 kHz |  |
+| **Reloop IQ2 MIDI** | 4 / 4 | 44.1–96 kHz |  |
+| **Reloop Jockey 3 Master Edition** | 6 / 4 | 44.1–96 kHz |  |
+| **Reloop Jockey 3 Remix** | 6 / 4 | 44.1–96 kHz |  |
+| **Smyth Research Realiser A16** | 2 / 16 | 44.1 kHz |  |
+| **Tascam US-144** | 4 / 4 | 44.1–96 kHz | Not in the Linux build by default: Linux has its own drivers |
+| **Tascam US-144MKII** | 4 / 4 | 44.1–96 kHz | Not in the Linux build by default: Linux has its own driver |
+| **Tascam US-200** | 2 / 4 | 44.1–96 kHz |  |
+| **Tascam US-366** | 4 / 6 | 44.1–96 kHz | Written from a Windows capture ([#91](https://github.com/mischa85/Ozzy/issues/91)); in the mixer mode with 4 inputs and 6 outputs only |
+| **Tascam US-600** | 6 / 4 | 44.1–96 kHz |  |
+| **Tascam US-1800** | 16 / 4 | 44.1–96 kHz |  |
+| **Tascam US-2000** | 16 / 4 | 44.1–96 kHz |  |
+
+**MIDI only:** Allen & Heath Xone:1D, on macOS and Windows. On Linux the kernel's own USB MIDI driver handles it, no Ozzy needed.
+
+### 🔍 Wanted: devices we need information about
+
+We can't work these out from the drivers alone. If you own one, the linked issue says what would help:
+
+* Alesis MultiMix 8 / 8 FX / 16 USB 2.0: [#90](https://github.com/mischa85/Ozzy/issues/90)
+* Dynacord PowerMate-3 / CMS-3: [#15](https://github.com/mischa85/Ozzy/issues/15)
+* Reloop, older interfaces (Digital Jockey IE / 2 IE, Spin 2, 10tion, Mixage IE, Play): [#92](https://github.com/mischa85/Ozzy/issues/92)
+* Tascam US-322, US-1200, UH-7000: [#91](https://github.com/mischa85/Ozzy/issues/91)
+* Unidentified Ploytec USB IDs: [#93](https://github.com/mischa85/Ozzy/issues/93)
 
 ---
 
@@ -61,10 +139,10 @@ Ozzy provides **native kernel-mode drivers** for maximum performance and compati
 Flexible architecture supporting three backend implementations:
 
 **Current: Kernel Extension (Kext)** - *Recommended*
-* **Audio:** 8×8 channels via CoreAudio HAL
+* **Audio:** up to 16 in / 16 out, per device, via CoreAudio HAL
 * **MIDI:** Full CoreMIDI support with lock-free ring buffers
 * **Latency:** Sub-millisecond performance via zero-copy ring buffers
-* **Requirements:** macOS 11+, SIP modified for kext loading (`csrutil enable --without kext`)
+* **Requirements:** macOS 10.11+ (Apple Silicon: 11+), SIP modified for kext loading (`csrutil enable --without kext`)
 * **Status:** ✅ Fully implemented and stable
 
 **Planned: DriverKit Extension (Dext)**
@@ -73,11 +151,11 @@ Flexible architecture supporting three backend implementations:
 * Same performance as kext, future-proof architecture
 * **Status:** 🚧 In development (legacy prototype in `legacy/mac-coreaudio/`)
 
-**Userspace Daemon**
+**Planned: Userspace Daemon**
 * No kernel extension required
 * Works with full SIP enabled
 * Slightly higher latency but maximum compatibility
-* **Status:** ✅ Implemented for the Dynacord CMS 600-3 - see [Userspace driver](macos/README.md#userspace-driver-dynacord-cms-600-3-sip-enabled)
+* **Status:** 🚧 Planned
 
 All backends share the same CoreAudio HAL and CoreMIDI drivers—only the USB communication layer changes. Choose the backend that fits your security and performance requirements.
 
@@ -85,14 +163,20 @@ All backends share the same CoreAudio HAL and CoreMIDI drivers—only the USB co
 
 ### 🐧 Linux (ALSA Kernel Module)
 Standard ALSA kernel module with automatic transfer mode detection.
-* **Audio:** 8×8 channels (PCM)
+* **Audio:** up to 16 in / 16 out, per device (PCM)
 * **MIDI:** ALSA Sequencer In/Out
-* **Modes:** Automatic BULK/INTERRUPT transfer detection
+* **Modes:** Automatic BULK/INTERRUPT transfer detection, isochronous output with feedback
 * **Integration:** Works seamlessly with JACK, PulseAudio, PipeWire
 * **Location:** [`linux/`](linux/)
 
-### 🪟 Windows
-*Coming soon.* WASAPI kernel-mode driver in development.
+### 🪟 Windows (ACX Kernel Driver)
+A KMDF + ACX kernel driver on the same engine as the Linux module and the macOS kext.
+* **Audio:** one output and one input endpoint per device, for every app through WASAPI (shared and exclusive), packed 24-bit at every rate the device has
+* **MIDI:** MIDI 1.0 ports through Windows MIDI Services, for WinMM and WinRT MIDI apps
+* **Requirements:** Windows 11 on x64, Secure Boot off (Ozzy is test-signed, see [Installation](#-windows))
+* **Devices:** every device in the list above, supported and experimental: the Ploytec bulk/interrupt family (the Xones and their relatives), the isochronous family (Tascam, Akai EIE Pro, M-Track Quad, Lexicon I-ONIX, Numark, ...) and the Xone:1D (MIDI only)
+* **Status:** 🧪 tested on the Xone:DB4. No ASIO driver yet.
+* **Location:** [`windows/`](windows/)
 
 **Why kernel mode?**  
 Non-class compliant devices need direct USB pipe access and precise timing that's only possible in kernel space. User-space solutions add latency and complexity—kernel drivers provide the clean, low-latency performance these professional devices were designed for.
@@ -118,15 +202,17 @@ The installer automatically:
 - ✅ Starts drivers immediately
 
 **Requirements:**
-- macOS 11+ (Big Sur or later)
+- macOS 10.11 El Capitan or later on Intel, 11 Big Sur or later on Apple Silicon
 - SIP modification: Run `csrutil enable --without kext` in Recovery Mode
 - Apple Developer certificate in Keychain (free Apple ID works)
+
+**Leaving devices out:** `OZZY_DISABLE="TascamUS144 NumarkNS7" ./install.command` builds without those devices (names are the keys in [`common/ozzy_devices.def`](common/ozzy_devices.def)), so another driver can keep them.
+
+**Device settings:** the installer also puts `ozzy-cli` in `/usr/local/bin`. `ozzy-cli` lists the devices, `ozzy-cli show` a device's settings (clock source, S/PDIF out mode, routing, for the devices that have them) and everything the driver knows of it (firmware, USB speed, rates, packet and transfer sizes, endpoints, latency) and `ozzy-cli set clock-source internal` changes one. The clock source is also in Audio MIDI Setup. The same settings are in **ozzy**, a small settings window (see [The ozzy app](#the-ozzy-app)).
 
 **Uninstall:** Run `macos/uninstall.command`
 
 **Troubleshooting:** Run `macos/debuglogs.command` to collect diagnostic logs
-
-For detailed information, see [macos/README.md](macos/README.md)
 
 ### 🐧 Linux
 
@@ -135,12 +221,75 @@ For detailed information, see [macos/README.md](macos/README.md)
     git clone https://github.com/mischa85/Ozzy
     cd Ozzy/linux
     make
-    sudo make install
+    sudo make modules_install
     ```
 2.  Load the module:
     ```bash
     sudo modprobe snd-usb-ozzy
     ```
+
+**Device settings** are ALSA controls ("Clock Source", "IEC958 Playback Mode", "Output 1-2 Source", ..., for the devices that have them), kept across reboots by `alsactl store`. Use `alsamixer` / `amixer`, or `ozzy-cli`, the same tool as on macOS (needs alsa-lib, e.g. `libasound2-dev`):
+```bash
+make -C apps/cli && sudo install -m 755 apps/cli/ozzy-cli /usr/local/bin/
+ozzy-cli show
+ozzy-cli set clock-source internal
+ozzy-cli watch       # prints a device again whenever it changes
+```
+The settings window, **ozzy**, works on Linux too (needs GTK 3 as well: `libgtk-3-dev`): see [The ozzy app](#the-ozzy-app).
+
+**Leaving devices out:** `make OZZY_DISABLE="NumarkNS7 ReloopIQ2MIDI"` builds without those devices (names are the keys in [`common/ozzy_devices.def`](common/ozzy_devices.def)). By default the Linux build leaves out the Tascam US-144 and US-144MKII, which the kernel's own drivers handle; `make OZZY_DISABLE=` builds them in.
+
+### 🪟 Windows
+
+1. Turn **Secure Boot off** in the PC's firmware settings (UEFI). Ozzy is test-signed, not signed by Microsoft (that needs a paid EV certificate), and Windows only loads test-signed drivers with Secure Boot off.
+2. Get Ozzy (`git clone https://github.com/mischa85/Ozzy`, or the ZIP from GitHub) and double-click **`windows\install.cmd`**. It asks for administrator rights.
+3. Restart when it says so (the first time, for test signing), and plug in your mixer.
+
+The installer automatically:
+- ✅ Checks the PC: Windows 11, x64, Secure Boot off, disk space
+- ✅ Gets the build tools the first time: the Visual Studio 2026 Build Tools with only the C++ compiler and the WDK's build integration (a few GB; added to a Visual Studio 2026 that is already there), the Windows Driver Kit as NuGet packages (about 330 MB, pinned and hash-checked, into `windows\build\wdk\`) and meson (with ninja) for the app. No Visual Studio IDE and no 20 GB EWDK.
+- ✅ Compiles the driver, `ozzy-cli` and the ozzy app
+- ✅ Turns test signing on and trusts the certificate the build signed the driver with
+- ✅ Adds the driver and switches every connected supported device to Ozzy, also from the manufacturer's driver or WinUSB (Zadig). Over a running Ozzy (an update) it stops Windows' audio services for a few seconds, so no restart is needed.
+- ✅ Puts the **ozzy app** in the Start menu (**Ozzy**) and `ozzy-cli` on the PATH, both in `C:\Program Files\Ozzy`
+
+**Leaving devices out:** `install.cmd -Disable TascamUS144,NumarkNS7` builds without those devices (names are the keys in [`common/ozzy_devices.def`](common/ozzy_devices.def)), so another driver keeps them. Without it, the installer switches every connected supported device to Ozzy, also one that works with its manufacturer's driver.
+
+`install.cmd -NoBuild` installs the package built before, `install.cmd -Package <folder>` one from elsewhere (`ozzy.inf`, `ozzy.sys`, `ozzy.cat`). With test signing on, Windows shows "Test Mode" on the desktop; that's expected.
+
+**Device settings:** Windows' sound settings have no place for them, so they are in the [ozzy app](#the-ozzy-app) (Start menu > Ozzy) and `ozzy-cli`: `ozzy-cli show`, `ozzy-cli set clock-source internal`. A device setting restarts the engine (an open stream glitches); every change is kept in the device's registry key and applied when the device comes up.
+
+**Sample rates:** each endpoint offers a format per rate the device has (the highest first). A stream at another rate switches the device to it, unless the other direction has a stream open at the current rate or the device is locked to S/PDIF at another rate; then the stream is refused.
+
+**Uninstall:** `windows\uninstall.cmd` (`-All`: also the certificate, and test signing off again)
+
+### The ozzy app
+
+**ozzy** shows a device's settings in one window (clock source and digital input lock, S/PDIF output, routing, for the devices that have them), with everything the driver knows of it in a second tab (as `ozzy-cli show` prints it), and follows every change at once, whether made in the window, by `ozzy-cli`, another app or the device. It is built with [libui-ng](https://github.com/libui-ng/libui-ng) (native controls on macOS, Linux and Windows), which meson downloads and links in:
+```bash
+meson setup apps/gui/build apps/gui && meson compile -C apps/gui/build
+./apps/gui/build/ozzy
+```
+**Latency:** on the Xone family (DB2, DB4, 4D, ESU1808, ...) the PCM transfer size is a setting per direction, from 10 frames out and 8 in (one USB sub-packet) up to 200, and so is how many transfers are in flight (2 to 4; one starves the DB4 on macOS and Windows, so it isn't offered). The latency on USB is the two multiplied, which the app shows next to them; the defaults are 80 frames and 4 in flight each way. `ozzy-cli set pcm-playback-transfer 10-frames pcm-capture-transfer 8-frames pcm-playback-queue 2-transfers pcm-capture-queue 2-transfers` sets the lowest (sizes a device can't take, such as 10 frames out on the DB4, which needs 20, aren't offered). Lower is faster but leaves less margin when the computer is busy. On macOS the app also offers the **largest IO buffer** apps may use (300 to 2400 frames, 1200 by default), which sets how often the driver gives CoreAudio its clock.
+
+On macOS, `install.command` builds the app and installs it as `/Applications/Ozzy.app` (with meson and ninja if you have them, else in a Python environment of its own in `macos/Build`). On Windows, `install.cmd` builds and installs the app (Start menu > Ozzy). On Linux, `sudo meson install -C apps/gui/build` puts it in `/usr/local/bin` with its launcher entry and icon, which is where GNOME's dock gets Ozzy the cat from (`meson setup --prefix ~/.local ...` installs it for you alone, without sudo).
+
+Without a device: `meson setup apps/gui/build-demo apps/gui -Ddemo=true` builds it with two made-up devices; `OZZY_DEMO_EVENTS=1 ./apps/gui/build-demo/ozzy` plugs them in, changes the clock and unplugs one.
+
+---
+
+## 🧪 Testing an Experimental Device
+
+If your device is in the experimental list, you can help get it to "supported":
+
+1. Install Ozzy as above and plug the device in.
+2. Try playback, recording and (if it has any) MIDI, at each sample rate it offers.
+3. Open an issue with the result, whether it works or not, and include the log:
+   * **Linux:** `sudo dmesg | grep -i ozzy` and `lsusb -v -d <vid:pid>`
+   * **macOS:** the output of `macos/debuglogs.command`
+   * **Windows:** `ozzy-cli show` and the kernel log (see [Troubleshooting](#-troubleshooting--bug-reports))
+
+Even "it works" is useful: it's what moves a device to the supported list.
 
 ---
 
@@ -275,6 +424,49 @@ If nothing above works:
 
 Zero-copy architecture with lock-free ring buffers in shared memory for minimal latency.
 
+### Windows Driver
+
+```
+┌─────────────────┐   ┌─────────────────┐
+│  Audio Apps     │   │  MIDI Apps      │
+└────────┬────────┘   └────────┬────────┘
+         │ WASAPI              │ Windows MIDI Services
+┌────────▼─────────────────────▼────────┐
+│  ozzy.sys (KMDF + ACX)                │
+│  audio circuits · MIDI circuit        │
+│  engine/ on a KMDF USB bus            │
+└───────────────────┬───────────────────┘
+                    │ USB
+             ┌──────▼──────┐
+             │  Hardware   │
+             └─────────────┘
+```
+
+One kernel driver, no user-space part: the real-time work happens in the USB completion path.
+- **Playback:** when a PCM OUT transfer completes, the engine encodes the next packet's frames straight from the WaveRT buffer into the USB packet (`ploytec_encode_frame_Nch`), then sends it.
+- **Recording:** when a PCM IN transfer completes, the engine decodes it straight into the WaveRT buffer (`ploytec_decode_frame_Nch`).
+- **No float:** the endpoints use packed 24-bit PCM (S24_3LE), and Windows' audio engine converts.
+- **Packet completion:** the ACX stream completes WaveRT packets (`AcxRtStreamNotifyPacketComplete`) from the same path, so the device's USB clock drives everything.
+- **Isochronous devices:** a transfer is one `URB_FUNCTION_ISOCH_TRANSFER` (started ASAP) over a buffer of its own, its packets back to back, so each OUT packet's length is the gap to the next. The URB reports no per-frame times; every packet gets the completion's time.
+- **MIDI:** a MIDI circuit next to the audio ones, the way Microsoft's USB MIDI 2 driver (also ACX) exposes its ports, so Windows MIDI Services (Windows 11, 25H2 for the full API) finds it and makes MIDI 1.0 ports for WinMM and WinRT apps. Each direction is a stream whose ring of UMP messages is mapped into the service (`KSPROPSETID_MidiLoopedStreaming`): MIDI in goes from the engine's ring into it in the USB completion path, MIDI out comes from it on a worker thread into the engine's ring. The Xone:1D (USB MIDI class) is a device with only this circuit, on the USB MIDI engine. Not covered: the legacy MIDI stack (Windows MIDI Services switched off, or older Windows). If ACX doesn't take the MIDI circuit, audio still comes up and the log says so.
+
+| File | What |
+|---|---|
+| `windows/install.cmd`, `uninstall.cmd` | the one-click installer and uninstaller (`scripts/install.ps1`, `scripts/uninstall.ps1` as administrator) |
+| `windows/scripts/build.ps1` | gets the build tools, the NuGet WDK and meson if needed, builds the driver package, `ozzy-cli` and the ozzy app |
+| `windows/driver/driver.c` | DriverEntry: WDF and ACX driver |
+| `windows/driver/device.c` | device add (model from the hardware ID), engine, bus and shared memory, D0 entry/exit |
+| `windows/driver/circuit.c` | render and capture circuits: host and bridge pins, the S24_3LE formats |
+| `windows/driver/stream.c` | RT stream: WaveRT packets as one ring, positions, packet completion |
+| `windows/driver/midi.c` | MIDI in and out as a UMP MIDI circuit, MIDI 1.0 bytes converted by `common/midi_ump.c` |
+| `windows/driver/settings.c` | the device settings for `ozzy-cli` and the ozzy app: a KS property set on each circuit (`ozzy_ksproperty.h`: status, settings and the driver's record `struct ozzy_info`), kept in the device's registry key, and a KS event that tells of every change |
+| `windows/driver/kmdf_bus.c` | the engine's bus (`ozzy_bus`) on KMDF USB: bulk/interrupt requests and isochronous URBs on the engine's own transfer buffers, control requests |
+| `windows/driver/ozzy.vcxproj` | the build; uses the NuGet WDK in `windows/build/wdk/` when it's there, else the environment's WDK (EWDK, Visual Studio + WDK) |
+| `windows/inf/ozzy.inf.in` | INF template: endpoints, service; the build fills in the devices |
+| `windows/inf/GenInf.c` | writes `ozzy.inf`: one line per device in `common/ozzy_devices.def`, every family, less the ones left out (compiled and run by `ozzy.vcxproj` before the build, like `GenPersonalities.c` for the kext) |
+
+**Building by hand:** `powershell -ExecutionPolicy Bypass -File windows\scripts\build.ps1` builds without installing (the package lands in `windows\build\x64\Release\ozzy\`: `ozzy.inf`, `ozzy.sys`, `ozzy.cat`, test-signed with the WDK's test certificate, plus `ozzy-cli.exe` and `ozzy.exe`; getting the tools the first time needs administrator rights). Once it has fetched the WDK, `msbuild windows\driver\ozzy.vcxproj /p:Configuration=Release /p:Platform=x64` works from a Visual Studio 2026 developer prompt (with the "Windows Driver Kit Build Tools" component `build.ps1` adds); the EWDK (`SetupBuildEnv.cmd amd64`) or Visual Studio with the WDK work too, without `windows\build\wdk\`. Devices are left out with `build.ps1 -Disable <keys>`, `msbuild ... /p:OzzyDisable="<keys>"` or the `OZZY_DISABLE` environment variable.
+
 ---
 
 ## 🛠️ For Developers
@@ -297,8 +489,9 @@ Ozzy provides a **clean, open-source example** of how to:
 
 ### Architecture Highlights
 
-- **Device-agnostic core:** The audio engine (`OzzyCore`) is separated from device protocol implementations, making it easy to support additional vendors
-- **Platform-portable:** Linux and macOS implementations share the USB protocol code
+- **Device-agnostic core:** The audio engine (`engine/`) is separated from device protocol implementations, making it easy to support additional vendors
+- **One device list:** [`common/ozzy_devices.def`](common/ozzy_devices.def) has one row per device (IDs, channels, rates, protocol family, quirks). The Linux USB ID table and the macOS kext's matching are generated from it, so adding a device that fits an existing family is one row; per-device differences are quirk flags ([`common/ozzy_quirks.h`](common/ozzy_quirks.h))
+- **Platform-portable:** Linux, macOS and Windows share the USB protocol code and the engine
 - **Performance-first:** No unnecessary data copies, context switches, or latency-inducing abstractions
 - **Lock-free design:** Ring buffers use atomic operations for thread-safe, real-time audio
 
@@ -307,14 +500,28 @@ Ozzy provides a **clean, open-source example** of how to:
 ```
 Ozzy/
 ├── common/         # Shared protocol code (platform-independent)
+│   ├── ozzy_devices.def  # The device list (one row per device)
+│   ├── ozzy_quirks.h     # Per-device differences
 │   └── devices/    # Device-specific protocol definitions and codecs
-├── linux/          # Linux ALSA kernel module
-│   └── devices/    # Linux device-specific glue
+├── linux/          # Linux ALSA kernel module (USB, PCM, MIDI, controls on the engine)
+├── engine/         # Device engines shared by the Linux module, the macOS kext and the Windows driver
+│   ├── core/       # Device-agnostic engine (C) and the bus interface (ozzy_bus)
+│   ├── devices/    # Device-specific protocol implementations
+│   └── shared/     # Shared memory layout, platform layer, logging
 ├── macos/          # macOS kext + HAL/MIDI drivers
-│   ├── OzzyCore/   # Device-agnostic audio engine
-│   ├── Devices/    # Device-specific protocol implementations
 │   └── Backends/   # Platform backends (Kext, future Dext)
-├── windows/        # Windows WASAPI driver (WIP)
+├── windows/        # Windows ACX (WASAPI) driver
+│   ├── install.cmd # One-click check, build and install (uninstall.cmd to remove)
+│   ├── driver/     # The kernel driver (ozzy.sys) and its project
+│   ├── inf/        # INF template and its generator
+│   └── scripts/    # Build, install and uninstall scripts
+├── apps/           # The user's tools: ozzy-cli and the ozzy app (macOS, Linux, Windows)
+│   ├── control/    # What both share: devices, settings, their changes, the driver's facts
+│   ├── cli/        # ozzy-cli: device settings from the command line
+│   └── gui/        # ozzy: the settings app (libui-ng)
+├── tests/          # Host tests of the engine on a fake USB bus
+├── tools/
+│   └── winusb-harness/  # The engine over WinUSB in a console program (Windows dev tool)
 └── legacy/         # Archived experiments and old implementations
 ```
 
@@ -334,8 +541,14 @@ Whether you need to support your own legacy hardware or understand how professio
 - Restart CoreAudio: `sudo killall coreaudiod`
 - Check Audio MIDI Setup app
 
+**Windows driver won't load?**
+- Secure Boot must be off: `Confirm-SecureBootUEFI` in an administrator PowerShell should say `False`
+- Test signing must be on: `bcdedit /enum {current}` should show `testsigning Yes` (restart after the installer turned it on)
+- Kernel log: DebugView (Capture Kernel) or WinDbg; Ozzy prints `[Ozzy]` / `[Ploytec]` lines under the IHVAUDIO component (`ed nt!Kd_IHVAUDIO_Mask 0xffffffff`)
+- Build problems: the full log is in `windows\build\build.log`
+
 **Linux module issues?**
-- Check kernel logs: `dmesg | grep ozzy`
+- Check kernel logs: `sudo dmesg | grep -i ozzy`
 - Verify module loaded: `lsmod | grep snd_usb_ozzy`
 
 **Reporting Issues:**

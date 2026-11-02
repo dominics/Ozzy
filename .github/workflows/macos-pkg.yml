@@ -2,7 +2,7 @@ name: macOS package
 
 on:
   push:
-    branches: [main]
+    branches: [release]
     tags: ['v*']
   workflow_dispatch:
 
@@ -22,19 +22,21 @@ jobs:
         run: brew install shellcheck
       - name: Lint scripts
         run: |
-          shellcheck macos/packaging/build-pkg.sh macos/tests/check-pkg.sh macos/tests/check-daemon-cli.sh \
+          shellcheck macos/packaging/build-pkg.sh macos/packaging/check-pkg.sh \
             macos/install-userspace.command macos/uninstall-userspace.command
           shellcheck --shell=bash macos/packaging/uninstall.sh macos/packaging/scripts/preinstall macos/packaging/scripts/postinstall
-      - name: Unit tests
-        run: make -C macos/tests test
-      - name: Daemon CLI
-        run: macos/tests/check-daemon-cli.sh
+      - name: Engine tests
+        run: make -C tests check
+      - name: Daemon tests
+        run: make -C macos/Backends/OzzyDaemon check
+      - name: Plug-in backend tests (fake-daemon)
+        run: make -C macos/Backends/OzzyDaemon/tools check
       - name: Build package
         run: macos/packaging/build-pkg.sh
       - name: Check package
         run: |
           v="$(cat macos/build/pkg/VERSION)"
-          macos/tests/check-pkg.sh "macos/build/pkg/Ozzy-CMS600-$v.pkg" "$v"
+          macos/packaging/check-pkg.sh "macos/build/pkg/Ozzy-CMS600-$v.pkg" "$v"
       - uses: actions/upload-artifact@v7
         with:
           name: ozzy-cms600-pkg
@@ -58,15 +60,16 @@ jobs:
         with:
           name: ozzy-cms600-pkg
           path: dist
-      - name: Check the tag is on main and matches the package
+      - name: Check the tag is on release and matches the package
         run: |
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "$GITHUB_REF_NAME is not on main"; exit 1; }
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/release || { echo "$GITHUB_REF_NAME is not on release"; exit 1; }
           [ "v$(cat dist/VERSION)" = "$GITHUB_REF_NAME" ] || { echo "package version $(cat dist/VERSION) != $GITHUB_REF_NAME"; exit 1; }
       - name: Draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           v="$(cat dist/VERSION)"
-          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "Ozzy for Dynacord CMS 600-3 $v" \
-            --notes-file macos/packaging/release-notes.md \
-            "dist/Ozzy-CMS600-$v.pkg" "dist/Ozzy-CMS600-$v.pkg.sha256"
+          args=(--draft --verify-tag --title "Ozzy for Dynacord CMS 600-3 $v" --notes-file macos/packaging/release-notes.md)
+          # v0.4.0-rc.1 and the like: a pre-release, so the latest release stays the last full one
+          case "$v" in *-*) args+=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" "${args[@]}" "dist/Ozzy-CMS600-$v.pkg" "dist/Ozzy-CMS600-$v.pkg.sha256"

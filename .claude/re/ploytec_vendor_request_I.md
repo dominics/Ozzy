@@ -36,7 +36,9 @@ bit 0x04 → digital lock (confirmed via (byte & 0x04) != 0; triggers re-read af
 ### Behavior
 
 - `0x04` indicates digital signal lock
-- `0x02` = clock source selection (internal vs external), not generic "input select"
+- `0x02` = clock source selection, not generic "input select": set = automatic (the digital input
+  when it has a valid signal, else internal), clear = internal. From Tascam's Control Panel:
+  menu [Automatic, Internal] → setClockSource(index) → AjExtData[1] 0/1 (`device_settings.md`)
 - `0x01` = USB1 mode flag, only set on certain devices (those with `this[0x7a8]` set,
   or product 0x644 sub-IDs 0x8048/0x8041)
 - Driver masks with `0xFD` and recomputes bit 1 from current clock source setting
@@ -90,7 +92,9 @@ byte +0x08 [2]  → USB1 mode (PTE_USB1Mode enum, controls bit 0 of status byte)
                    Dispatch: read=0x02/0x19, write=0x1A (setUSB1Mode)
 byte +0x0C [3]  → digital out mode
                    Dispatch: read=0x1B, write=0x1C (setDigitalOutMode)
-byte +0x10 [4]  → digital output selector value (written to index 2 by writeDigitalOutSelector)
+byte +0x10 [4]  → digital output selector value (written to index 2 by writeDigitalOutSelector;
+                   Tascam's panel sets it only from its USB 1.1 mode code; ESU1808: S/PDIF mirror
+                   pair 0..3 for chooseDMAEncoder, no request)
                    Dispatch: write=0x03 (setDigitalOutSelector)
 byte +0x14      → input postprocessor setting [sub=0]
 byte +0x18      → input postprocessor setting [sub=1]
@@ -104,6 +108,9 @@ byte +0x28 [10] → digital lock flag (written from bit 2 of status byte)
 
 The ESU path preserves bits with mask `0x4C`, then ORs in a composite state
 based on the clock source setting. These are NOT individual flags:
+
+ESI's U168 XT panel names them (`esi_u168xt_cport.md`): 2 = Auto with inputs 15/16 analog,
+1 = Internal, 0 = Auto with inputs 15/16 digital.
 
 | AjExtData[1] | State | Value | 'A' request param |
 |---------------|-------|-------|-------------------|
@@ -160,6 +167,22 @@ For ESU (0x2573) and 0x0A92/0x0111 only:
 - Writes to vendor request 'I', wIndex=1 with the masked value
 - Stops bulk audio before writing, resumes after
 - Stored in `this[0x55D8]`
+
+### Generic selector and confirm (EIE kext 3.3.17, all junction devices)
+
+- `updateAjInputSelector` (configurationDone; not for the ESU devices, which use `_Esu186`, nor
+  the Jockey 3 ME): 'I' read (again after 20 ms while bit 2 is set), new = `b | 0x02` (AjExtData[1]
+  = 0, the default), bit 0 = AjExtData[2] (default 0) when plist flag 0x7a8 is set; written
+  (sign-extended) only if it changed, then 40 ms and GET_CUR. Xones read bit 1 set, so no write.
+- `setAJDMAInputChannels` (bulkAudioRun, every stream start, every device with a bulk pipe):
+  'I' read, write `b | 0x20 | 0x10` for up to 16 inputs (`b & ~0x20 | 0x10` above; D064 keeps 0x20).
+  This is Ozzy's "confirm"; it used to set only 0x20, which is the same on the Xones (bit 4 is
+  set at power-up) but not on devices that power up with bit 4 clear.
+- 'I' wIndex 2 = AjExtData[4] (default 0): `writeDigitalOutSelector`, plist flag 0x7ac.
+- `configurationDone` calls it with the stored byte and resets the store to 0 first, so the
+  write always goes out; the stored byte starts at 0, so the first write is wValue 0xE7. Only
+  the control panel (user client dispatch 5) changes the byte (bits 3/4, the ones 0xE7 leaves
+  free; meaning open)
 
 ### readUS3XXChannelConfig — confirmed index 1 read (from Ghidra)
 

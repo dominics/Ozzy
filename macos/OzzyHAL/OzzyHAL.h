@@ -1,192 +1,258 @@
 #ifndef OzzyHAL_h
 #define OzzyHAL_h
 
+#include <mutex>
 #include <CoreAudio/AudioServerPlugIn.h>
-#include <CoreAudioTypes/CoreAudioBaseTypes.h>
+#include <CoreAudio/CoreAudioTypes.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h> // Required for Kext Communication
 #include <os/log.h>
 #include <atomic>
 #include <cstdint>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 #include <pthread.h>
-#include "../Shared/OzzySharedData.h"
-#include "OzzyChannels.h"
-#include "OzzyDevices.h"
+#include "../../engine/shared/ozzy_shared_data.h"
+#include "../../common/ozzy_devices.h"
+#include "PloytecCodec.h"   // the codec function pointer types
+#include "../Shared/OzzyBackend.h"
+#include "OzzyHALExtras.h"
 
-// Codec function pointer types for device-agnostic encoding/decoding
-typedef void (*PCMEncoderFunc)(uint8_t* dst, const float* src);
-typedef void (*PCMDecoderFunc)(float* dst, const uint8_t* src);
-typedef void (*WriteOutputFunc)(uint8_t* ringBuffer, const float* srcFrames, uint64_t sampleTime, uint32_t frameCount, uint32_t ringSize, uint32_t bytesPerFrame);
-typedef void (*ReadInputFunc)(float* dstFrames, const uint8_t* ringBuffer, uint64_t sampleTime, uint32_t frameCount, uint32_t ringSize, uint32_t bytesPerFrame);
-typedef void (*ClearOutputFunc)(uint8_t* outputBuffer, uint32_t bufferSize);
+/* The macOS 12 SDK renamed kAudioObjectPropertyElementMaster; older SDKs only have that name */
+#ifndef __MAC_12_0
+#define kAudioObjectPropertyElementMain kAudioObjectPropertyElementMaster
+#endif
 
-class OzzyHAL {
+// One audio device per OzzyKext instance with audio. Device slot i owns the object IDs from
+// kOzzyObjectIDBase + kOzzyObjectsPerDevice * i: the device (+0), its input stream (+1), its
+// output stream (+2), its clock source control (+3, published only for devices with the Clock
+// Source setting), then the fork's (OzzyHALExtras.h, from +4).
+// A slot keeps its IDs and UID when its device is replugged.
+#define kOzzyMaxDevices         8
+#define kOzzyObjectIDBase       100
+#define kOzzyObjectsPerDevice   16
+
+class OzzyHALDevice {
 public:
-    static OzzyHAL& Get();
-    
-    void Init(AudioServerPlugInHostRef host);
-    void Cleanup();
+    void Init(uint32_t slot);
 
-    bool IsConnected();
-    bool IsRunning(int device) const { return mDevices[device].clients.load() > 0; }
+    AudioObjectID GetDeviceID() const { return kOzzyObjectIDBase + mSlot * kOzzyObjectsPerDevice; }
+    AudioObjectID GetInputStreamID() const { return GetDeviceID() + 1; }
+    AudioObjectID GetOutputStreamID() const { return GetDeviceID() + 2; }
+    AudioObjectID GetClockControlID() const { return GetDeviceID() + 3; }
 
-    /* Index into kOzzyDevices of a device this plug-in answers for, or of one of
-     * its streams; -1 for anything else. */
-    int DeviceIndex(AudioObjectID object) const { return OzzyDeviceIndex(object, true, mIsDynacord); }
-    UInt32 PublishedDeviceCount() { return OzzyDeviceCount(IsConnected(), mIsDynacord); }
+    // Connection to the driver, the kext or a daemon (monitor thread)
+    bool IsMapped() const { return mSHM.load(std::memory_order_relaxed) != nullptr; }
+    bool IsUsed() const { return mDeviceUID != nullptr; }   // has been published before
+    uint64_t GetRegistryID() const { return mRegistryID; }
+    uint32_t GetLocationID() const { return mLocationID; }
+    bool Map(const OzzyBackend& backend, uint64_t registryID, uint32_t locationID);
+    void Unmap();
+    bool CheckHealth();
+    bool UpdateConnectionState(AudioServerPlugInHostRef host);   // true if it changed
 
-    kern_return_t StartIO(AudioObjectID device);
-    kern_return_t StopIO(AudioObjectID device);
+    // CoreAudio state
+    bool IsConnected() const { return mConnected; }
+    bool IsRunning() const { return mIOStarted; }
+    // Clients (AddDeviceClient / RemoveDeviceClient) and their IO. The device runs IO from the
+    // first StartIO to the StopIO that balances it: AudioServerPlugIn.h has them come per client,
+    // but coreaudiod (macOS 26) counts its clients itself, sending StartIO for the first and
+    // StopIO, with the last one's ID, for the last; so the calls are counted, not matched by ID
+    void AddClient(const AudioServerPlugInClientInfo* info);
+    void RemoveClient(UInt32 clientID);
+    kern_return_t StartIO(AudioServerPlugInHostRef host, UInt32 clientID);
+    kern_return_t StopIO(AudioServerPlugInHostRef host, UInt32 clientID);
+    // OZZY_PROPERTY_CLIENTS's data: a new CFArray of the clients doing IO
+    CFArrayRef CopyClientsArray() const;
+    HRESULT GetZeroTimeStamp(Float64* outSampleTime, UInt64* outHostTime, UInt64* outSeed);
+    OSStatus ioOperation(UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo, void* ioMainBuffer);
 
-    HRESULT GetZeroTimeStamp(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID, Float64* outSampleTime, UInt64* outHostTime, UInt64* outSeed);
-    
     Float64 GetNominalSampleRate() const;
-    bool IsRateSettable() const { return mIsDynacord; }
-    UInt32 GetAvailableSampleRateCount() const { return mNumSampleRates; }
-    const AudioValueRange* GetAvailableSampleRateList() const { return mSampleRateList; }
-    OSStatus RequestSampleRate(Float64 rate);
-    OSStatus PerformDeviceConfigurationChange(AudioObjectID device, UInt64 rate);
-    AudioBufferList* GetInputStreamConfiguration(int device) const;
-    AudioBufferList* GetOutputStreamConfiguration(int device) const;
-    CFStringRef GetDeviceName(int device) const;
+    // The rates CoreAudio may pick (ozzy_device_host_rates), as ranges of one rate each, into
+    // @out (NULL: just count); returns how many
+    UInt32 CopySampleRates(AudioValueRange* out, UInt32 max) const;
+    AudioBufferList* GetInputStreamConfiguration() const;
+    AudioBufferList* GetOutputStreamConfiguration() const;
+    CFStringRef GetDeviceName() const;
     CFStringRef GetManufacturer() const;
-    CFStringRef GetDeviceUID(int device) const;
-    CFStringRef GetModelUID(int device) const;
+    CFStringRef GetDeviceUID() const;
+    CFStringRef GetModelUID() const;
     UInt32 GetTransportType() const;
     UInt32 GetClockDomain() const;
-    UInt32 GetChannelCount(int device) const { return kOzzyDevices[device].inputChannel ? 1 : mChannels; }
-    AudioStreamBasicDescription GetStreamFormat(int device) const;
-    
-    UInt32 GetLatency() const { return 0; }
+    AudioStreamBasicDescription GetStreamFormat(bool isOutput) const;
+    UInt32 CopyStreamRangedDescriptions(bool isOutput, AudioStreamRangedDescription* out, UInt32 max) const;
+    // A client set the nominal rate or a stream format: one of the host rates asks CoreAudio
+    // to stop IO and call PerformConfigurationChange
+    OSStatus SetSampleRate(AudioServerPlugInHostRef host, Float64 rate);
+
+    // Frames the device itself adds that way at the current rate (common/ozzy_devices.def)
+    UInt32 GetLatency(AudioObjectPropertyScope scope) const;
+    // Output: frames the engine reads ahead; input: frames behind the clock it is complete (ApplyDeviceConfig)
     UInt32 GetSafetyOffset(AudioObjectPropertyScope scope) const {
-        return scope == kAudioObjectPropertyScopeInput ? mSafetyOffsetIn : mSafetyOffsetOut;
+        return scope == kAudioObjectPropertyScopeInput ? mInputSafetyOffset : mSafetyOffset;
     }
-    UInt32 GetZeroTimestampPeriod() const;
-    
-    void FillPreferredChannelLayout(int device, AudioObjectPropertyScope inScope, AudioChannelLayout* layout) const;
-    UInt32 GetPreferredChannelLayoutSize(int device) const;
-    
-    // Output volume and mute, applied to the mix before it is encoded
-    Float32 GetVolumeScalar() const { return mVolumeScalar.load(); }
-    void SetVolumeScalar(Float32 scalar);
-    bool IsMuted() const { return mMuted.load(); }
-    void SetMuted(bool muted);
+    UInt32 GetZeroTimestampPeriod() const { return mTimestampFrames; }  // spacing of the kext's timestamp anchors
 
-    // Per-channel names, and the channels stereo clients use, for each scope
-    CFStringRef CopyChannelName(int device, AudioObjectPropertyScope scope, AudioObjectPropertyElement element) const;
-    OzzyStereoPair GetStereoPair(int device, AudioObjectPropertyScope scope) const;
-    OSStatus SetStereoPair(AudioObjectPropertyScope scope, OzzyStereoPair pair);
+    // Device settings (common/ozzy_settings.h). The clock source is a clock source selector
+    // control (kAudioClockSourceControlClassID), from which CoreAudio derives the device's
+    // kAudioDevicePropertyClockSource (Audio MIDI Setup's Clock Source menu). Item IDs are
+    // the setting's values (enum ozzy_clock_source).
+    bool HasSetting(unsigned int id) const { return id < OZZY_NUM_SETTINGS && (mSettingsAvailable & (1u << id)); }
+    bool HasSettings() const { return mSettingsAvailable != 0; }
+    unsigned int SettingCount(unsigned int id) const;
+    UInt32 GetSetting(unsigned int id) const { return mSettings.value[id]; }
+    CFStringRef CopyClockSourceName(UInt32 item) const;
+    // A client set a setting (OZZY_PROPERTY_SETTING, or the clock source control): a route
+    // applies at once, a device setting asks CoreAudio to stop IO and call PerformSettingChange
+    OSStatus SetSetting(AudioServerPlugInHostRef host, unsigned int id, UInt32 value);
+    // OZZY_PROPERTY_SETTING's data: a new dictionary, and setting from one
+    CFDictionaryRef CopySettingsDictionary() const;
+    // OZZY_PROPERTY_INFO's data: a new CFData of the kext's struct ozzy_info
+    CFDataRef CopyInfoData() const;
+    // OZZY_PROPERTY_STATS's data: a new CFData of the kext's struct ozzy_stats, as it is now
+    CFDataRef CopyStatsData();
+    // The monitor thread: true once for a change in the stats' incidents (ozzy_stats_incidents)
+    bool StatsChanged();
+    bool InfoChanged();
+    // The custom properties the device has (kAudioObjectPropertyCustomPropertyInfoList): the
+    // info, the stats, and the settings if it has any
+    UInt32 CustomPropertyCount() const { return HasSettings() ? 4 : 3; }
+    OSStatus SetSettingsDictionary(AudioServerPlugInHostRef host, CFDictionaryRef dict);
+    // CoreAudio stopped IO for a setting or rate change: send it to the kext, re-read the
+    // format, keep it
+    OSStatus PerformConfigurationChange(AudioServerPlugInHostRef host, UInt64 action);
 
-    OSStatus ioOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inStreamObjectID, UInt32 inClientID, UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo, void* ioMainBuffer, void* ioSecondaryBuffer);
+    AudioChannelLayout* GetPreferredChannelLayout(AudioObjectPropertyScope inScope);
+    UInt32 GetPreferredChannelLayoutSize(AudioObjectPropertyScope inScope) const;
+
+    // The UID for a device (also used to find its old slot): its serial number, or for
+    // devices without one (all Ploytec devices so far) its model and USB port
+    static void MakeDeviceUID(const ozzy_shared_memory* shm, uint32_t locationID, char* buf, size_t size);
+    bool HasDeviceUID(const char* uid) const;
+
+    // The fork's volume, mute, channel names and stereo pairs (OzzyHALExtras.h)
+    OzzyHALExtras& Extras() { return mExtras; }
+    // IO thread of a mono input device (OzzyHALMono.h): device input @channel (1-based) of the
+    // cycle into @out, decoded @chunk frames at a time through @scratch (@chunk x 16 floats)
+    void ReadInputChannel(uint32_t channel, UInt32 frames, const AudioServerPlugInIOCycleInfo* cycle, float* out,
+                          float* scratch, uint32_t chunk);
 
 private:
-    OzzyHAL() = default;
-    ~OzzyHAL() = default;
+    uint32_t mSlot = 0;
 
     CFStringRef mDeviceUID = nullptr;
     CFStringRef mModelUID = nullptr;
     CFStringRef mManufacturerUID = nullptr;
 
-    /* State kept for each entry of kOzzyDevices. */
-    struct DeviceState {
-        std::atomic<uint32_t> clients { 0 };   // StartIO calls minus StopIO calls on this device
-        std::atomic<uint64_t> seed { 1 };      // zero timestamp seed
-        // Last anchor served by GetZeroTimeStamp(), from this device's IO thread
-        uint64_t anchorSample = 0, anchorHost = 0;
-        // UID and model UID derived from mDeviceUID / mModelUID; the main device's are those
-        CFStringRef uid = nullptr, model = nullptr;
-        CFStringRef name = nullptr;   // fixed name, or nullptr for the product name (mModelUID)
-    };
-    DeviceState mDevices[kOzzyMaxDevices];
-    
-    uint32_t mZeroTimestampPeriod = 640;  // Updated dynamically: 2 URBs * framesPerPacket * 4
-    uint8_t* mInputBufferAddr = nullptr;
-    uint8_t* mOutputBufferAddr = nullptr;
-    
     // Cached frame format for real-time I/O (updated on connect)
-    uint32_t mFramesPerPacket = 80;
-    uint32_t mRingSize = 10240; // kOzzyNumPackets * mFramesPerPacket
-    uint32_t mOutputBytesPerFrame = 48;
-    uint32_t mInputBytesPerFrame = 64;
+    uint32_t mOutRingFrames = 1;   // frames in the shared memory's output ring (the engine's layout)
+    uint32_t mInRingFrames = 1;
+    uint32_t mTimestampFrames = OZZY_TIMESTAMP_FRAMES;   // between the engine's clock anchors
+    uint32_t mSafetyOffset = 160; // frames the engine reads output ahead of the clock
+    uint32_t mInputSafetyOffset = 160;   // frames behind the clock input is complete
+    uint32_t mInputChannels = 8;    // published by the kext per model (16 for the WZ4)
+    uint32_t mOutputChannels = 8;   // (2 for the WZ4)
 
-    // Device shape, set by ApplyPacketLayout() / ApplyFrameLayout() on attach
-    uint32_t mChannels = 8;
-    uint32_t mRingSizeIn = 10240;        // input ring, frames (kext: same as mRingSize)
-    uint32_t mSafetyOffsetOut = 160;
-    uint32_t mSafetyOffsetIn = 160;
-    bool mIsDynacord = false;
-
-    // Set when the mapping must no longer be touched by the IO path but IO is
-    // still running; the monitor unmaps once StopIO has been seen.
-    std::atomic<bool> mMappingDead { false };
-    std::atomic<uint32_t> mIOClients { 0 };   // StartIO calls minus StopIO calls on every device, plus a running rate change
-    std::atomic<bool> mRateChangeActive { false };   // PerformSampleRateChange is waiting for the engine
-
-    // Daemon liveness (layout v2 only)
-    uint32_t mLastHeartbeat = 0;
-    uint64_t mHeartbeatSeenAt = 0;       // mach_absolute_time of the last change
-
-    // Codec function pointers (set based on device vendor/product ID)
-    PCMEncoderFunc mEncode = nullptr;
-    PCMDecoderFunc mDecode = nullptr;
+    // Codecs picked once per device from what the kext published
     WriteOutputFunc mWriteOutput = nullptr;
     ReadInputFunc mReadInput = nullptr;
     ClearOutputFunc mClearOutput = nullptr;
-    
+
     AudioStreamBasicDescription mCurrentStreamFormat;
     AudioBufferList mInputConfig;
     AudioBufferList mOutputConfig;
-    AudioBufferList mMonoInputConfig;
-    AudioBufferList mNoConfig;   // an input-only device's output scope
-    AudioValueRange mSampleRateList[3] = {};
-    UInt32 mNumSampleRates = 1;
-    
-    std::atomic<Float32> mVolumeScalar { 1.0f };
-    std::atomic<bool> mMuted { false };
-    float mAppliedGain = 1.0f;   // IO thread only: the gain the last WriteMix ended on
-    std::atomic<uint32_t> mStereoPairIn { OzzyStereoPairPack({}) };
-    std::atomic<uint32_t> mStereoPairOut { OzzyStereoPairPack({}) };
+    uint32_t mHostRates[OZZY_MAX_RATES] = { 96000 };   // ApplyDeviceConfig
+    uint32_t mHostRateCount = 1;
+    const struct ozzy_device* mModel = nullptr;   // its row, null if not listed (ApplyDeviceConfig)
+
+    // Settings as the kext applied them (ApplyDeviceConfig)
+    uint32_t mSettingsAvailable = 0;   // bit (1 << enum ozzy_setting) per setting the device has
+    struct ozzy_settings mSettings = {};
+    bool mClockLocked = false;
+    uint32_t mLockRate = 0;
+    struct ozzy_info mInfo = {};        // the kext's, as of its last handshake (ApplyDeviceConfig)
+    mutable std::mutex mInfoLock;       // ApplyDeviceConfig writes mInfo while a client may read it
+    uint32_t mStatsIncidents = 0;       // as the monitor thread last told of them
+    struct ozzy_route mInRoute = {};    // capture routing, applied after mReadInput
+    struct ozzy_route mOutRoute = {};   // playback routing, applied before mWriteOutput
+    bool mSpdifMirror = false;          // mWriteOutput is the ESU1808 mirror writer (UpdateRoutes)
+
+    bool mConnected = false;     // published to CoreAudio
+    bool mIOStarted = false;
+
+    struct Client {
+        UInt32 id;
+        pid_t pid;
+        char bundle[128];
+        bool io;                 // started IO (where the host says so per client)
+    };
+    int mIOCount = 0;            // StartIOs not yet balanced by a StopIO (mClientLock)
+    static constexpr int kMaxClients = 64;
+    Client mClients[kMaxClients] = {};
+    int mClientCount = 0;
+    mutable std::mutex mClientLock;
+    kern_return_t StartDeviceIO();
+    void StopDeviceIO();
+    void NotifyClients(AudioServerPlugInHostRef host);
+    uint32_t mTimestampSeed = 1;
+    // The last real anchor GetZeroTimeStamp handed out (host time 0: none since IO started)
+    uint64_t mAnchorSample = 0, mAnchorHost = 0;
+
+    // Kext connection. The monitor thread maps and unmaps; CoreAudio's threads use the
+    // mapping between AcquireSHM and ReleaseSHM, and Unmap waits for them to finish.
+    std::atomic<ozzy_shared_memory*> mSHM { nullptr };
+    std::atomic<uint32_t> mSHMUsers { 0 };
+    OzzyBackend mBackend;       // the kext's user client or a daemon's segment (OzzyBackend.h)
+    uint64_t mRegistryID = 0;   // the OzzyKext instance's, or the USB device's for a daemon
+    uint32_t mLocationID = 0;   // USB port (IOUSBHostDevice locationID)
+    uint32_t mSessionID = 0;
+
+    alignas(16) uint8_t mChannelLayoutBuffer[0x50C];
+    OzzyHALExtras mExtras;
+
+    ozzy_shared_memory* AcquireSHM();
+    void ReleaseSHM();
+    void ApplyDeviceConfig();
+    kern_return_t CallSetRate(uint32_t rate);
+    kern_return_t CallApplySetting(unsigned int id, uint32_t value);
+    CFStringRef CopySettingKey(unsigned int id) const;
+    void StoreSetting(AudioServerPlugInHostRef host, unsigned int id, uint32_t value);
+    void RestoreSettings(AudioServerPlugInHostRef host);
+    void UpdateRoutes();
+    void UpdateMetadata();
+    void RebuildStreamConfigs();
+    void ClearOutputBuffer();
+    void NotifyDeviceChanged(AudioServerPlugInHostRef host);
+};
+
+class OzzyHAL {
+public:
+    static OzzyHAL& Get();
+
+    void Init(AudioServerPlugInHostRef host);
+    void Cleanup();
+
+    // Object ID lookup: the device that owns @objectID, or null
+    OzzyHALDevice* DeviceForObject(AudioObjectID objectID);
+    UInt32 GetDeviceList(AudioObjectID* outIDs, UInt32 maxIDs) const;
+    AudioServerPlugInHostRef GetHost() const { return mHost; }
+
+private:
+    OzzyHAL() = default;
+    ~OzzyHAL() = default;
 
     AudioServerPlugInHostRef mHost = nullptr;
-    OzzySharedMemory* mSHM = nullptr;
-    
-    // --- Kext Support ---
-    io_connect_t mKextConnect = IO_OBJECT_NULL;
-    mach_vm_address_t mKextMapAddress = 0;
-    mach_vm_size_t mKextMapSize = 0;
-    bool mIsKextMapping = false;
-
-    // --- Legacy Daemon Support ---
-    int mSHMFd = -1;
-
-    uint32_t mLastSessionID = 0;
+    OzzyHALDevice mDevices[kOzzyMaxDevices];
 
     pthread_t mMonitorThread;
     std::atomic<bool> mMonitorRunning { false };
-    bool mLastConnectedState = false;
     bool mLoggedWaitingForDriver = false;
 
-    void MapSharedMemory();
-    void UnmapSharedMemory();
     static void* MonitorEntry(void* arg);
     void MonitorLoop();
-    void RebuildStreamConfigs();
-    void SetIdentity(const char* product, const char* manufacturer, const char* serial);
-    void RebuildDeviceStrings();
-    bool ApplyPacketLayout();
-    bool ApplyFrameLayout();
-    bool FrameLayoutUnchanged() const;
-    void DropMapping();
-
-    void ClearOutputBuffer();
-    void LoadControlState();
-    void SaveControlState();
-    void NotifyControlChanged(AudioObjectID control, const AudioObjectPropertySelector* selectors, UInt32 count);
-    void NotifyDeviceChanged(AudioObjectID device, AudioObjectPropertySelector selector, AudioObjectPropertyScope scope);
-    void NotifyAllDevicesChanged(AudioObjectPropertySelector selector);
+    void ScanServices();
+    void ConnectService(io_service_t service, uint64_t registryID);
+    void ScanDaemonSegments();
+    void Attach(OzzyBackend& backend, uint64_t registryID, uint32_t locationID);
+    OzzyHALDevice* SlotForUID(const char* uid);
 };
 
 #endif

@@ -3,7 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include "ploytec_defs.h"
+#include "dynacord_defs.h"
 
 /* Pack one frame of signed 24-bit samples (one per channel) as S24_3LE. */
 void pack_s24(uint8_t *frame, const int32_t samples[DYNACORD_CHANNELS]);

@@ -1,4 +1,4 @@
-Userspace macOS driver for the Dynacord CMS 600-3: 4 inputs and 4 outputs at 44.1, 48 and 96 kHz, plus USB-MIDI. Needs an Apple Silicon Mac on macOS 26.1 or later, and no SIP changes.
+Userspace macOS driver for the Dynacord CMS 600-3: 4 inputs and 4 outputs at 44.1, 48 and 96 kHz, plus both MIDI ports (USB-MIDI and SystemCtrl). Needs an Apple Silicon Mac on macOS 26.1 or later, and no SIP changes.
 
 ## Install with Homebrew
 
@@ -20,4 +20,4 @@ Or skip Gatekeeper from Terminal: `sudo installer -pkg Ozzy-CMS600-*.pkg -target
 
 `brew uninstall --cask ozzy-cms600`, or `sudo "/Library/Application Support/Ozzy/uninstall.sh"`.
 
-More in the [macOS README](https://github.com/dominics/Ozzy/blob/main/macos/README.md#install-dynacord-cms-600-3).
+More in the [README](https://github.com/dominics/Ozzy/blob/release/README.md#about-this-fork).

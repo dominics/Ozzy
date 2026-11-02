@@ -4,7 +4,7 @@
 #include <stdint.h>
 #include "pacer.h"
 #include "ring.h"
-#include "ploytec_defs.h"
+#include "dynacord_defs.h"
 
 enum fill_mode {
 	FILL_NORMAL,     /* audio from the ring; a short ring counts as an underrun */

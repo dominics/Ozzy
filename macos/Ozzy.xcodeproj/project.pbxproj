@@ -3,26 +3,25 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 77;
+	objectVersion = 46;
 	objects = {
 
 /* Begin PBXBuildFile section */
-		D1C0DEC0A10000000000A002 /* DynacordCodec.cpp in Sources */ = {isa = PBXBuildFile; fileRef = D1C0DEC0A10000000000A001 /* DynacordCodec.cpp */; };
-		D1C0DEC0A10000000000A004 /* ploytec_codec.c in Sources */ = {isa = PBXBuildFile; fileRef = D1C0DEC0A10000000000A003 /* ploytec_codec.c */; };
-		1F5418052F1C6900003FECA9 /* PloytecCodec.mm in Sources */ = {isa = PBXBuildFile; fileRef = 1F5418042F1C6900003FECA9 /* PloytecCodec.mm */; };
+		1F5418052F1C6900003FECA9 /* PloytecCodec.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 1F5418042F1C6900003FECA9 /* PloytecCodec.cpp */; };
+		1F5418072F1C6900003FECA9 /* ploytec_codec.c in Sources */ = {isa = PBXBuildFile; fileRef = 1F5418062F1C6900003FECA9 /* ploytec_codec.c */; };
 		1FB396AA2F0AECA200073667 /* OzzyHAL.mm in Sources */ = {isa = PBXBuildFile; fileRef = 1FB396A92F0AECA200073667 /* OzzyHAL.mm */; };
-		D1C0DEC0B10000000000B002 /* MidiParser.cpp in Sources */ = {isa = PBXBuildFile; fileRef = D1C0DEC0B10000000000B001 /* MidiParser.cpp */; };
 		1FC985E22F05B4B700668435 /* OzzyMIDI.mm in Sources */ = {isa = PBXBuildFile; fileRef = 1FC985DF2F05B4B700668435 /* OzzyMIDI.mm */; };
 		1FE242542F05D730004C729F /* CoreMIDI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1FC985E62F05B63100668435 /* CoreMIDI.framework */; };
 		1FF6DC902F06F1F00061482F /* CoreAudio.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1FC985EA2F05B64A00668435 /* CoreAudio.framework */; };
+		1F5418082F1C6900003FECA9 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1FC985E82F05B64300668435 /* IOKit.framework */; };
+		1F5418092F1C6900003FECA9 /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1FADCD2E2F05C9960059FC84 /* CoreFoundation.framework */; };
+		1F54180A2F1C6900003FECA9 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1FC985E82F05B64300668435 /* IOKit.framework */; };
+		1F54180B2F1C6900003FECA9 /* CoreFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1FADCD2E2F05C9960059FC84 /* CoreFoundation.framework */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		D1C0DEC0A10000000000A001 /* DynacordCodec.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = DynacordCodec.cpp; path = Devices/Dynacord/DynacordCodec.cpp; sourceTree = SOURCE_ROOT; };
-		D1C0DEC0A10000000000A003 /* ploytec_codec.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; name = ploytec_codec.c; path = ../common/devices/ploytec/ploytec_codec.c; sourceTree = SOURCE_ROOT; };
-		1F5418042F1C6900003FECA9 /* PloytecCodec.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; name = PloytecCodec.mm; path = Devices/Ploytec/PloytecCodec.mm; sourceTree = SOURCE_ROOT; };
-		D1C0DEC0B10000000000B001 /* MidiParser.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = MidiParser.cpp; sourceTree = "<group>"; };
-		D1C0DEC0B10000000000B003 /* MidiParser.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = MidiParser.h; sourceTree = "<group>"; };
+		1F5418042F1C6900003FECA9 /* PloytecCodec.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = PloytecCodec.cpp; path = OzzyHAL/PloytecCodec.cpp; sourceTree = SOURCE_ROOT; };
+		1F5418062F1C6900003FECA9 /* ploytec_codec.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; name = ploytec_codec.c; path = ../common/devices/ploytec/ploytec_codec.c; sourceTree = SOURCE_ROOT; };
 		1FADCD2B2F05C8AC0059FC84 /* OzzyMIDI.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = OzzyMIDI.h; sourceTree = "<group>"; };
 		1FADCD2E2F05C9960059FC84 /* CoreFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreFoundation.framework; path = System/Library/Frameworks/CoreFoundation.framework; sourceTree = SDKROOT; };
 		1FB396A82F0AECA200073667 /* OzzyHAL.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = OzzyHAL.h; sourceTree = "<group>"; };
@@ -44,6 +43,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				1FF6DC902F06F1F00061482F /* CoreAudio.framework in Frameworks */,
+				1F5418082F1C6900003FECA9 /* IOKit.framework in Frameworks */,
+				1F5418092F1C6900003FECA9 /* CoreFoundation.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -52,6 +53,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				1FE242542F05D730004C729F /* CoreMIDI.framework in Frameworks */,
+				1F54180A2F1C6900003FECA9 /* IOKit.framework in Frameworks */,
+				1F54180B2F1C6900003FECA9 /* CoreFoundation.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -81,9 +84,8 @@
 		1FC985D92F05B4AE00668435 /* OzzyHAL */ = {
 			isa = PBXGroup;
 			children = (
-				1F5418042F1C6900003FECA9 /* PloytecCodec.mm */,
-				D1C0DEC0A10000000000A001 /* DynacordCodec.cpp */,
-				D1C0DEC0A10000000000A003 /* ploytec_codec.c */,
+				1F5418042F1C6900003FECA9 /* PloytecCodec.cpp */,
+				1F5418062F1C6900003FECA9 /* ploytec_codec.c */,
 				1FC985D32F05B4AE00668435 /* Info.plist */,
 				1FB396A92F0AECA200073667 /* OzzyHAL.mm */,
 				1FB396A82F0AECA200073667 /* OzzyHAL.h */,
@@ -97,8 +99,6 @@
 				1FC985DE2F05B4B700668435 /* Info.plist */,
 				1FC985DF2F05B4B700668435 /* OzzyMIDI.mm */,
 				1FADCD2B2F05C8AC0059FC84 /* OzzyMIDI.h */,
-				D1C0DEC0B10000000000B001 /* MidiParser.cpp */,
-				D1C0DEC0B10000000000B003 /* MidiParser.h */,
 			);
 			path = OzzyMIDI;
 			sourceTree = "<group>";
@@ -181,6 +181,7 @@
 				};
 			};
 			buildConfigurationList = 1FA268732EF990B700378831 /* Build configuration list for PBXProject "Ozzy" */;
+			compatibilityVersion = "Xcode 3.2";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -189,7 +190,6 @@
 			);
 			mainGroup = 1FA2686F2EF990B700378831;
 			minimizedProjectReferenceProxies = 1;
-			preferredProjectObjectVersion = 77;
 			productRefGroup = 1FA268792EF990B700378831 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -223,9 +223,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				1FB396AA2F0AECA200073667 /* OzzyHAL.mm in Sources */,
-				1F5418052F1C6900003FECA9 /* PloytecCodec.mm in Sources */,
-				D1C0DEC0A10000000000A002 /* DynacordCodec.cpp in Sources */,
-				D1C0DEC0A10000000000A004 /* ploytec_codec.c in Sources */,
+				1F5418052F1C6900003FECA9 /* PloytecCodec.cpp in Sources */,
+				1F5418072F1C6900003FECA9 /* ploytec_codec.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -234,7 +233,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				1FC985E22F05B4B700668435 /* OzzyMIDI.mm in Sources */,
-				D1C0DEC0B10000000000B002 /* MidiParser.cpp in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -248,7 +246,7 @@
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
-				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++0x";
 				CLANG_ENABLE_MODULES = YES;
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CLANG_ENABLE_OBJC_WEAK = YES;
@@ -280,7 +278,7 @@
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
-				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_OPTIMIZATION_LEVEL = 0;
@@ -295,7 +293,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 26.1;
+				MACOSX_DEPLOYMENT_TARGET = 10.11;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				NEW_SETTING = "";
@@ -311,7 +309,7 @@
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
-				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++0x";
 				CLANG_ENABLE_MODULES = YES;
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CLANG_ENABLE_OBJC_WEAK = YES;
@@ -343,7 +341,7 @@
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
-				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
 				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
@@ -352,7 +350,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 26.1;
+				MACOSX_DEPLOYMENT_TARGET = 10.11;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				NEW_SETTING = "";

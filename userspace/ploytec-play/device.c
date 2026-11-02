@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include "device.h"
-#include "ploytec_defs.h"
+#include "dynacord_defs.h"
 
 int device_open(struct device *d, int verbose, char *err, size_t errlen)
 {

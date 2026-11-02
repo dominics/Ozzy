@@ -1,0 +1,77 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * Ploytec junction devices with bulk or interrupt PCM out (the Xones and their relatives).
+ * PCM and MIDI out share every output packet; PCM in and MIDI in have their own endpoints.
+ *
+ * Copyright (C) 2024 Marcel Bierling <marcel@hackerman.art>
+ */
+
+#ifndef PLOYTEC_ENGINE_H
+#define PLOYTEC_ENGINE_H
+
+#include "../../core/ozzy_engine.h"
+#include "../../../common/devices/ploytec/ploytec_protocol.h"
+#include "../../../common/devices/ploytec/ploytec_midi.h"
+#include "../../../common/devices/ploytec/ploytec_codec.h"
+#include "../../../common/devices/ploytec/ploytec_cport.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * struct ploytec_engine
+ * @hw_sample_time: frames of completed PCM out packets (the device's clock)
+ * @sample_rate:    what the device runs at (the S/PDIF lock rate while locked)
+ * @default_rate:   the highest rate the device lists (what start asks for without a request)
+ * @running:        completions resubmit (cleared by stop and suspend)
+ * @pcm_in_int1024: PCM IN is interrupt, wMaxPacketSize 1024 (ploytec_midi.h)
+ * @encode/@decode: frame codecs for the model's channel counts
+ * @mirror:         ESU1808 S/PDIF mirror (bulk layout, 8 out)
+ * @cport:          C-port bytes (ploytec_cport.h) the control bytes still have to carry, from
+ *                  @cport_head; queued by start, before any transfer, and only taken by the
+ *                  out completions after it, so no locking
+ * @cport_idle_left: out places that may still hold a C-port byte from their last lap: they get
+ *                  idle control bytes once more
+ */
+/* Room for every write a start queues: the S/PDIF mode and 8 attenuators */
+#define PLOYTEC_CPORT_QUEUE (9 * PLOYTEC_CPORT_WRITE_BYTES)
+
+struct ploytec_engine {
+	struct ozzy_engine base;
+	uint64_t hw_sample_time;
+	enum ploytec_out_layout out_layout;
+	uint32_t sample_rate;
+	uint32_t default_rate;
+	volatile bool running;
+	bool streamed;         /* has streamed since attach: a start is a restart */
+	bool pcm_in_int1024;
+	struct ploytec_midi midi;
+	ploytec_frame_fn encode;
+	ploytec_frame_fn decode;
+	bool mirror;
+	uint8_t cport[PLOYTEC_CPORT_QUEUE];
+	uint32_t cport_head;
+	uint32_t cport_len;
+	uint32_t cport_idle_left;
+	uint32_t out_frames;   /* frames per PCM transfer this run (OZZY_SETTING_PCM_OUT_FRAMES at start) */
+	uint32_t in_frames;
+	uint32_t out_queue;    /* PCM transfers in flight this run (OZZY_SETTING_PCM_OUT_QUEUE at start) */
+	uint32_t in_queue;
+	uint32_t anchor_frames;   /* frames between clock anchors: a whole number of out transfers */
+	/* The out completions since the last anchor (update_timestamp): the first one's time and
+	 * frames, and the sums of every one's ticks and frames after the first */
+	uint64_t period_time;
+	uint64_t period_frames;
+	uint64_t period_ticks_sum;
+	uint64_t period_frames_sum;
+	uint32_t period_count;
+};
+
+void ploytec_engine_init(struct ploytec_engine *pe, const struct ozzy_device *model);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* PLOYTEC_ENGINE_H */

@@ -1,8 +1,10 @@
 #!/bin/bash
 # SPDX-License-Identifier: MIT
 set -euo pipefail
+# The kext driver (macos/install.command) claims the same devices and installs its own OzzyHAL and
+# OzzyMIDI; this package leaves it alone and stops instead.
 if [ -d /Library/Extensions/OzzyKext.kext ] || [ -f /Library/LaunchDaemons/com.ozzy.kext.load.plist ]; then
-	echo "The Ozzy kext driver is installed. Run its uninstall.command and reboot first." >&2
+	echo "The Ozzy kext driver is installed. Run its macos/uninstall.command and reboot first." >&2
 	exit 1
 fi
 if [ -f /usr/local/bin/Ozzy ] || [ -f /Library/LaunchDaemons/Ozzy.plist ]; then

@@ -1,6 +1,5 @@
 # Build artifacts
 Build/
-build-userspace/
 *.o
 *.kext
 *.driver

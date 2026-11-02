@@ -1,7 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ring.h"
-#include "ploytec_defs.h"
+#include "dynacord_defs.h"
 
 #define FS DYNACORD_OUT_FRAME_SIZE
 

@@ -66,4 +66,217 @@ type difference comes from the firmware's endpoint descriptors, not from this fl
 - 0x1ACC: 0x0102, 0x0103
 - 0x1D03: 0x005C
 - 0x200C: range 0x1005–0x1037 (bitmask)
-- 0x2573 (ESU): PID < 0x2B (bitmask)
+- 0x2573 (ESI Audiotechnik, ESU product line): 0x0012, 0x0013, 0x002A (bitmask)
+
+## What bulk vs interrupt actually changes (official driver)
+
+For Ploytec junction devices, `configureDevice` puts the PCM pipes into the *bulk* slots no
+matter their transfer type:
+- IN: `getBulkInPipe()`, else `getInterruptInPipe()` → `this+0xa90` (`this[0xb53]=1` if interrupt)
+- OUT: `getPipeByAddress(0x05)` (or `getInterruptOutPipe()`) → `this+0xa98`
+- isoc slots `0xab0` / `0xac0` are cleared; the keep-alive isoc pipe (EP 1–4 range, EP 0x02)
+  goes to `0xac8`
+
+`resumeStreaming` then always runs `bulkAudioRun` + `rtsBulkOutBulkIn`, and the OUT buffers are
+always `AudioBulkIRP` (`wMaxPacketSize × 20` bytes). The dedicated interrupt path
+(`interruptAudioRun`, `0xaa0/0xaa8`) is only used for JCT30 / Elektron Overbridge.
+
+So transfer type only matters in two places:
+1. **The URB/pipe type** used on the host side (obviously).
+2. **The isoc keep-alive on EP 0x02**: `rtsIsocAudioRunKeepAlive` is started only if the IN
+   pipe *or* the OUT pipe is bulk. All-interrupt devices (DB2 fw 1.2.0, DB4 fw 1.4.1, 4D) get no
+   keep-alive. **Ozzy never sends the keep-alive.** This could matter for bulk-mode firmware
+   (DB4 fw 1.3.9, DB2 fw 1.0.8). Decided not needed for Ozzy.
+
+## Output framing depends on wMaxPacketSize, NOT on bulk vs interrupt
+
+`AudioBulkIRP::useOut` pre-fills the MIDI idle pattern per packet of `wMaxPacketSize` bytes,
+for 20 packets:
+
+```c
+if (pipe->wMaxPacketSize <= 0x200) {       // 512
+    *(u16*)(pkt + 0x1e0) = 0xfffd;          // 480: FD, 481: FF
+} else {                                    // e.g. 964
+    *(u16*)(pkt + 0x1b0) = 0xfdfd;          // 432
+    *(u16*)(pkt + 0x392) = 0xfdfd;          // 914 = 482 + 432
+}
+```
+
+| Device / fw | EP 0x05 | wMaxPacketSize | Framing |
+|-------------|---------|----------------|---------|
+| DB4 fw 1.3.9 | bulk | 512 | `[480 PCM][MIDI][ctrl][30 pad]` |
+| **DB2 fw 1.2.0** | **interrupt** | **512** | `[480 PCM][MIDI][ctrl][30 pad]` |
+| DB4 fw 1.4.1 | interrupt | 964 (inferred: Ozzy's 3856 B URB = 4×964 works) | 2× `[432 PCM][MIDI][ctrl][48 PCM]` |
+| Xone:4D | interrupt | 964 (issue #9 lsusb; Win log `mExpectedEndpointBytes:964`) | 2× `[432][MIDI][ctrl][48]` |
+
+The byte after each MIDI slot is a control byte (FF when idle), and every slot can carry MIDI,
+paced to 2500 bytes/s: see `ploytec_midi.md`.
+
+Verified on the DB2 Windows capture: across 2352 non-silent 512-byte chunks, bytes 0–479
+behave as audio (≈50% non-zero at every offset, including 432–433), and bytes 480–511 are
+always 0. The Windows driver sends `00 00` in the MIDI slot when idle.
+
+**Consequences:**
+- Ozzy (macOS commit c1f48bd and Linux `is_bulk`) picked the 482 layout for *any* interrupt
+  endpoint. That's wrong for the DB2 and was the root cause of the white noise in #72 / #48.
+  Fixed: the layout now follows wMaxPacketSize.
+- PR #70 and PR #83 switch interrupt to the 512 layout for *all* devices. That fixes the DB2
+  but breaks the DB4 fw 1.4.1 and the 4D. The selector has to be wMaxPacketSize.
+- The c1f48bd commit message ("DB2 (older firmware) exposes bulk endpoints") is only true for
+  DB2 fw 1.0.8 (WeDigJames' first capture in #5). DB2 fw 1.2.0 is interrupt.
+
+## Transfer sizes are the host's choice (down to one sub-packet)
+
+The device's units are the sub-packets: out 10 frames (one 512-byte packet, or one 482-byte half
+of a 964-byte packet), in 8 frames (one 512-byte packet, 64 bytes per frame). How many of them
+go into one USB transfer, and how many transfers are queued, is up to the host:
+- The official driver sends `wMaxPacketSize × 20` bytes per OUT transfer (above).
+- Ozzy used to send 80 frames per transfer each way (8 out sub-packets, 10 in), 4 queued: 320
+  frames ahead (6.7 ms at 48 kHz). That 80 was Ozzy's own grouping (one logical packet for the
+  HAL's ring and timestamps), not the device's. Since 2026-10-18 the size is a setting per
+  direction (`OZZY_SETTING_PCM_OUT_FRAMES` / `_IN_FRAMES`, 1-20 sub-packets out, 1-25 in, up to
+  200 frames), 80 / 80 the default, and nothing in Ozzy groups frames by 80 any more.
+- **Both ways, transfers must be whole packets of the endpoint** (DB4 fw 1.4.1, Linux, 2026-10-21).
+  OUT: the DB4 reads every packet on EP 0x05 (interrupt, wMaxPacketSize 964) as a full 964-byte
+  packet of two 482-byte halves. Transfers of 20, 40 and 60 frames (964, 1928, 2892 bytes) play
+  clean; 10 and 30 frames (482 and 1446 bytes, ending in a 482-byte short packet) play garbage
+  (tones come back at wrong frequencies, discontinuities near full scale), with 1 or 4 queued. So
+  the out step is 20 frames on the 964 layout and 10 on the 512 layout (one packet each). The
+  user's earlier report that the 964 layout works as a single 482-byte half is not reproduced.
+  IN: packets are the device's choice, and the DB4 (fw 1.4.1, EP 0x86 interrupt,
+  wMaxPacketSize 1024) always sends full 1024-byte packets, 16 frames each (Linux usbmon
+  2026-10-21: with 1024-byte requests, 2417 completions, all status 0 and exactly 1024 bytes; no
+  short packet). A request that isn't a multiple of 1024 bytes is overrun: 8 frames (512 bytes)
+  completes every transfer with -EOVERFLOW (babble) and 0 bytes, and 24 frames babbles as well.
+  On Linux one babble on EP 0x86 also leaves capture dead until a replug (xhci "Event dma ... for
+  ep 12 status 3 not part of TD" on every restart after it); the engine's restart doesn't recover
+  it. So the IN step is wMaxPacketSize / 64 frames: 16 on the DB4, 8 on a 512-byte endpoint (DB2).
+  The user's earlier report that 8-frame IN worked on the DB4 is not reproduced; main's pre-engine
+  driver always used 80-frame IN transfers. 16 frames in with 1 queued records clean.
+- **The official Windows driver does the same** (Allen & Heath 2.9.91.0, its ASIO control panel,
+  DB4 at 48 kHz, USBPcap 2026-10-21, `captures/db4_windows_official/official_panel.pcap` with the
+  registry changes timestamped in `official_panel.log`). The panel's "USB buffer length" (ms) and
+  "Number of USB buffers" are `PerformanceMode_USB_LEN` / `_NUM` under
+  `HKLM\SYSTEM\CurrentControlSet\Services\XONE_DB4_USB\Parameters` ("Performance mode" is a
+  preset of the two; "Default ASIO buffer size" is `DefBufferSize`), written on Close:
+
+  | Panel | OUT transfer | OUT in flight | IN transfer | IN in flight |
+  |---|---|---|---|---|
+  | 5 ms x 4 | 12 x 964 B = 240 frames | 4 | 15 x 1024 B = 240 frames | 4 |
+  | 4 ms x 4 | 9 x 964 B = 180 frames | 4 | 12 x 1024 B = 192 frames | 4 |
+  | 3 ms x 3 | 7 x 964 B = 140 frames | 3 | 9 x 1024 B = 144 frames | 4 |
+  | 2 ms x 3 / x 2 | 4 x 964 B = 80 frames | 3 / 2 | 6 x 1024 B = 96 frames | 4 |
+  | 1 ms x 3 | 2 x 964 B = 40 frames | 3 | 3 x 1024 B = 48 frames | 4 |
+
+  The length is rounded down to whole packets each way (20 frames out, 16 in at 48 kHz); the
+  number of buffers sets only the OUT queue, IN always keeps 4. **Changes apply live**: no control
+  request, no restart, at most a 5 ms gap between OUT completions while the sizes switch (Ozzy
+  restarts the engine for each). Its smallest: 40 frames out x 2, 48 in x 4. "Number of USB buffers"
+  doesn't offer 1 (the user checked the list): the official driver never runs one OUT transfer in
+  flight, the case that starves the DB4 on macOS.
+- Ozzy offers only whole-packet sizes (`ozzy_pcm_step`, from the endpoints in the driver's info):
+  the engine refuses the rest and rounds a kept value up at start.
+- **One transfer in flight ("no queue") works on Linux, not on macOS** (DB4, 2026-10-21).
+  Linux: 20 frames out / 16 in, one each, records clean at 48 and 96 kHz. The device paces OUT
+  itself (NAKs until it has room), so its own buffer covers the gap while the next transfer is
+  submitted. macOS (kext): one OUT transfer in flight glitches at every size (20, 40, 80 frames;
+  96 kHz: hundreds of glitches in 5 s, the audio about 1-3% longer), two are clean (20/16 x2,
+  40/32 x2, 80/80 x4). A sawtooth on output 5 shows why: the DB4 holds the last sample (a frame
+  played twice, ~15000 in 6 s) once per 20-frame transfer, so it runs dry before each next
+  packet. The kext resubmits 2-12 us after the completion (XHC0 capture: IOUSBHost submit after
+  complete), so the gap is below the driver, in how soon macOS's USB stack puts a newly submitted
+  interrupt transfer on the wire. One IN transfer in flight is mostly fine there (8 glitches in
+  5 s at 96 kHz). Ozzy still offers 1 on macOS (the user's choice: documented, not hidden).
+  Not known: the device buffer's depth, and Windows.
+- **The DB4's IN side dies when the host stops polling it** (fw 1.4.1, Windows, 2026-10-21). With
+  the IN queue run dry for a few ms (the driver held the completion path 5 ms on purpose, 80
+  frames x 2 queued), EP 0x86 never completes again: requests stay in flight with no error,
+  OUT runs on. An engine restart (abort, handshake, clear halt) doesn't bring it back; a port
+  reset (bus reset) does. It doesn't always happen: a ~110 ms stall with 16 x 4 queued came
+  back by itself. Same shape as the Linux babble case above and the user's macOS user-mode
+  driver. Not known: what the firmware does (an IN FIFO overflow is the guess).
+- **What stalled the host on the Windows test box** (Threadripper 1920X, MSI X399 Gaming Pro
+  Carbon AC, BIOS 1.D9, AMD fTPM 3.5.0.3): the AMD fTPM stutter. A Windows TPM command (tpm.sys,
+  through ACPI) stops every CPU for ~10 ms (no CPU samples on any of 24 CPUs, no interrupts),
+  then the xHCI raises no interrupt for ~100 ms while the CPUs run again: 67-130 ms with no
+  completion on either pipe (xperf DPC/ISR/profile trace). Each `Get-TpmEndorsementKeyInfo`
+  while streaming made 3 late OUT and 2 late IN completions, 6 times out of 6. No DPC or ISR of
+  any driver ran longer than 2 ms. AMD's fix (AGESA 1.2.0.7, 2022) was for AM4 boards.
+- The queue of 4 Ozzy used had no basis in the protocol: d785fd4 (2026-10-17) copied Linux's old
+  `OZZY_PCM_N_URBS`; before that the engine kept 2. It is a setting now too
+  (`OZZY_SETTING_PCM_OUT_QUEUE` / `_IN_QUEUE`, 1-4, default 4).
+
+**Measured round trip** (DB4 fw 1.4.1, Linux, PipeWire's JACK layer, 2026-10-21): a one-sample
+click on output 5, found again on input 5 (the DB4 loops each USB return to its USB send),
+sample-exact in JACK time; every click of a run gave the same number. 48 kHz unless noted:
+
+| Transfers (out/in, queued) | PipeWire quantum | Round trip |
+|---|---|---|
+| 20/16, 1 | 1024 (44.1 kHz) | 2239 frames (50.8 ms) |
+| 20/16, 1 | 256 / 128 | 560 / 460 frames (11.7 / 9.6 ms) |
+| 20/16, 1 | 64 | 327-338 frames (6.8-7.0 ms) |
+| 20/16, 1 | 32 | 272-300 frames (5.7-6.3 ms) |
+| 20/16, 2 | 64 / 32 | 348 / 292 frames |
+| 80/80, 4 (main's fixed sizes) | 64 | 780 frames (16.3 ms) |
+| 80/80, 4 | 32 | 699-870 frames, varying, and 1284 xruns on the input node |
+
+Above 2 quanta, about 200-240 frames (4-5 ms) are fixed: the driver's 36 (20 out + 16 in), the
+rest PipeWire's ALSA side and the DB4's own buffer and mixer, not separated (that needs a raw
+ALSA measurement with PipeWire off the device). The numbers move by ~10-30 frames between
+restarts (the phase of the transfers to the graph's cycle).
+
+So the host's latency is transfers in flight × transfer size, in steps of one packet each way
+(DB4: 20 frames out, 16 in)
+(plus the device's own buffer, which the host can't see). MIDI out
+waits behind the same queue (its slot is in every out sub-packet), so it gets faster with it.
+
+**The device's own latency** (DB4 fw 1.4.1, macOS, Ozzy 160 x 4 transfers both ways, 2026-10-25;
+the latency column of `common/ozzy_devices.def`). What CoreAudio's timestamps can't see: output
+from the HAL's time for a frame (its OUT transfer completed) to the sound at the socket; input
+from a sound at the socket to the HAL's time for its frame. Measured in one process playing
+through the real engine (djengine) and capturing with a second IOProc, all on the host clock:
+
+| Rate | Loopback, USB 1-2 to 7-8 (digital) | Input: Mac out to RCA in, USB 7 | Output: USB 1-2 to DB4 headphones |
+|---|---|---|---|
+| 44.1 kHz | 141 frames (3.20 ms) | 22 frames (0.50 ms) | 155 frames (3.51 ms) |
+| 48 kHz | 145 (3.02 ms) | 31 (0.64 ms) | 157 (3.28 ms) |
+| 88.2 kHz | 230 (2.61 ms) | 107 (1.21 ms) | 217 (2.46 ms) |
+| 96 kHz | 240 (2.50 ms) | 110 (1.15 ms) | 226 (2.35 ms) |
+
+- Loopback: single-sample clicks, every one of 20-262 per run within a few frames. It stayed at
+  132-142 frames at 44.1 kHz with 256 to 800 frames queued (`ozzy-cli`), so it is the device's,
+  not the transfers'. A round trip can't be split, hence the two measurements against the
+  MacBook Pro's own audio, whose reported latency is taken as true.
+- Input: the Mac's headphone out (Apple's timestamps smooth to 0.3 us) into the RCA input, on
+  USB 7-8; four runs per rate within 3 frames.
+- Output: a 2 kHz, 10 ms Hann-windowed burst on the DB4's headphone out, an HD25's shells on
+  the MacBook's microphones, found by correlation; minus the same burst from the Mac's headphone
+  out with the shells unmoved (19.935 ms, three runs within 7 us), which cancels the distance and
+  Apple's microphone processing (it reports 2413 frames, 50 ms, and is ~20 ms off). Two runs per
+  rate within 2 frames.
+- Output plus input exceeds the loopback by 36, 43, 94, 96 frames: the converters' filters,
+  which a digital loop does not pass through. So nearly all the ~140 frames of the loop are on
+  the output side; the input side is about one converter at 44.1/48 kHz and gains ~80 frames
+  at 88.2/96 kHz, cause unknown.
+- Ploytec's reference schematic (USB2 Audio Launchpad v3, 2010: ISP1583, ATmega8515, WM8776,
+  AK4114) puts the ISP1583's 16-bit DMA bus straight on the serial audio lines, strobed from
+  the audio clock (74HC4040 divider), with no RAM and the microcontroller out of the sample
+  path: only the endpoint buffers, at most two packets each way. If the DB4's USB side is that
+  design, the ~140 output frames are beyond it (its mixer/DSP), not on the USB board.
+- The clock anchors slipped by a microframe every ~6 s (fixed 2026-10-25). An OUT transfer
+  completes on the host's 125 us microframe grid (the device takes a packet only when it has
+  room, the host offers one per microframe), plus up to ~30 us before the completion runs:
+  every gap between anchors was a whole number of microframes within +-30 us (552 of 552). An
+  anchor was one completion, and 6400 frames at 44.1 kHz are 1161.0 microframes, so every
+  anchor rounded alike until the device's drift (21 ppm slow here) carried it across one: steps
+  of ~125 us that CoreAudio passed on to clients, with its default filter (simple IIR), its
+  12-point moving average and with kAudioDevicePropertyClockIsStable 0 alike. IOUSBHost gives
+  bulk and interrupt completions no timestamp (isochronous ones only the observed time), so no
+  better time exists. The fix is in update_timestamp: the completions between two anchors fall
+  on every phase of the grid (a 160-frame transfer is 29.025 microframes), so each anchor is
+  their mean along the nominal rate. Measured over 40 s: anchors 37 us rms from the device's
+  line with 7 slips, now 6.4 us at 44.1 kHz and 12 us at 48 and 96 kHz with none; CoreAudio's
+  timestamps stepped 38-57 times over 20 us (to 159 us), now 3 (to 24 us) at 44.1 kHz and 25-28
+  (to 46 us) at 48 and 96 kHz, where 40 transfers aren't whole cycles of the grid's three
+  phases. Averaging can't help where a transfer is a whole number of microframes (48 kHz in
+  120-frame transfers: 20.0).

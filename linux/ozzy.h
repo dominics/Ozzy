@@ -1,10 +1,11 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * Ozzy USB Audio Driver - Core Definitions
+ * Ozzy USB Audio Driver - Linux on the shared engine
  *
- * Device-agnostic abstraction layer for non-class-compliant USB audio
- * hardware. Each device family implements ozzy_device_info (static
- * hardware descriptor) and ozzy_device_ops (behavioral contract).
+ * The engine (engine/) runs the device's protocol, as in the macOS kext and the Windows
+ * driver; this side gives it a bus (bus.c: URBs, control requests, a timer), ALSA PCM on its
+ * rings (pcm.c), rawmidi on its MIDI rings (midi.c) and the settings as ALSA controls
+ * (controls.c). core.c probes the device.
  *
  * Copyright (C) 2024 Marcel Bierling <marcel@hackerman.art>
  */
@@ -13,205 +14,142 @@
 #define OZZY_H
 
 #include <linux/usb.h>
+#include <linux/hrtimer.h>
+#include <linux/mutex.h>
+#include <linux/spinlock.h>
+#include <linux/workqueue.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
+#include <sound/rawmidi.h>
+
+#include "../engine/core/ozzy_engine.h"
+#include "../common/midi_running_status.h"
+
+#define OZZY_MAX_INTERFACES  4
+#define OZZY_MAX_PIPES        OZZY_PIPE_ROLES
+#define OZZY_URBS_PER_PIPE             8     /* per pipe: more than any engine keeps in flight (4) */
+
+#define chip_log(chip, fmt, ...)  dev_info(&(chip)->dev->dev, "[ozzy] " fmt "\n", ##__VA_ARGS__)
+#define chip_err(chip, fmt, ...)  dev_err(&(chip)->dev->dev, "[ozzy] " fmt "\n", ##__VA_ARGS__)
 
 struct ozzy_chip;
-struct pcm_runtime;
-struct midi_runtime;
 
-/*
- * struct ozzy_device_info - Static hardware descriptor for a device family.
- *
- * One const instance per device family (or per model if they differ).
- * Describes the hardware's capabilities and topology. Never changes
- * at runtime. Populated in each device file (e.g. devices/ploytec.c).
- */
-struct ozzy_device_info {
-	const char *name;                 /* human-readable name, e.g. "Ploytec Xone" */
+/* One URB of a pipe and what its completion needs */
+struct ozzy_urb {
+	struct urb *urb;
+	struct ozzy_chip *chip;
+	uint8_t pipe;                      /* index in ozzy_urb_bus.pipes */
+	uint8_t index;                     /* bit in the pipe's busy mask */
+	void *xfer;                        /* the engine's transfer cookie */
+	struct ozzy_isoc_packet *packets;  /* isochronous: the engine's packets */
+};
 
-	/* PCM topology */
-	unsigned int playback_channels;   /* number of playback channels (e.g. 8) */
-	unsigned int capture_channels;    /* number of capture channels (e.g. 8) */
-	unsigned int out_packet_size;     /* default output URB size in bytes */
-	unsigned int in_packet_size;      /* input URB size in bytes */
-	unsigned int frames_per_out_packet; /* audio frames per output USB transfer */
-	unsigned int frames_per_in_packet;  /* audio frames per input USB transfer */
-	unsigned int out_ep;              /* output endpoint number (e.g. 5) */
-	unsigned int in_ep;               /* input endpoint number (e.g. 6) */
-	u64 alsa_format;                  /* SNDRV_PCM_FMTBIT_xxx */
-	unsigned int bytes_per_sample;    /* bytes per ALSA sample (e.g. 3 for S24_3LE) */
-
-	/* MIDI topology */
-	unsigned int midi_in_ep;          /* dedicated MIDI input endpoint (0 = none) */
-	bool midi_out_embedded;           /* true if MIDI out is embedded in PCM out packets */
-
-	/* USB interface configuration */
-	unsigned int num_interfaces;      /* number of USB interfaces to claim (e.g. 2) */
-	unsigned int alt_setting;         /* alternate setting to select (e.g. 1) */
-
-	/* Sample rates */
-	const unsigned int *rates;        /* array of supported rates (e.g. {44100, 48000, ...}) */
-	unsigned int num_rates;           /* number of entries in rates[] */
-	unsigned int rates_mask;          /* SNDRV_PCM_RATE_xxx bitmask */
-	unsigned int rate_min;            /* lowest supported rate */
-	unsigned int rate_max;            /* highest supported rate */
+struct ozzy_urb_pipe {
+	uint8_t address;                   /* bEndpointAddress */
+	uint8_t type;                      /* USB_ENDPOINT_XFER_xxx */
+	uint8_t interval;                  /* bInterval */
+	unsigned int usb_pipe;
+	struct ozzy_urb urbs[OZZY_URBS_PER_PIPE];
+	unsigned long busy;                /* bit per URB in flight */
 };
 
 /*
- * struct ozzy_device_ops - Behavioral contract for a device family.
- *
- * Function pointer table implemented by each device family.
- * Follows the Linux kernel convention (cf. struct file_operations,
- * struct snd_pcm_ops). NULL pointers mean "not supported" or
- * "use default behavior" as documented per callback.
+ * struct ozzy_urb_bus - The engine's bus (engine/core/ozzy_bus.h) on URBs. Completions run in
+ * interrupt context; the engine resubmits from there with GFP_ATOMIC.
+ * @in_completion: completions running now (ozzy_urb_wait_completions)
  */
-struct ozzy_device_ops {
-	/*
-	 * init - Perform device-specific initialization after USB probe.
-	 * Called once after the chip struct is populated. Should perform the
-	 * vendor handshake sequence (firmware version, status, sample rate).
-	 * Allocate chip->private_data here if needed.
-	 * Returns 0 on success, negative errno on failure.
-	 */
-	int (*init)(struct ozzy_chip *chip);
+struct ozzy_urb_bus {
+	struct ozzy_bus bus;
+	struct ozzy_chip *chip;
+	struct usb_device *dev;
+	struct ozzy_urb_pipe pipes[OZZY_MAX_PIPES];
+	unsigned int num_pipes;
+	struct usb_anchor anchor;          /* every URB in flight */
+	atomic_t in_completion;
+	struct hrtimer timer;
+	ktime_t timer_interval;
+	bool timer_on;
+	u8 *ctrl_buf;                      /* control requests: the engine passes stack buffers */
+};
 
-	/*
-	 * free - Release device-specific resources.
-	 * Called during card destruction. Free chip->private_data here.
-	 */
-	void (*free)(struct ozzy_chip *chip);
+/* One PCM direction: ALSA's buffer as the engine's ring */
+struct ozzy_pcm_stream {
+	struct snd_pcm_substream *substream;
+	struct ozzy_pcm_ring ring;
+	spinlock_t lock;
+	bool attached;
+	uint64_t pos;                      /* ring position the engine reported last */
+	uint64_t period_next;              /* ring position of the next period boundary */
+};
 
-	/*
-	 * set_rate - Set the hardware sample rate.
-	 * @rate_index: index into the device's rate table (info->rates[]).
-	 * Sends the appropriate vendor requests to change the device's clock.
-	 * Returns 0 on success, negative errno on failure.
-	 */
-	int (*set_rate)(struct ozzy_chip *chip, unsigned int rate_index);
+#define OZZY_MIDI_PORTS 2   /* the CMS 600-3's second port (OZZY_QUIRK_MIDI_PORT2) */
 
-	/*
-	 * reset - Perform a USB device reset (e.g. for sample rate changes).
-	 * Called when the rate change requires a full device reset.
-	 * NULL if set_rate fully applies the new rate on its own.
-	 * The core's pre_reset/post_reset callbacks handle URB teardown/reinit.
-	 * Returns 0 on success, negative errno on failure.
-	 */
-	int (*reset)(struct ozzy_chip *chip);
+/* One MIDI port: a rawmidi substream per direction on a ring pair */
+struct ozzy_midi_port {
+	struct snd_rawmidi_substream *in;  /* triggered input, NULL if none */
+	struct snd_rawmidi_substream *out; /* triggered output, NULL if none */
+	volatile struct ozzy_midi_buffer *ring_in, *ring_out;
+	struct midi_running_status rs;     /* the output stream's running status (PR #80) */
+	u8 pending[2];                     /* expanded bytes that didn't fit the ring yet */
+	unsigned int pending_count;
+};
 
-	/*
-	 * process_out_packet - Encode ALSA audio into a device output USB packet.
-	 * Zero-copy: reads directly from the ALSA DMA area, writes directly
-	 * into the URB buffer. Handles device-specific framing (padding, gaps).
-	 * Must handle DMA ring buffer wraparound when dma_off + packet > buf_size.
-	 * @urb_buf:         destination URB buffer (device format)
-	 * @dma_area:        source ALSA DMA ring buffer (interleaved samples)
-	 * @dma_off:         current byte offset in the DMA ring buffer
-	 * @pcm_buffer_size: total DMA ring buffer size in bytes
-	 * Returns: number of ALSA bytes consumed from the DMA area.
-	 */
-	unsigned int (*process_out_packet)(struct ozzy_chip *chip, uint8_t *urb_buf,
-					   uint8_t *dma_area, unsigned int dma_off,
-					   unsigned int pcm_buffer_size);
-
-	/*
-	 * process_in_packet - Decode a device input USB packet into ALSA audio.
-	 * Zero-copy: reads directly from the URB buffer, writes directly into
-	 * the ALSA DMA area. Must handle DMA ring buffer wraparound.
-	 * @urb_buf:         source URB buffer (device format)
-	 * @dma_area:        destination ALSA DMA ring buffer (interleaved samples)
-	 * @dma_off:         current byte offset in the DMA ring buffer
-	 * @pcm_buffer_size: total DMA ring buffer size in bytes
-	 * Returns: number of ALSA bytes written to the DMA area.
-	 */
-	unsigned int (*process_in_packet)(struct ozzy_chip *chip, uint8_t *urb_buf,
-					  uint8_t *dma_area, unsigned int dma_off,
-					  unsigned int pcm_buffer_size);
-
-	/*
-	 * init_out_urb - Fill an output URB buffer with the initial silence pattern.
-	 * Called once per URB at allocation time. Should write device-specific
-	 * silence values, sync bytes, padding, and MIDI idle bytes.
-	 * @buffer: the URB buffer to initialize (size from get_out_packet_size)
-	 */
-	void (*init_out_urb)(struct ozzy_chip *chip, uint8_t *buffer);
-
-	/*
-	 * fill_midi_out - Embed pending MIDI output bytes into a PCM out packet.
-	 * Called from the out URB handler after audio processing. Reads from
-	 * the MIDI runtime's send buffer and writes into device-specific byte
-	 * positions within the URB buffer.
-	 * NULL if device doesn't embed MIDI in PCM output packets.
-	 * @urb_buf: the output URB buffer to write MIDI bytes into
-	 */
-	void (*fill_midi_out)(struct ozzy_chip *chip, uint8_t *urb_buf);
-
-	/*
-	 * get_out_packet_size - Return the output packet size in bytes.
-	 * May differ between bulk and interrupt transfer modes.
-	 * Called during URB allocation to determine buffer size.
-	 * If NULL, the core uses info->out_packet_size.
-	 * @is_bulk: true if the output endpoint uses bulk transfers
-	 */
-	unsigned int (*get_out_packet_size)(struct ozzy_chip *chip, bool is_bulk);
-
-	/*
-	 * start_urbs - Allocate and submit the device's own streaming URBs.
-	 * For devices whose transport the core URB model can't express
-	 * (e.g. isochronous endpoints with feedback). When set, the core
-	 * calls this instead of setting up its own PCM URBs, and
-	 * process_out_packet, process_in_packet and init_out_urb are unused.
-	 * Called with the PCM stream mutex held. Completion handlers advance
-	 * the ALSA position with ozzy_pcm_advance().
-	 * Returns 0 on success, negative errno on failure (with nothing left
-	 * submitted).
-	 */
-	int (*start_urbs)(struct ozzy_chip *chip);
-
-	/*
-	 * stop_urbs - Kill and free the URBs from start_urbs.
-	 * Required if start_urbs is set. Called from process context during
-	 * disconnect and pre-reset; must be safe to call when nothing is running.
-	 */
-	void (*stop_urbs)(struct ozzy_chip *chip);
+struct ozzy_midi {
+	struct snd_rawmidi *rmidi;
+	spinlock_t lock;
+	unsigned int ports;                /* 1, or 2 with the engine moving the second */
+	struct ozzy_midi_port port[OZZY_MIDI_PORTS];
+	struct ozzy_midi_buffer midi2_in, midi2_out;   /* the second port's rings */
 };
 
 /*
- * struct ozzy_device_desc - Pairs a device's info and ops for USB ID lookup.
- *
- * Stored in usb_device_id.driver_data so the probe function can look up
- * both the hardware descriptor and behavioral contract from the USB match.
- */
-struct ozzy_device_desc {
-	const struct ozzy_device_info *info;
-	const struct ozzy_device_ops *ops;
-};
-
-/*
- * struct ozzy_chip - Per-device instance state.
- *
- * One allocated per USB device that is plugged in. Stored as
- * snd_card->private_data. Contains pointers to the matched device
- * info/ops and all runtime subsystem state.
+ * struct ozzy_chip - One device (snd_card private data).
+ * @lock: serializes restarts (rate changes, settings) with each other and disconnect
  */
 struct ozzy_chip {
-	struct usb_device *dev;           /* USB device handle */
-	struct snd_card *card;            /* ALSA sound card */
-
-	const struct ozzy_device_info *info; /* static hardware descriptor */
-	const struct ozzy_device_ops *ops;   /* device behavior callbacks */
-
-	struct pcm_runtime *pcm;          /* PCM subsystem runtime (NULL until init) */
-	struct midi_runtime *midi;        /* MIDI subsystem runtime (NULL until init) */
-
-	unsigned int current_rate;        /* rate index currently active on hardware */
-	unsigned int requested_rate;      /* rate index requested by ALSA */
-	bool is_bulk;                     /* true if output EP uses bulk transfers */
-
-	struct usb_interface *intf;       /* primary USB interface */
-	struct usb_interface *intf2;      /* secondary USB interface (NULL if single) */
-
-	void *private_data;               /* device-specific runtime data */
+	struct usb_device *dev;
+	struct snd_card *card;
+	struct usb_interface *intf[OZZY_MAX_INTERFACES];   /* [0] probed, the rest claimed */
+	unsigned int num_intf;
+	const struct ozzy_device *model;
+	struct ozzy_engine *engine;
+	struct ozzy_shared_memory *shm;    /* CPU only (vzalloc): the transfers have their own memory */
+	struct ozzy_urb_bus bus;
+	struct mutex lock;
+	bool running;                      /* engine started, device present */
+	bool gone;                         /* disconnected */
+	struct snd_pcm *pcm;
+	struct ozzy_pcm_stream stream[OZZY_PCM_DIRS];
+	struct ozzy_midi midi;
+	struct snd_kcontrol *clock_lock_kctl;
+	struct snd_kcontrol *info_kctl;
+	struct snd_kcontrol *stats_kctl;
+	struct delayed_work stats_work;    /* a stats incident: clients hear of it once it settles */
 };
+
+/* bus.c */
+int ozzy_urb_init(struct ozzy_urb_bus *bus, struct ozzy_chip *chip);
+int ozzy_urb_add_pipe(struct ozzy_urb_bus *bus, const struct usb_endpoint_descriptor *epd);
+void ozzy_urb_wait_completions(struct ozzy_urb_bus *bus);
+void ozzy_urb_free(struct ozzy_urb_bus *bus);
+
+/* core.c */
+int ozzy_chip_restart(struct ozzy_chip *chip);
+
+/* pcm.c */
+int ozzy_pcm_init(struct ozzy_chip *chip);
+void ozzy_pcm_progress(struct ozzy_chip *chip, enum ozzy_pcm_dir dir, uint64_t frames);
+void ozzy_pcm_stop_streams(struct ozzy_chip *chip);
+
+/* midi.c */
+void ozzy_midi_attach(struct ozzy_chip *chip);
+int ozzy_midi_init(struct ozzy_chip *chip);
+void ozzy_midi_service(struct ozzy_chip *chip);
+
+/* controls.c */
+int ozzy_controls_init(struct ozzy_chip *chip);
+void ozzy_controls_handshake(struct ozzy_chip *chip);
+void ozzy_controls_stream_changed(struct ozzy_chip *chip);
+void ozzy_controls_stats_work(struct work_struct *work);
 
 #endif /* OZZY_H */

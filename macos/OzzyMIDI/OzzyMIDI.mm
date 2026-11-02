@@ -1,419 +1,337 @@
 #include "OzzyMIDI.h"
-#include "../Shared/OzzySharedData.h"
+#include "../../engine/shared/ozzy_shared_data.h"
 #include "../Shared/OzzyLog.h"
-#include "MidiParser.h"
+#include "../Shared/OzzyKextClient.h"
+#include "../Shared/OzzyBackend.h"
+#include "OzzyMIDIPort2.h"
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMIDI/CoreMIDI.h>
 #include <mach/mach_time.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <atomic>
-#include <errno.h>
 #include <IOKit/IOKitLib.h>
-#include <SystemConfiguration/SystemConfiguration.h>
-#include <dispatch/dispatch.h>
 
-/* Threading rule: the poll thread is pure IO. It maps and watches the
- * segment, moves bytes from the in rings to MIDIReceived and keeps the ring
- * indices, and makes no CoreMIDI call other than MIDIReceived: Stop() holds
- * CoreMIDI's mutex while it joins the poll thread. Every device lifecycle
- * and property call is posted to the main queue, and the device state below
- * (gMidiDeviceRef, gSources, gPortCount) is written only on the main thread.
- * Stop() makes no CoreMIDI calls. */
+/*
+ * One port per OzzyKext instance or OzzyDaemon segment (OzzyBackend.h; a DB4 and a Xone:1D can
+ * be connected at the same time).
+ * A port keeps its MIDI device when the hardware goes away (it goes offline), so apps keep
+ * their connections when the same device comes back.
+ *
+ * Threads: everything that changes CoreMIDI devices (create, rename, online/offline, dispose)
+ * runs on MIDIServer's main run loop, from Start/Stop and a scan timer. MIDIServer calls Stop
+ * there while holding its own lock, and those calls take that lock too, so making them on the
+ * poll thread deadlocks Stop's join. The poll thread only drains the input rings and calls
+ * MIDIReceived.
+ */
+#define kMaxPorts 8
 
-static OzzySharedMemory* gSharedMem = nullptr;
-/* Send() runs on CoreMIDI's thread and writes through gSharedMem; it holds
- * this lock while it does. The poll thread takes it to publish or drop the
- * mapping, and unmaps only after dropping it, so Send never touches an
- * unmapped segment. Only the poll thread (or Stop() after joining it) maps
- * and unmaps, so the poll thread itself reads gSharedMem without the lock. */
-static pthread_mutex_t gShmLock = PTHREAD_MUTEX_INITIALIZER;
-static uint16_t gVendorID = 0, gProductID = 0;   // identity of the mapped device
-static MIDIDeviceRef gMidiDeviceRef = 0;
+// MIDI out that doesn't fit the shared ring waits here until the kext has drained it: the
+// device takes 2500 bytes/s and the ring holds 1 KB. 64 KB like the official driver's MIDI
+// queue (26 s of MIDI).
+#define kPendingSize 65536
+
+struct OzzyMidiPort {
+	// Connection to one OzzyKext instance or daemon segment; shm is null while disconnected
+	uint64_t registryID;   // the OzzyKext instance's, or the USB device's for a daemon
+	uint32_t locationID;   // USB port: tells two devices of the same model apart
+	OzzyBackend backend;
+	ozzy_shared_memory* shm;
+	uint32_t sessionID;
+
+	// CoreMIDI objects, kept across reconnects
+	MIDIDeviceRef device;
+	MIDIEndpointRef source;
+	char name[64];
+
+	// Bumped on every connect, so the poll thread knows to reset its parser
+	uint32_t generation;
+
+	// MIDI out waiting for room in the shared ring, oldest first (gPortLock); its dropped
+	// bytes are reported once it drains
+	struct ozzy_midi_queue pending;
+	Byte pendingBuf[kPendingSize];
+
+	// The CMS 600-3's second MIDI port (OzzyMIDIPort2.h)
+	OzzyMidiPort2 port2;
+};
+
+static OzzyMidiPort gPorts[kMaxPorts];
 static MIDIDriverRef gDriverRef = nullptr;
 
-static const int kMaxPorts = 2;
-static std::atomic<int> gPortCount{0};                      // entities currently on the device
-static MIDIEndpointRef gSources[kMaxPorts] = {};
-static MidiParser gParsers[kMaxPorts] = {};                 // poll thread only
+// Our devices stay in the MIDI setup across MIDIServer restarts (Start gets them back); this
+// property is the USB port each was on, to give it back to the same device
+static const CFStringRef kLocationProperty = CFSTR("com.ozzy.locationID");
 
-/* Bumped by Stop() and by every connect, reconfigure or disconnect the poll
- * thread posts. A posted block captures it and does nothing once it is
- * stale, so a block queued before Stop() never touches the device after
- * Stop() has returned. */
-static std::atomic<uint32_t> gGeneration{1};
-/* The generation whose entities are configured, published by the main
- * thread after it writes gSources and gPortCount. The poll thread reads
- * gSources only while this equals gGeneration; bumping the generation
- * clears it. */
-static std::atomic<uint32_t> gEntitiesReady{0};
-static int gRequestedPorts = 0;                             // poll thread only: ports last posted
-
-// The port count comes from shared memory the other side can write, so it is clamped to 1..2.
-static int WantedPorts() { return (gSharedMem && gSharedMem->midiPortCount >= 2) ? 2 : 1; }
-
-/* The daemon's segment is world-writable by name, so any local user could
- * create it first. Only map one owned by the console user, who runs the
- * daemon. */
-static bool OwnedByConsoleUser(const struct stat& sb) {
-	uid_t uid = 0;
-	CFStringRef name = SCDynamicStoreCopyConsoleUser(NULL, &uid, NULL);
-	if (!name) return false;
-	CFRelease(name);
-	return sb.st_uid == uid;
-}
-
-static OzzyMidiBuffer& InRing(int port) { return port == 1 ? gSharedMem->midiInPort1 : gSharedMem->midiIn; }
-static OzzyMidiBuffer& OutRing(int port) { return port == 1 ? gSharedMem->midiOutPort1 : gSharedMem->midiOut; }
-
-static void EmitToSource(const uint8_t* msg, size_t len, void* ctx)
-{
-	MIDIEndpointRef src = (MIDIEndpointRef)(uintptr_t)ctx;
-	if (!src)
-		return;
-	Byte storage[sizeof(MIDIPacketList) + MidiParser::kChunk];
-	MIDIPacketList* pl = (MIDIPacketList*)storage;
-	MIDIPacket* p = MIDIPacketListInit(pl);
-	p = MIDIPacketListAdd(pl, sizeof(storage), p, mach_absolute_time(), len, msg);
-	if (p)
-		MIDIReceived(src, pl);
-}
+// Held around every use of a port's shared memory and pending MIDI out by Send and the poll
+// thread, and while the main thread maps or unmaps it. Never held across a CoreMIDI call.
+static pthread_mutex_t gPortLock = PTHREAD_MUTEX_INITIALIZER;
 
 static std::atomic<bool> gThreadShouldRun{false};
 static pthread_t gPollThread = nullptr;
-static uint32_t gLastSessionID = 0;
+static CFRunLoopTimerRef gScanTimer = nullptr;
 
-// IOKit connection state
-static io_connect_t gKextConnect = IO_OBJECT_NULL;
-static mach_vm_address_t gKextMapAddress = 0;
-static mach_vm_size_t gKextMapSize = 0;
-static bool gIsKextMapping = false;
-static int gSHMFd = -1;
-static ino_t gSHMInode = 0;
+/* The device of @port for the device in @shm on USB port @locationID: the port's own (renamed if
+ * it was another's), else a new one, added to the MIDI setup */
+static void SetPortDevice(OzzyMidiPort* port, const ozzy_shared_memory* shm, uint32_t locationID) {
+	const char* name = shm->product_name[0] ? shm->product_name : "Ozzy MIDI";
+	const char* mfg = shm->manufacturer_name[0] ? shm->manufacturer_name : "Ozzy";
+	CFStringRef deviceName = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
+	CFStringRef vendorName = CFStringCreateWithCString(NULL, mfg, kCFStringEncodingUTF8);
 
-/* Main thread only. The name and manufacturer are set by
- * EnsureMIDIDeviceCreated from its snapshot. */
-static void SetDeviceOnline(bool online) {
-	if (gMidiDeviceRef) {
-		SInt32 offline = online ? 0 : 1;
-		MIDIObjectSetIntegerProperty(gMidiDeviceRef, kMIDIPropertyOffline, offline);
-	}
-}
-
-/* Main thread only. Give the device one entity per port: "MIDI" for one,
- * "USB-MIDI" and "SystemCtrl" for the CMS 600-3. Destinations carry their
- * port number. The poll thread resets the parsers when it posts this. */
-static void ConfigureEntities(int want) {
-	if (want == gPortCount.load())
-		return;
-	gPortCount.store(0);
-	for (ItemCount i = MIDIDeviceGetNumberOfEntities(gMidiDeviceRef); i-- > 0;)
-		MIDIDeviceRemoveEntity(gMidiDeviceRef, MIDIDeviceGetEntity(gMidiDeviceRef, i));
-	static const CFStringRef one[] = { CFSTR("MIDI") };
-	static const CFStringRef two[] = { CFSTR("USB-MIDI"), CFSTR("SystemCtrl") };
-	for (int port = 0; port < want; port++) {
-		MIDIEntityRef ent;
-		OSStatus err = MIDIDeviceAddEntity(gMidiDeviceRef, want == 2 ? two[port] : one[port], false, 1, 1, &ent);
-		if (err != noErr) {
-			LogOzzyMIDIError("failed to add MIDI entity %{public}d: %{public}d", port, (int)err);
-			gPortCount.store(port);
-			return;
-		}
-		gSources[port] = MIDIEntityGetSource(ent, 0);
-		MIDIEndpointSetRefCons(MIDIEntityGetDestination(ent, 0), (void*)(intptr_t)port, nullptr);
-	}
-	gPortCount.store(want);
-	LogOzzyMIDI("%{public}d MIDI port(s)", want);
-}
-
-/* What the main thread needs from the segment, copied on the poll thread
- * so the main thread never reads gSharedMem. */
-struct DeviceSnapshot {
-	char name[64];
-	char mfg[64];
-	int ports;
-};
-static_assert(sizeof(DeviceSnapshot::name) == sizeof(OzzySharedMemory::productName), "snapshot name size");
-static_assert(sizeof(DeviceSnapshot::mfg) == sizeof(OzzySharedMemory::manufacturerName), "snapshot mfg size");
-
-/* Main thread only. Create the device, or rename an existing one, give it
- * the snapshot's ports and mark it online. */
-static void EnsureMIDIDeviceCreated(const DeviceSnapshot& snap) {
-	CFStringRef deviceName = CFStringCreateWithCString(NULL, snap.name, kCFStringEncodingUTF8);
-	CFStringRef vendorName = CFStringCreateWithCString(NULL, snap.mfg, kCFStringEncodingUTF8);
-
-	if (gMidiDeviceRef != 0) {
-		if (deviceName) MIDIObjectSetStringProperty(gMidiDeviceRef, kMIDIPropertyName, deviceName);
-		if (vendorName) MIDIObjectSetStringProperty(gMidiDeviceRef, kMIDIPropertyManufacturer, vendorName);
-		ConfigureEntities(snap.ports);
-		SetDeviceOnline(true);
+	if (port->device) {
+		if (deviceName) MIDIObjectSetStringProperty(port->device, kMIDIPropertyName, deviceName);
+		if (vendorName) MIDIObjectSetStringProperty(port->device, kMIDIPropertyManufacturer, vendorName);
 	} else {
-			LogOzzyMIDI("creating device: '%{public}s'", snap.name);
-		OSStatus err = MIDIDeviceCreate(gDriverRef, deviceName, vendorName, deviceName, &gMidiDeviceRef);
-		
+		LogOzzyMIDI("creating device: '%{public}s'", name);
+		OSStatus err = MIDIDeviceCreate(gDriverRef, deviceName, vendorName, deviceName, &port->device);
 		if (err == noErr) {
-			gPortCount.store(0);
-			ConfigureEntities(snap.ports);
-			SInt32 val = 1;
-			MIDIObjectSetIntegerProperty(gMidiDeviceRef, kMIDIPropertyDriverOwner, val);
-			SetDeviceOnline(true);
+			MIDIEntityRef ent;
+			MIDIDeviceAddEntity(port->device, CFSTR("MIDI"), false, 1, 1, &ent);
+			port->source = MIDIEntityGetSource(ent, 0);
+			MIDIEndpointSetRefCons(MIDIEntityGetDestination(ent, 0), port, nullptr);
+			// Without this the device exists but no client sees it (only a rescan's FindDevices
+			// showed it)
+			err = MIDISetupAddDevice(port->device);
+			if (err != noErr) LogOzzyMIDIError("failed to add the device to the MIDI setup: %{public}d", (int)err);
 		} else {
-				LogOzzyMIDIError("failed to create device: %{public}d", (int)err);
+			LogOzzyMIDIError("failed to create device: %{public}d", (int)err);
+			port->device = 0;
 		}
 	}
-	
+	if (port->device) {
+		MIDIObjectSetIntegerProperty(port->device, kLocationProperty, (SInt32)locationID);
+		MIDIObjectSetIntegerProperty(port->device, kMIDIPropertyOffline, 0);
+	}
+	strlcpy(port->name, name, sizeof(port->name));
+
 	if (deviceName) CFRelease(deviceName);
 	if (vendorName) CFRelease(vendorName);
 }
 
-/* Poll thread. Snapshot the segment, reset the parsers and post the device
- * coming online (create or rename, configure the ports, set online) to the
- * main thread. Bytes are dropped until that block has run. */
-static void PostDeviceOnline() {
-	DeviceSnapshot snap = { "Ozzy MIDI", "Ozzy", WantedPorts() };
-	// The other side may leave a name unterminated: copy a fixed size and terminate.
-	if (gSharedMem->productName[0] != 0) {
-		memcpy(snap.name, gSharedMem->productName, sizeof(snap.name) - 1);
-		snap.name[sizeof(snap.name) - 1] = 0;
-	}
-	if (gSharedMem->manufacturerName[0] != 0) {
-		memcpy(snap.mfg, gSharedMem->manufacturerName, sizeof(snap.mfg) - 1);
-		snap.mfg[sizeof(snap.mfg) - 1] = 0;
-	}
-	for (int i = 0; i < kMaxPorts; i++) gParsers[i] = MidiParser();
-	gRequestedPorts = snap.ports;
-	uint32_t gen = gGeneration.fetch_add(1) + 1;
-	dispatch_async(dispatch_get_main_queue(), ^{
-		if (gGeneration.load() != gen)
-			return;
-		EnsureMIDIDeviceCreated(snap);
-		if (gMidiDeviceRef)
-			gEntitiesReady.store(gen, std::memory_order_release);
-	});
+/* Close the port's connection to its driver; no CoreMIDI calls */
+static void UnmapPort(OzzyMidiPort* port) {
+	pthread_mutex_lock(&gPortLock);
+	port->backend.Close();
+	port->shm = nullptr;
+	port->registryID = 0;
+	port->pending.head = port->pending.tail = 0;
+	port->port2.rings = nullptr;
+	port->port2.pending.head = port->port2.pending.tail = 0;
+	pthread_mutex_unlock(&gPortLock);
 }
 
-static void PublishMapping(OzzySharedMemory* mem) {
-	pthread_mutex_lock(&gShmLock);
-	gSharedMem = mem;
-	pthread_mutex_unlock(&gShmLock);
+/* The port's second entity for @backend's second MIDI port, or none (OzzyMIDIPort2.h) */
+static void SetPort2(OzzyMidiPort* port, OzzyBackend& backend) {
+	struct ozzy_daemon_midi2* m2 = backend.Midi2();
+	MIDIEndpointRef source = port->device ? OzzyMidiSetEntities(port->device, m2, port) : 0;
+
+	pthread_mutex_lock(&gPortLock);
+	port->port2.source = source;
+	port->port2.rings = source ? m2 : nullptr;
+	port->port2.pending.buf = port->port2.pendingBuf;
+	port->port2.pending.mask = kPort2PendingSize - 1;
+	port->port2.pending.head = port->port2.pending.tail = 0;
+	pthread_mutex_unlock(&gPortLock);
+	if (source) LogOzzyMIDI("'%{public}s': second MIDI port '%{public}.32s'", port->name, m2->name);
 }
 
-/* Unpublish and unmap the segment and close its handles. Runs on the poll
- * thread, or in Stop() after the join. Returns whether one was mapped. */
-static bool UnmapSharedMemory() {
-	OzzySharedMemory* mem = gSharedMem;
-	if (mem) {
-		PublishMapping(nullptr);   // from here on Send() can't be using the segment
-		if (gIsKextMapping) {
-			IOConnectUnmapMemory(gKextConnect, 0, mach_task_self(), gKextMapAddress);
-			IOServiceClose(gKextConnect);
-			gKextConnect = IO_OBJECT_NULL;
-			gKextMapAddress = 0;
-			gKextMapSize = 0;
-			gIsKextMapping = false;
-		} else {
-			munmap(mem, sizeof(OzzySharedMemory));
-			if (gSHMFd != -1) {
-				close(gSHMFd);
-				gSHMFd = -1;
-			}
-		}
-		LogOzzyMIDI("disconnected");
-		return true;
-	}
+static void DisconnectPort(OzzyMidiPort* port) {
+	if (!port->shm) return;
+	UnmapPort(port);
+	if (port->device) MIDIObjectSetIntegerProperty(port->device, kMIDIPropertyOffline, 1);
+	LogOzzyMIDI("'%{public}s' disconnected", port->name);
+}
+
+static bool PortIsConnected(uint64_t registryID) {
+	for (int i = 0; i < kMaxPorts; i++)
+		if (gPorts[i].shm && gPorts[i].registryID == registryID) return true;
 	return false;
 }
 
-/* Poll thread. Drop the segment, stop feeding the sources and post the
- * device going offline to the main thread. */
-static void DisconnectOnPollThread() {
-	if (!UnmapSharedMemory())
+/* A free port for a device called @name on USB port @locationID: preferably the one it had
+ * before (or one of that name from the setup without a USB port: added by a rescan), else an
+ * unused one, else any disconnected port (its device gets renamed). */
+static OzzyMidiPort* PortForDevice(const char* name, uint32_t locationID) {
+	for (int i = 0; i < kMaxPorts; i++)
+		if (!gPorts[i].shm && gPorts[i].device && gPorts[i].locationID == locationID &&
+		    strcmp(gPorts[i].name, name) == 0) return &gPorts[i];
+	for (int i = 0; i < kMaxPorts; i++)
+		if (!gPorts[i].shm && gPorts[i].device && gPorts[i].locationID == 0 &&
+		    strcmp(gPorts[i].name, name) == 0) return &gPorts[i];
+	for (int i = 0; i < kMaxPorts; i++)
+		if (!gPorts[i].shm && !gPorts[i].device) return &gPorts[i];
+	for (int i = 0; i < kMaxPorts; i++)
+		if (!gPorts[i].shm) return &gPorts[i];
+	return nullptr;
+}
+
+/* Give an open backend a port, or close it */
+static void AttachBackend(OzzyBackend& backend, uint64_t registryID, uint32_t locationID) {
+	ozzy_shared_memory* shm = backend.shm;
+	OzzyMidiPort* port = nullptr;
+	if (shm->magic != OZZY_MAGIC || shm->version != OZZY_SHARED_VERSION) {
+		LogOzzyMIDIError("SHM magic/version mismatch (version %{public}u, expected %{public}u): reinstall Ozzy",
+		                 shm->version, OZZY_SHARED_VERSION);
+	} else if (!shm->audio.hardware_present.load()) {
+		// Not started yet; try again on the next scan
+	} else {
+		port = PortForDevice(shm->product_name[0] ? shm->product_name : "Ozzy MIDI", locationID);
+		if (!port) LogOzzyMIDIError("too many devices");
+	}
+	if (!port) {
+		backend.Close();
 		return;
-	uint32_t gen = gGeneration.fetch_add(1) + 1;
-	dispatch_async(dispatch_get_main_queue(), ^{
-		if (gGeneration.load() != gen)
-			return;
-		SetDeviceOnline(false);
-	});
-}
-
-/* The engine restarted (a rate change or a halted stream) and published a
- * new session in the same segment. The mapping stays valid, so keep it:
- * reset the parsers and follow a change in the port count, which is posted
- * to the main thread. A different device behind the same segment counts as
- * the device going away. */
-static bool OnSessionChange() {
-	if (gSharedMem->vendorID != gVendorID || gSharedMem->productID != gProductID) {
-		LogOzzyMIDIError("device changed, reconnecting");
-		DisconnectOnPollThread();
-		return false;
-	}
-	gLastSessionID = gSharedMem->sessionID;
-	LogOzzyMIDI("session changed (0x%{public}08X)", gLastSessionID);
-	for (int i = 0; i < kMaxPorts; i++) gParsers[i] = MidiParser();
-	if (WantedPorts() != gRequestedPorts) PostDeviceOnline();
-	return true;
-}
-
-/* A segment was mapped: publish it to Send() and remember whose it is. */
-static void Connected(OzzySharedMemory* mem) {
-	PublishMapping(mem);
-	gLastSessionID = mem->sessionID;
-	gVendorID = mem->vendorID;
-	gProductID = mem->productID;
-}
-
-static bool UpdateConnectionState() {
-	if (gSharedMem) {
-		if (gSharedMem->magic != kOzzyMagic) {
-				LogOzzyMIDIError("bad magic, disconnecting");
-			DisconnectOnPollThread();
-			return false;
-		}
-		if (gSharedMem->sessionID != gLastSessionID) return OnSessionChange();
-		return true;
 	}
 
-	// --- 1. Try OzzyKext (IOKit) ---
-	CFMutableDictionaryRef matching = IOServiceMatching("OzzyKext");
-	io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, matching);
-	
-	if (service) {
-		LogOzzyMIDI("found OzzyKext service, connecting...");
-		kern_return_t kr = IOServiceOpen(service, mach_task_self(), 0, &gKextConnect);
-		IOObjectRelease(service);
-		
-		if (kr == KERN_SUCCESS) {
-			kr = IOConnectMapMemory(gKextConnect, 0, mach_task_self(), &gKextMapAddress, &gKextMapSize, kIOMapAnywhere);
-			if (kr == KERN_SUCCESS) {
-				gIsKextMapping = true;
-				Connected((OzzySharedMemory*)gKextMapAddress);
-					LogOzzyMIDI("connected to kext (session: 0x%{public}08X)", gLastSessionID);
-				PostDeviceOnline();
-				return true;
-			} else {
-					LogOzzyMIDIError("failed to map kext memory (0x%{public}x)", kr);
-				IOServiceClose(gKextConnect);
-				gKextConnect = IO_OBJECT_NULL;
+	SetPortDevice(port, shm, locationID);
+	SetPort2(port, backend);
+
+	pthread_mutex_lock(&gPortLock);
+	port->registryID = registryID;
+	port->locationID = locationID;
+	port->backend = backend;
+	port->sessionID = shm->session_id;
+	port->generation++;
+	port->pending.buf = port->pendingBuf;
+	port->pending.mask = kPendingSize - 1;
+	port->shm = shm;
+	pthread_mutex_unlock(&gPortLock);
+	LogOzzyMIDI("connected to '%{public}s' (%{public}s, session: 0x%{public}08X)", port->name,
+	            backend.kind == OzzyBackendKind::Daemon ? "daemon" : "kext", port->sessionID);
+}
+
+static void ConnectService(io_service_t service, uint64_t registryID) {
+	OzzyBackend backend;
+	if (!backend.OpenKext(service)) {
+		LogOzzyMIDIError("failed to open or map the kext");
+		return;
+	}
+	AttachBackend(backend, registryID, OzzyUSBLocationID(service));
+}
+
+/* Connect to the daemon segments of listed USB devices that no port has yet (by the kext or a
+ * daemon). A device without a segment (no daemon drives it) is skipped quietly. */
+static void ScanDaemonSegments() {
+	OzzyUSBDevice usb[kMaxPorts];
+	unsigned int n = OzzyListUSBDevices(usb, kMaxPorts);
+	for (unsigned int k = 0; k < n; k++) {
+		bool known = false;
+		for (int i = 0; i < kMaxPorts; i++)
+			known |= gPorts[i].shm && (gPorts[i].registryID == usb[k].registryID ||
+			                           gPorts[i].locationID == usb[k].locationID);
+		OzzyBackend backend;
+		if (!known && backend.OpenDaemon(usb[k].locationID))
+			AttachBackend(backend, usb[k].registryID, usb[k].locationID);
+	}
+}
+
+/* Connect to OzzyKext instances and daemon segments we don't have yet and drop ports whose
+ * device (or daemon) went away */
+static void ScanDevices() {
+	static unsigned int scans;
+	for (int i = 0; i < kMaxPorts; i++) {
+		OzzyMidiPort* port = &gPorts[i];
+		if (!port->shm) continue;
+		if (port->shm->magic != OZZY_MAGIC || port->shm->session_id != port->sessionID ||
+		    !port->shm->audio.hardware_present.load(std::memory_order_relaxed) || !port->backend.Alive()) {
+			DisconnectPort(port);
+		} else if (!port->device) {
+			// MIDIDeviceCreate failed when it connected: try again each 500 ms, entities included
+			if (scans % 10 == 0) {
+				SetPortDevice(port, port->shm, port->locationID);
+				if (port->device) SetPort2(port, port->backend);
 			}
+		} else if (!port->port2.rings && port->backend.Midi2()) {
+			SetPort2(port, port->backend);
 		}
 	}
 
-	// --- 2. Fallback to Daemon (shm_open) ---
-	gIsKextMapping = false;
-	int fd = shm_open(kOzzySharedMemName, O_RDWR, 0666);
-	if (fd == -1) return false;
-
-	struct stat sb;
-	if (fstat(fd, &sb) == -1) { close(fd); return false; }
-	if (sb.st_size < sizeof(OzzySharedMemory)) { close(fd); return false; }
-	if (!OwnedByConsoleUser(sb)) {
-		// Logged once per owner, not on every poll.
-		static uid_t lastRefused = (uid_t)-1;
-		if (sb.st_uid != lastRefused) {
-			LogOzzyMIDIError("ignoring /ozzy_shared_mem owned by uid %{public}u, not the console user", sb.st_uid);
-			lastRefused = sb.st_uid;
-		}
-		close(fd);
-		return false;
+	io_iterator_t it = IO_OBJECT_NULL;
+	if (IOServiceGetMatchingServices(MACH_PORT_NULL, IOServiceMatching("OzzyKext"), &it) != KERN_SUCCESS) return;
+	io_service_t service;
+	while ((service = IOIteratorNext(it))) {
+		uint64_t registryID = 0;
+		IORegistryEntryGetRegistryEntryID(service, &registryID);
+		if (!PortIsConnected(registryID)) ConnectService(service, registryID);
+		IOObjectRelease(service);
 	}
+	IOObjectRelease(it);
+	// Daemon segments each 500 ms: it lists the USB devices
+	if (scans++ % 10 == 0) ScanDaemonSegments();
+}
 
-	gSHMInode = sb.st_ino;
-	void* ptr = mmap(NULL, sizeof(OzzySharedMemory), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	
-	if (ptr == MAP_FAILED) {
-		close(fd);
-		return false;
-	}
+/* Drain the port's input rings (midi_in, and the second port's) into CoreMIDI. Returns true if
+ * there was data. */
+static bool DrainInput(OzzyMidiPort* port, OzzyMidiParsers* parsers) {
+	Byte bytes[OZZY_MIDI_RING_SIZE], bytes2[OZZY_MIDI_RING_SIZE];
+	uint32_t count = 0, count2 = 0;
 
-	gSHMFd = fd;
-	Connected((OzzySharedMemory*)ptr);
-	
-	if (gSharedMem->magic != kOzzyMagic) {
-		DisconnectOnPollThread();
-		return false;
+	// Copy the rings out under the lock, so the main thread can't unmap them meanwhile
+	pthread_mutex_lock(&gPortLock);
+	ozzy_shared_memory* shm = port->shm;
+	MIDIEndpointRef source = port->source, source2 = port->port2.source;
+	uint32_t generation = port->generation;
+	if (shm) count = ozzy_midi_ring_pop(&shm->midi_in, bytes, sizeof(bytes));
+	if (port->port2.rings) count2 = ozzy_midi_ring_pop(&port->port2.rings->in, bytes2, sizeof(bytes2));
+	pthread_mutex_unlock(&gPortLock);
+
+	if (parsers->generation != generation) {
+		*parsers = OzzyMidiParsers{};
+		parsers->generation = generation;
 	}
-	
-	LogOzzyMIDI("connected via shm_open (session: 0x%{public}08X)", gLastSessionID);
-	PostDeviceOnline();
-	return true;
+	OzzyMidiFeed(&parsers->port[0], source, bytes, count);
+	OzzyMidiFeed(&parsers->port[1], source2, bytes2, count2);
+	return count || count2;
+}
+
+/* Move waiting MIDI out into the shared ring as the kext drains it. Returns true if any moved. */
+static bool FlushMidiOut(OzzyMidiPort* port) {
+	uint32_t dropped = 0;
+
+	pthread_mutex_lock(&gPortLock);
+	bool moved = port->shm && ozzy_midi_queue_pending(&port->pending) &&
+	             ozzy_midi_queue_write(&port->shm->midi_out, &port->pending, nullptr, 0);
+	if (moved) port->backend.MidiOutPending();
+	if (!ozzy_midi_queue_pending(&port->pending)) {
+		dropped = port->pending.dropped;
+		port->pending.dropped = 0;
+	}
+	if (port->port2.rings && ozzy_midi_queue_pending(&port->port2.pending))
+		moved |= ozzy_midi_queue_write(&port->port2.rings->out, &port->port2.pending, nullptr, 0) != 0;
+	if (!ozzy_midi_queue_pending(&port->port2.pending)) {
+		dropped += port->port2.pending.dropped;
+		port->port2.pending.dropped = 0;
+	}
+	pthread_mutex_unlock(&gPortLock);
+
+	if (dropped) LogOzzyMIDIError("'%{public}s': MIDI out queue drained, %{public}u bytes were dropped", port->name, dropped);
+	return moved;
 }
 
 static void* MidiInputPollThread(void* arg) {
 	LogOzzyMIDI("poll thread started");
-	int checkCounter = 0;
-	
+	OzzyMidiParsers parsers[kMaxPorts] = {};
+
 	while (gThreadShouldRun.load()) {
-		if (!gSharedMem) {
-			if (!UpdateConnectionState()) {
-				usleep(50000);
-				continue;
-			}
-		} else {
-			// Periodically verify connection is still valid
-			if (++checkCounter > 1000) {
-				checkCounter = 0;
-				bool magicValid = (gSharedMem->magic == kOzzyMagic);
-				bool sessionValid = (gSharedMem->sessionID == gLastSessionID);
-				bool hwPresent = gSharedMem->audio.hardwarePresent.load(std::memory_order_relaxed);
-				
-				if (!magicValid || !hwPresent) {
-						LogOzzyMIDIError("connection lost (magic:%{public}d hw:%{public}d), reconnecting",
-						magicValid, hwPresent);
-					DisconnectOnPollThread();
-					continue;
-				}
-				if (!sessionValid && !OnSessionChange()) continue;
-				// Repost on a port count change, or once this generation's block
-				// has run but configured fewer entities than requested.
-				bool configured = gEntitiesReady.load(std::memory_order_acquire) == gGeneration.load(std::memory_order_relaxed);
-				if (WantedPorts() != gRequestedPorts || (configured && gPortCount.load() != gRequestedPorts))
-					PostDeviceOnline();
-			}
-			
-			// Also check hardware presence on every iteration (fast check)
-			if (!gSharedMem->audio.hardwarePresent.load(std::memory_order_relaxed)) {
-				LogOzzyMIDIError("device disconnected");
-				DisconnectOnPollThread();
-				continue;
-			}
-		}
-
-		if (!gSharedMem) continue;
-
-		// Drain every requested ring. Parse only the ports whose entities the
-		// main thread has configured for this generation; drop the rest.
-		bool ready = gEntitiesReady.load(std::memory_order_acquire) == gGeneration.load(std::memory_order_relaxed);
-		int fed = ready ? gPortCount.load() : 0;
 		bool didWork = false;
-		for (int port = 0; port < gRequestedPorts; port++) {
-			OzzyMidiBuffer& ring = InRing(port);
-			// Indices come from memory the other side can write: mask before indexing.
-			uint32_t r = std::atomic_load_explicit(&ring.readIndex, std::memory_order_relaxed) & kOzzyMidiRingMask;
-			uint32_t w = std::atomic_load_explicit(&ring.writeIndex, std::memory_order_acquire) & kOzzyMidiRingMask;
-			if (r == w)
-				continue;
-			didWork = true;
-			while (port < fed && r != w) {
-				MidiParserFeed(&gParsers[port], ring.buffer[r], EmitToSource, (void*)(uintptr_t)gSources[port]);
-				r = (r + 1) & kOzzyMidiRingMask;
-			}
-			r = w;
-			std::atomic_store_explicit(&ring.readIndex, r, std::memory_order_release);
+		for (int i = 0; i < kMaxPorts; i++) {
+			didWork |= DrainInput(&gPorts[i], &parsers[i]);
+			didWork |= FlushMidiOut(&gPorts[i]);
 		}
-		if (!didWork)
-			usleep(500);
+		if (!didWork) usleep(500);
 	}
-
-	// Stop() unmaps the segment after joining this thread.
 	return NULL;
 }
 
+static void ScanTimerFired(CFRunLoopTimerRef, void*) {
+	ScanDevices();
+}
+
 static OSStatus FindDevices(MIDIDriverRef self, MIDIDeviceListRef devList) {
-	if (gMidiDeviceRef) MIDIDeviceListAddDevice(devList, gMidiDeviceRef);
+	for (int i = 0; i < kMaxPorts; i++) {
+		if (gPorts[i].device) MIDIDeviceListAddDevice(devList, gPorts[i].device);
+	}
 	return noErr;
 }
 static OSStatus Configure(MIDIDriverRef, MIDIDeviceRef) { return noErr; }
@@ -421,8 +339,82 @@ static OSStatus EnableSource(MIDIDriverRef, MIDIEndpointRef, Boolean) { return n
 static OSStatus Flush(MIDIDriverRef, MIDIEndpointRef, void*, void*) { return noErr; }
 static OSStatus Monitor(MIDIDriverRef, MIDIEndpointRef, const MIDIPacketList*) { return noErr; }
 
+static void CopyName(MIDIObjectRef obj, char* buf, size_t size) {
+	CFStringRef name = nullptr;
+	buf[0] = 0;
+	MIDIObjectGetStringProperty(obj, kMIDIPropertyName, &name);
+	if (name) {
+		CFStringGetCString(name, buf, (CFIndex)size, kCFStringEncodingUTF8);
+		CFRelease(name);
+	}
+}
+
+/* One of our devices from the setup takes a port, offline until its hardware is found. A second
+ * device for the same name and USB port is a duplicate and goes. */
+static void AdoptDevice(MIDIDeviceRef dev) {
+	char name[64];
+	SInt32 location = 0;
+	CopyName(dev, name, sizeof(name));
+	MIDIObjectGetIntegerProperty(dev, kLocationProperty, &location);
+	for (int i = 0; i < kMaxPorts; i++) {
+		if (gPorts[i].device == dev) return;
+		if (gPorts[i].device && gPorts[i].locationID == (uint32_t)location && strcmp(gPorts[i].name, name) == 0) {
+			OSStatus err = MIDISetupRemoveDevice(dev);
+			LogOzzyMIDI("removing a duplicate of '%{public}s' from the MIDI setup: %{public}d", name, (int)err);
+			return;
+		}
+	}
+	OzzyMidiPort* port = nullptr;
+	for (int i = 0; i < kMaxPorts && !port; i++)
+		if (!gPorts[i].device) port = &gPorts[i];
+	if (!port || MIDIDeviceGetNumberOfEntities(dev) < 1) return;
+	MIDIEntityRef ent = MIDIDeviceGetEntity(dev, 0);
+	if (MIDIEntityGetNumberOfSources(ent) < 1 || MIDIEntityGetNumberOfDestinations(ent) < 1) return;
+
+	strlcpy(port->name, name, sizeof(port->name));
+	port->device = dev;
+	port->locationID = (uint32_t)location;
+	port->source = MIDIEntityGetSource(ent, 0);
+	MIDIEndpointSetRefCons(MIDIEntityGetDestination(ent, 0), port, nullptr);
+	port->port2.source = OzzyMidiAdoptSecondEntity(dev, port);
+	MIDIObjectSetIntegerProperty(dev, kMIDIPropertyOffline, 1);
+	LogOzzyMIDI("'%{public}s' from the MIDI setup", port->name);
+}
+
+/* Start: our devices already in the setup (from an earlier MIDIServer run, @devList) take ports;
+ * ScanDevices gives each back to its device. Devices with our location property but no driver
+ * owner are from builds that set kMIDIPropertyDriverOwner to a number: MIDIServer doesn't hand
+ * them back, won't let us remove them, and setting the owner again doesn't make their endpoints
+ * ours. They stay offline; Audio MIDI Setup can delete them. */
+static void AdoptDevices(MIDIDeviceListRef devList) {
+	ItemCount count = devList ? MIDIDeviceListGetNumberOfDevices(devList) : 0;
+	for (ItemCount d = 0; d < count; d++)
+		AdoptDevice(MIDIDeviceListGetDevice(devList, d));
+
+	for (ItemCount i = 0; i < MIDIGetNumberOfDevices(); i++) {
+		MIDIDeviceRef dev = MIDIGetDevice(i);
+		SInt32 location = 0;
+		CFStringRef owner = nullptr;
+		if (MIDIObjectGetIntegerProperty(dev, kLocationProperty, &location) != noErr) continue;
+		if (MIDIObjectGetStringProperty(dev, kMIDIPropertyDriverOwner, &owner) == noErr && owner) {
+			CFRelease(owner);
+			continue;
+		}
+		char name[64];
+		CopyName(dev, name, sizeof(name));
+		LogOzzyMIDI("'%{public}s' in the MIDI setup is from an older build; delete it in Audio MIDI Setup", name);
+	}
+}
+
 static OSStatus Start(MIDIDriverRef self, MIDIDeviceListRef devList) {
 	gDriverRef = self;
+	AdoptDevices(devList);
+	ScanDevices();
+	if (!gScanTimer) {
+		// Look for new and departed devices every 50 ms
+		gScanTimer = CFRunLoopTimerCreate(NULL, CFAbsoluteTimeGetCurrent() + 0.05, 0.05, 0, 0, ScanTimerFired, NULL);
+		CFRunLoopAddTimer(CFRunLoopGetMain(), gScanTimer, kCFRunLoopCommonModes);
+	}
 	if (!gThreadShouldRun.load()) {
 		gThreadShouldRun.store(true);
 		pthread_create(&gPollThread, NULL, MidiInputPollThread, NULL);
@@ -430,59 +422,53 @@ static OSStatus Start(MIDIDriverRef self, MIDIDeviceListRef devList) {
 	return noErr;
 }
 
-/* Called on MIDIServer's main thread, which also runs the blocks the poll
- * thread posts, so none of them can run while this does. Bumping the
- * generation after the join makes every block already queued stale.
- * MIDIServer calls this from MIDIDriverMgr::StopMIDI, in the middle of
- * stopping every driver; a CoreMIDI object call made here (setting a
- * property, disposing the device) leaves its setup state broken and the
- * next driver's Stop crashes. So this only drops the segment and resets
- * the plugin's own state. The device stays with the server, and a later
- * Start() reuses gMidiDeviceRef. */
 static OSStatus Stop(MIDIDriverRef self) {
+	if (gScanTimer) {
+		CFRunLoopTimerInvalidate(gScanTimer);
+		CFRelease(gScanTimer);
+		gScanTimer = nullptr;
+	}
 	if (gThreadShouldRun.load()) {
 		gThreadShouldRun.store(false);
 		pthread_join(gPollThread, NULL);
 		gPollThread = nullptr;
 	}
-	gGeneration.fetch_add(1);
-	UnmapSharedMemory();
-	gRequestedPorts = 0;
-	gDriverRef = nullptr;
+	// Only close the kext connections. MIDIServer stops its drivers when it shuts down, and
+	// changing or disposing devices that are in the setup then crashes it (in whichever
+	// driver it stops next); the devices stay in the setup as they are.
+	for (int i = 0; i < kMaxPorts; i++) {
+		if (gPorts[i].shm) UnmapPort(&gPorts[i]);
+	}
 	return noErr;
 }
 
-/* Called on CoreMIDI's thread. Holds gShmLock while it writes to the
- * segment so the poll thread can't unmap it underneath; the poll thread
- * alone connects, so a send before it has is refused. */
+/* Queue the bytes for the kext (ozzy_midi_queue_write), then tell it. Ploytec devices pick them up
+ * with the next PCM packet anyway; the Xone:1D sends only when told. */
 static OSStatus Send(MIDIDriverRef self, const MIDIPacketList *pktlist, void *destRefCon1, void *destRefCon2) {
-	pthread_mutex_lock(&gShmLock);
-	if (!gSharedMem) {
-		pthread_mutex_unlock(&gShmLock);
+	OzzyMidiPort* port = (OzzyMidiPort*)destRefCon1;
+	bool second = destRefCon2 == OzzyMidiEntityRefCon(1);   // the second port's entity
+	if (!port) return kMIDINoConnection;
+
+	pthread_mutex_lock(&gPortLock);
+	if (!port->shm || (second && !port->port2.rings)) {
+		pthread_mutex_unlock(&gPortLock);
 		return kMIDINoConnection;
 	}
-	
-	int port = (int)(intptr_t)destRefCon1;
-	if (port < 0 || port >= gPortCount.load() || port >= WantedPorts()) {
-		pthread_mutex_unlock(&gShmLock);
-		return kMIDIUnknownEndpoint;
-	}
-	OzzyMidiBuffer& ring = OutRing(port);
 
+	ozzy_midi_ring* ring = second ? &port->port2.rings->out : &port->shm->midi_out;
+	struct ozzy_midi_queue* pending = second ? &port->port2.pending : &port->pending;
+	uint32_t droppedBefore = pending->dropped;
 	const MIDIPacket *packet = &pktlist->packet[0];
 	for (unsigned int i = 0; i < pktlist->numPackets; ++i) {
-		for (unsigned int j = 0; j < packet->length; ++j) {
-			uint32_t w = std::atomic_load_explicit(&ring.writeIndex, std::memory_order_relaxed) & kOzzyMidiRingMask;
-			uint32_t r = std::atomic_load_explicit(&ring.readIndex, std::memory_order_acquire) & kOzzyMidiRingMask;
-			uint32_t nextW = (w + 1) & kOzzyMidiRingMask;
-			if (nextW != r) {
-				ring.buffer[w] = packet->data[j];
-				std::atomic_store_explicit(&ring.writeIndex, nextW, std::memory_order_release);
-			}
-		}
+		ozzy_midi_queue_write(ring, pending, packet->data, packet->length);
 		packet = MIDIPacketNext(packet);
 	}
-	pthread_mutex_unlock(&gShmLock);
+	if (!second) port->backend.MidiOutPending();
+	bool startedDropping = droppedBefore == 0 && pending->dropped != 0;
+	pthread_mutex_unlock(&gPortLock);
+
+	if (startedDropping) LogOzzyMIDIError("'%{public}s': MIDI out queue full (%{public}u KB), dropping", port->name,
+	                                      (pending->mask + 1) / 1024);
 	return noErr;
 }
 

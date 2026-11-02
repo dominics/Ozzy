@@ -31,7 +31,7 @@ Returns 15-byte firmware version. Known fields:
 - byte[0]: chip ID
 - byte[2]: version (decimal encoded: v1.{byte/10}.{byte%10})
 
-### 'A' (0x41) — ESU Clock Source Config (ESU/product 0x2573 only)
+### 'A' (0x41) — ESU Clock Source Config (ESI, VID 0x2573, ESU product line only)
 
 Called via `sendEsuARequest(device, param)` during ESU's `updateAjInputSelector_Esu186`.
 Also called from `configurationDone` for product 0x2573/0x12.
@@ -52,6 +52,26 @@ Log: `"WRITE ESU A-Request value: %d"` with `param & 7`.
 Appears to configure the ESU's clock source at the hardware level, complementing
 the composite state written to index 0 of vendor request 'I'.
 
+Order in `PGDevice::configurationDone` (all before `startStreaming` sets the rate):
+`updateAjInputSelector` (ESI: `_Esu186`, guarded by plist flags), then 'A' 0x349 for 2573:0012
+only, then `updateAjInputSelector(NULL)` again (ESI: another 'A', 0x348 for STATE_A, which
+overrides the 0x349), ..., then `setEsuCpldByte`. Ozzy (`hs_esi_setup` in
+`common/devices/ploytec/ploytec_handshake.c`, `OZZY_QUIRK_ESI` / `OZZY_QUIRK_ESI_U168`) sends
+'A' 0x349 (U168 XT), the ESI selector with STATE_A and 'A' 0x348, then the CPLD byte 0xE7, all
+before SET_CUR, and skips the Xone status confirm. Untested on hardware.
+
+### 'A' (0x41) — S/PDIF output registers (writeDigitalOutMode, wIndex 0x0101)
+
+Plist flag 0x7a6 (Tascams but the US-200, MPC Renaissance) or Tascam 0x8041/0x8048: read 5 bytes
+(0xC0, wValue 0x0D00), then write registers 0x0D..0x11 that differ (wValue `reg << 8 | val`).
+Mode 0 (default): 04, 00 (0x0E written only if non-zero), 00, `(old & 0xF0) | rate code`
+(32k 3, 44.1k 0, 48k 2, 88.2k 8, 96k 0xA, 176.4k 0xC, 192k 0xE), 0B.
+Mode 1: 0x0D 0xC1/0x41/0x81 at 32k/44.1k/48k, 0x01 at 88.2k and up (other rates: unchanged),
+0x0E 0, 0x0F 0x2C, 0x10 0, 0x11 0x50/0x10/0x58/0x18 at 88.2k/96k/176.4k/192k, else 0. Mode 1 sets
+IEC 60958 byte 0 bit 0 (professional). Runs in `startStreaming` after SET_CUR, and from
+`setDigitalOutMode` with streaming suspended. Ozzy: `hs_spdif_regs` / `hs_spdif_out`,
+`OZZY_QUIRK_SPDIF_OUT`, setting `OZZY_SETTING_SPDIF_OUT_MODE`.
+
 ### 'A' (0x41) — Wolfson Codec Register Write (devices with Wolfson DAC/ADC)
 
 From `writeWolfsonRegister(this, chipIndex, registerIndex, value)`:
@@ -67,6 +87,14 @@ wLength:       0
 **Note:** Same bRequest as ESU clock config, but different wIndex values distinguish them:
 - wIndex=0x0101 → ESU clock source config
 - wIndex=0x0102/0x0106 → Wolfson codec register write
+
+The one known user is the Musonik PHASE X64 USB (0A4A:5B01, two WM8776). Its Windows 2.9.34
+driver (`WM8776SetDefault`, in configurationDone) writes the registry values, or else these
+defaults: codec 0 R7=0x090, R21=0x001, R22=0x001; codec 1 R7=0x090, R21=0x004, R22=0x001. The
+Mac kext 2.0.4 writes them only from its control panel. R21 is the ADC input mux (bit 0 Mic/Line/
+HiZ, 1 Phono, 2 Aux, 3 sound module, 4 loopback of the other output pair; 0xC0 = muted), R22
+the output mux (bit 0 playback, 1/2 direct monitoring), R7 0x090 stereo / 0x0F0 mono playback.
+Ozzy writes the defaults (`OZZY_QUIRK_WM8776`). Details: `OEM_DRIVERS/Musonik_PhaseX64/findings.md`.
 
 ### 'B' (0x42) — Reverb Buffer Write (VID 0x0644)
 
@@ -196,8 +224,18 @@ wIndex:        0x0086 / 0x0005 (endpoint addresses)
 wLength:       3
 ```
 
-Sends 3 bytes, little-endian sample rate. Sent 5 times alternating between endpoints
-0x0086 and 0x0005 (3x to 0x0086, 2x to 0x0005).
+Sends 3 bytes, little-endian sample rate. How many times it is sent differs per source:
+- DB4 Windows capture: 5× alternating (3× 0x0086, 2× 0x0005)
+- DB2 Windows capture (PR #70): 7× alternating 0x86,0x05,0x86,0x05,0x86,0x05,0x86, ~27 ms apart,
+  then GET_CUR with wIndex=0x0086 to read it back
+- Official macOS driver: 5× (86,05 in startStreaming; 86,05 in resumeStreaming; 86 + GET_CUR 86 +
+  50 ms sleep in bulkAudioRun). Each `setFrequency` call is one request; see `ploytec_sample_rates.md` §5
+- Ozzy currently sends 2 (commit bbfa66d, based on the incorrect "once per pipe" reading). Issue #72
+  reports the DB2 only works with the 7-call sequence, but that was tested together with the framing
+  fix, so it's unproven whether the count matters.
+
+Neither driver ever sends GET_MIN/GET_MAX/GET_RES. The device is never asked which rates it
+supports. See `ploytec_sample_rates.md`.
 
 ## Standard USB Requests
 

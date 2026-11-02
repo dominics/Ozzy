@@ -56,7 +56,7 @@ enum ploytec_ctrl_reg {
  * use read-modify-write -- never blindly overwrite.
  *
  * Confirmed bits:
- *   0x02 - input routing / source select
+ *   0x02 - clock source: set = automatic (S/PDIF in when valid), clear = internal
  *   0x04 - digital signal lock (detected via (byte & 0x05) == 0x04)
  *
  * Partially understood bits (device-dependent mode/config):
@@ -65,7 +65,7 @@ enum ploytec_ctrl_reg {
  */
 enum ploytec_aj_input_flags {
 	PLOYTEC_AJ_MODE0_BIT        = 0x01,  /* mode/config, device-dependent */
-	PLOYTEC_AJ_INPUT_SELECT_BIT = 0x02,  /* input routing / source select */
+	PLOYTEC_AJ_INPUT_SELECT_BIT = 0x02,  /* clock source: set = automatic (ploytec_aj_clock_byte) */
 	PLOYTEC_AJ_DIGITAL_LOCK_BIT = 0x04,  /* digital signal lock */
 	PLOYTEC_AJ_MODE3_BIT        = 0x08,  /* mode/config, device-dependent */
 	PLOYTEC_AJ_MODE4_BIT        = 0x10,  /* mode/config, device-dependent */
@@ -78,11 +78,41 @@ enum ploytec_aj_input_flags {
 #define PLOYTEC_AJ_DIGITAL_LOCK_MASK   0x05
 #define PLOYTEC_AJ_DIGITAL_LOCK_VALUE  0x04
 
-/* ESU-specific composite states (observed fixed patterns, not individual flags) */
+/*
+ * ploytec_aj_clock_byte - The selector byte @b with bit 1 for clock source @clock
+ * (enum ozzy_clock_source). The official updateAjInputSelector sets bit 1 for
+ * ClockSource (AjExtData[1]) 0 and clears it otherwise; Tascam's Control Panel calls 0
+ * "Automatic" (the default) and 1 "Internal". Not yet seen on a device.
+ */
+static inline uint8_t ploytec_aj_clock_byte(uint8_t b, uint8_t clock)
+{
+	return clock == 0 ? (uint8_t)(b | PLOYTEC_AJ_INPUT_SELECT_BIT) :
+			    (uint8_t)(b & ~PLOYTEC_AJ_INPUT_SELECT_BIT);
+}
+
+/*
+ * ploytec_aj_locked - Whether the selector byte reports digital lock.
+ */
+static inline bool ploytec_aj_locked(uint8_t b)
+{
+	return (b & PLOYTEC_AJ_DIGITAL_LOCK_MASK) == PLOYTEC_AJ_DIGITAL_LOCK_VALUE;
+}
+
+/*
+ * ESI U-series selector states (updateAjInputSelector_Esu186): the byte keeps the
+ * PRESERVE_MASK bits it reads and gets one of three states, from the driver's
+ * clock setting (AjExtData+4): 2 -> STATE_A, 1 -> STATE_B, else STATE_C. STATE_B
+ * also sends the 'A' request with bit 0 set. Which state is which clock source
+ * ("Internal (Analoge audio only)" / "External SPDIF" in ESI's 2.0 driver) is open;
+ * STATE_A is the one the driver reports as its default (*param_1 = 0x32).
+ */
 #define PLOYTEC_AJ_ESU_PRESERVE_MASK   0x4C
 #define PLOYTEC_AJ_ESU_STATE_A         0x32
 #define PLOYTEC_AJ_ESU_STATE_B         0xB0
 #define PLOYTEC_AJ_ESU_STATE_C         0xB2
+
+/* ESI CPLD byte ('I' wIndex 1, setEsuCpldByte): wValue = setting | 0xE7, setting 0 at start */
+#define PLOYTEC_ESI_CPLD_BASE          0xE7
 
 /*
  * struct ploytec_aj_input_status - Decoded AJ Input Selector register (wIndex=0).
@@ -125,13 +155,16 @@ static inline void ploytec_decode_aj_input(uint8_t raw, struct ploytec_aj_input_
  * ploytec_confirm_wvalue - Compute wValue for the status confirm write-back.
  * @status: raw byte read from vendor request 'I', wIndex=0
  *
- * Sets bit 5 (MODE5/LegacyActive) and sign-extends to 16 bits,
+ * The official setAJDMAInputChannels (bulkAudioRun, every stream start): sets
+ * bit 5 (16-lane input DMA, for up to 16 inputs, which every Ozzy device has) and
+ * bit 4 (MODE4/StreamingArmed; the Xones already report it at power-up, so for
+ * them only bit 5 changes), and sign-extends to 16 bits,
  * matching the official Ploytec driver's (short)(char)byte cast.
  * The high byte is 0xFF when bit 7 is set, 0x00 when clear.
  */
 static inline uint16_t ploytec_confirm_wvalue(uint8_t status)
 {
-	int8_t modified = (int8_t)(status | PLOYTEC_AJ_MODE5_BIT);
+	int8_t modified = (int8_t)(status | PLOYTEC_AJ_MODE5_BIT | PLOYTEC_AJ_MODE4_BIT);
 	return (uint16_t)(int16_t)modified;
 }
 
@@ -148,92 +181,126 @@ enum ploytec_us3xx_config_flags {
 #define PLOYTEC_US3XX_WRITABLE_MASK    0x18
 #define PLOYTEC_US3XX_FORCED_HIGH_MASK 0xE7
 
+/*
+ * ploytec_us3xx_selector - The AJ input selector ('I' wIndex 0) a TEAC device gets: the byte
+ * read (@sel) with bits 3-4 from the channel config (@config, 'I' wIndex 1), as the official
+ * updateAjInputSelector merges this[0xd2] for VID 0x644. The US-366's Windows driver wrote 0x0A
+ * from 0x02 and 0x0F (.claude/re/tascam_us366.md).
+ */
+static inline uint8_t ploytec_us3xx_selector(uint8_t sel, uint8_t config)
+{
+	return (uint8_t)((sel & ~PLOYTEC_US3XX_WRITABLE_MASK) | (config & PLOYTEC_US3XX_WRITABLE_MASK));
+}
+
+/*
+ * ploytec_us366_channels - The US-366's PCM channels in the mixer mode @config ('I' wIndex 1)
+ * says, as the official readUS3XXChannelConfig picks them: bypass 2 in / 2 out, else 6 out /
+ * 4 in with the width bit (the capture: 0x0F) or 4 out / 6 in without. Only 6 out / 4 in has
+ * been seen on the wire.
+ */
+static inline void ploytec_us366_channels(uint8_t config, uint32_t *in, uint32_t *out)
+{
+	if (config & PLOYTEC_US3XX_MIXER_BYPASS_BIT) {
+		*in = 2;
+		*out = 2;
+	} else if (config & PLOYTEC_US3XX_MIXER_WIDTH_BIT) {
+		*in = 4;
+		*out = 6;
+	} else {
+		*in = 6;
+		*out = 4;
+	}
+}
+
 
 /* ========================================================================
- * Packet Layout Tables
+ * Output Packet Layout
  *
- * The Ploytec chipset groups audio frames into sub-packets with MIDI
- * byte slots between them. The layout differs between bulk and
- * interrupt transfer modes. These tables describe where things go
- * so both platforms use identical framing logic.
+ * Output goes in sub-packets of 10 frames, with a MIDI byte and a control
+ * byte embedded in each; a transfer is any number of them in a row.
+ * There are two layouts. Which one a device uses follows the PCM OUT
+ * endpoint's wMaxPacketSize, not its transfer type, like the official
+ * driver (AudioBulkIRP::useOut):
+ *
+ *   BULK (wMaxPacketSize <= 512), 512 bytes per sub-packet:
+ *     [480 PCM (10 frames)][MIDI][control][30 pad]
+ *   INT (wMaxPacketSize 964), 482 bytes per sub-packet, 2 per USB packet:
+ *     [432 PCM (9 frames)][MIDI][control][48 PCM (1 frame)]
+ *
+ * ploytec_midi.h fills the MIDI slots.
+ *
+ * Both platforms compute all offsets with the helpers below.
  * ======================================================================== */
 
-/*
- * struct ploytec_subpacket - Describes one group of audio frames in an output packet.
- * @start_frame: index of the first audio frame in this group
- * @frame_count: number of audio frames in this group
- * @byte_offset: byte offset of first audio frame within the USB packet
- */
-struct ploytec_subpacket {
-	uint8_t start_frame;
-	uint8_t frame_count;
-	uint16_t byte_offset;
+enum ploytec_out_layout {
+	PLOYTEC_OUT_LAYOUT_BULK,
+	PLOYTEC_OUT_LAYOUT_INT,
 };
 
 /*
- * struct ploytec_midi_slot - Describes one MIDI byte position in an output packet.
- * @offset:    byte offset within the USB packet
- * @num_bytes: number of MIDI bytes at this position (1 for bulk, 2 for interrupt)
+ * ploytec_out_layout_for_maxpacket - Select the output layout from the
+ * PCM OUT endpoint's wMaxPacketSize.
  */
-struct ploytec_midi_slot {
-	uint16_t offset;
-	uint8_t num_bytes;
-};
+static inline enum ploytec_out_layout ploytec_out_layout_for_maxpacket(uint16_t max_packet_size)
+{
+	return max_packet_size <= PLOYTEC_BULK_OUT_SUBPKT_SIZE ? PLOYTEC_OUT_LAYOUT_BULK
+							      : PLOYTEC_OUT_LAYOUT_INT;
+}
+
+/* Bytes of one output sub-packet (10 frames, a MIDI slot and a control byte) */
+static inline uint32_t ploytec_out_subpkt_size(enum ploytec_out_layout layout)
+{
+	return layout == PLOYTEC_OUT_LAYOUT_BULK ? PLOYTEC_BULK_OUT_SUBPKT_SIZE : PLOYTEC_INT_OUT_SUBPKT_SIZE;
+}
 
 /*
- * Bulk output packet layout (2048 bytes total):
- *   4 groups of 10 frames (480 bytes) + 32-byte gap (1 MIDI + 1 sync + 30 pad)
- *   Group 0: frames  0-9  at offset 0
- *   Group 1: frames 10-19 at offset 512
- *   Group 2: frames 20-29 at offset 1024
- *   Group 3: frames 30-39 at offset 1536
+ * ploytec_out_frame_offset - Byte offset of frame @frame of a run of sub-packets from the start
+ * of its first (frame 10 is the first of the second sub-packet).
  */
-static const struct ploytec_subpacket ploytec_bulk_subpackets[] = {
-	{ .start_frame =  0, .frame_count = 10, .byte_offset = 0 },
-	{ .start_frame = 10, .frame_count = 10, .byte_offset = 512 },
-	{ .start_frame = 20, .frame_count = 10, .byte_offset = 1024 },
-	{ .start_frame = 30, .frame_count = 10, .byte_offset = 1536 },
-};
+static inline uint32_t ploytec_out_frame_offset(enum ploytec_out_layout layout, uint32_t frame)
+{
+	uint32_t subpkt = frame / PLOYTEC_FRAMES_PER_OUT_SUBPKT;
+	uint32_t index = frame % PLOYTEC_FRAMES_PER_OUT_SUBPKT;
+
+	if (layout == PLOYTEC_OUT_LAYOUT_BULK)
+		return subpkt * PLOYTEC_BULK_OUT_SUBPKT_SIZE + index * PLOYTEC_OUT_FRAME_SIZE;
+
+	/* INT: frames 0-8, then the MIDI slot and control byte, then frame 9 */
+	return subpkt * PLOYTEC_INT_OUT_SUBPKT_SIZE + index * PLOYTEC_OUT_FRAME_SIZE +
+	       (index == PLOYTEC_FRAMES_PER_OUT_SUBPKT - 1 ? 2 : 0);
+}
 
 /*
- * Interrupt output packet layout (1928 bytes total):
- *   5 groups with 2-byte MIDI gaps between them
- *   Group 0: frames  0-8  (9 frames, 432 bytes) at offset 0
- *   Group 1: frames  9-18 (10 frames) at offset 434
- *   Group 2: frames 19-28 (10 frames) at offset 916
- *   Group 3: frames 29-38 (10 frames) at offset 1398
- *   Group 4: frame  39    (1 frame)   at offset 1880
+ * ploytec_out_midi_offset - Byte offset of the MIDI slot of sub-packet @subpkt of a run.
+ * The control byte follows it.
  */
-static const struct ploytec_subpacket ploytec_int_subpackets[] = {
-	{ .start_frame =  0, .frame_count =  9, .byte_offset = 0 },
-	{ .start_frame =  9, .frame_count = 10, .byte_offset = 434 },
-	{ .start_frame = 19, .frame_count = 10, .byte_offset = 916 },
-	{ .start_frame = 29, .frame_count = 10, .byte_offset = 1398 },
-	{ .start_frame = 39, .frame_count =  1, .byte_offset = 1880 },
-};
+static inline uint32_t ploytec_out_midi_offset(enum ploytec_out_layout layout, uint32_t subpkt)
+{
+	if (layout == PLOYTEC_OUT_LAYOUT_BULK)
+		return subpkt * PLOYTEC_BULK_OUT_SUBPKT_SIZE +
+		       PLOYTEC_FRAMES_PER_OUT_SUBPKT * PLOYTEC_OUT_FRAME_SIZE;
 
-#define PLOYTEC_BULK_NUM_SUBPACKETS  4
-#define PLOYTEC_INT_NUM_SUBPACKETS   5
+	return subpkt * PLOYTEC_INT_OUT_SUBPKT_SIZE +
+	       (PLOYTEC_FRAMES_PER_OUT_SUBPKT - 1) * PLOYTEC_OUT_FRAME_SIZE;
+}
 
-/* Bulk MIDI slots: 1 byte each, after each 10-frame group */
-static const struct ploytec_midi_slot ploytec_bulk_midi_slots[] = {
-	{ .offset = 480,  .num_bytes = 1 },
-	{ .offset = 992,  .num_bytes = 1 },
-	{ .offset = 1504, .num_bytes = 1 },
-	{ .offset = 2016, .num_bytes = 1 },
-};
+/*
+ * ploytec_out_init_subpkts - Fill @count sub-packets from @pkt with silence, idle MIDI slots
+ * and idle control bytes.
+ */
+static inline void ploytec_out_init_subpkts(enum ploytec_out_layout layout, uint8_t *pkt, uint32_t count)
+{
+	uint32_t k, midi;
 
-/* Interrupt MIDI slots: 2 bytes each, between frame groups */
-static const struct ploytec_midi_slot ploytec_int_midi_slots[] = {
-	{ .offset = 432,  .num_bytes = 2 },
-	{ .offset = 914,  .num_bytes = 2 },
-	{ .offset = 1396, .num_bytes = 2 },
-	{ .offset = 1878, .num_bytes = 2 },
-};
+	for (k = 0; k < count * ploytec_out_subpkt_size(layout); k++)
+		pkt[k] = 0;
 
-#define PLOYTEC_BULK_NUM_MIDI_SLOTS  4
-#define PLOYTEC_INT_NUM_MIDI_SLOTS   4
-
+	for (k = 0; k < count; k++) {
+		midi = ploytec_out_midi_offset(layout, k);
+		pkt[midi] = PLOYTEC_MIDI_IDLE_BYTE;
+		pkt[midi + 1] = PLOYTEC_MIDI_CONTROL_IDLE;
+	}
+}
 
 /* ========================================================================
  * Sample Rate Encoding

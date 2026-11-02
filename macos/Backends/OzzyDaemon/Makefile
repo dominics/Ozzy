@@ -1,65 +1,77 @@
-# SPDX-License-Identifier: MIT
-COMMON   := ../../../common/devices/ploytec
-CXX      ?= clang++
-CC       ?= clang
-CXXFLAGS := -std=gnu++20 -O2 -g -Wall -Wextra -Werror -MMD -MP
-CFLAGS   := -std=c11 -O2 -g -Wall -Wextra -Werror -MMD -MP
-FRAMEWORKS := -framework IOKit -framework CoreFoundation -framework SystemConfiguration
-OZZY_VERSION ?= 0.0.0-dev
+# OzzyDaemon: the fork's userspace backend. Drives a device through IOUSBLib with the portable
+# engine and publishes its shared memory as a POSIX shm segment (see segment.h).
+#   make           build/ozzy-daemon (this machine's architecture)
+#   make UNIVERSAL=1   arm64 + x86_64
+#   make check     host tests (no device needed)
+#   make OZZY_VERSION=1.0.0   stamp a release version (default: git describe of the checkout)
+CC       ?= cc
+CXX      ?= c++
+OZZY     := ../../..
+BUILD    := build
+OZZY_VERSION ?= $(shell git -C $(OZZY) describe --always --dirty 2>/dev/null || echo unknown)
+VERSION  := $(OZZY_VERSION)
+BUNDLE_VERSION := $(firstword $(subst -, ,$(subst +, ,$(VERSION))))
+ARCHS    := $(if $(UNIVERSAL),-arch arm64 -arch x86_64,)
+MINOS    := -mmacosx-version-min=11.0
+CPPFLAGS += -DOZZY_USER_ENGINE -DOZZY_GIT_VERSION=\"$(VERSION)\" -I$(OZZY)
+CFLAGS   ?= -std=gnu11 -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
+CFLAGS   += $(ARCHS) $(MINOS)
+LDLIBS   := -framework IOKit -framework CoreFoundation -framework SystemConfiguration
+# The version for codesign and Finder: an Info.plist in the binary
+LDFLAGS  += -Wl,-sectcreate,__TEXT,__info_plist,$(BUILD)/Info.plist
 
-.DEFAULT_GOAL := all
+ENGINE   := $(OZZY)/engine/core/ozzy_engine.c $(OZZY)/engine/core/ozzy_isoc_output.c \
+            $(OZZY)/engine/core/ozzy_isoc_input.c \
+            $(OZZY)/engine/devices/ploytec/ploytec_engine.c $(OZZY)/engine/devices/ploytec/ploytec_io.c \
+            $(OZZY)/engine/devices/ploytec/ploytec_isoc_engine.c $(OZZY)/engine/devices/ploytec/ploytec_us3xx_engine.c \
+            $(OZZY)/engine/devices/usbmidi/usb_midi_engine.c \
+            $(OZZY)/common/devices/ploytec/ploytec_handshake.c $(OZZY)/common/devices/ploytec/ploytec_codec.c \
+            $(OZZY)/common/usb_midi.c $(OZZY)/common/midi_ump.c
+DAEMON   := main.c device.c handover.c user_bus.c segment.c isoc_plan.c
+HEADERS  := $(wildcard *.h $(OZZY)/engine/*/*.h $(OZZY)/engine/devices/*/*.h $(OZZY)/common/*.h \
+            $(OZZY)/common/devices/*/*.h) $(OZZY)/macos/Shared/OzzyDaemonShared.h
+TESTS    := test_isoc_plan test_mailbox test_segment test_handover
 
-build:
-	mkdir -p build
+all: $(BUILD)/ozzy-daemon
 
-build/%.o: %.cpp | build
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+$(BUILD):
+	mkdir -p $@
 
-FAKE_SRC := tools/fake-daemon.cpp SharedMemory.cpp ../../Devices/Dynacord/DynacordRing.cpp
-FAKE_HDR := SharedMemory.h ../../Shared/OzzySharedData.h ../../Devices/Dynacord/DynacordRing.h \
-	$(COMMON)/ploytec_defs.h
-build/fake-daemon: $(FAKE_SRC) $(FAKE_HDR) | build
-	$(CXX) $(CXXFLAGS) -o $@ $(FAKE_SRC)
+# Rewritten only when the version changes, so the binary relinks when it does
+$(BUILD)/Info.plist: Info.plist.in FORCE | $(BUILD)
+	sed -e "s|@VERSION@|$(VERSION)|g" -e "s|@BUNDLE_VERSION@|$(BUNDLE_VERSION)|g" Info.plist.in > $@.tmp
+	cmp -s $@.tmp $@ && rm $@.tmp || mv $@.tmp $@
 
-CLIENT_SRC := tools/shm-client.cpp RealTime.cpp ../../Devices/Dynacord/DynacordCodec.cpp
-CLIENT_HDR := $(FAKE_HDR) RealTime.h ../../Devices/Dynacord/DynacordCodec.h
-build/ploytec_codec.o: $(COMMON)/ploytec_codec.c $(COMMON)/ploytec_codec.h $(COMMON)/ploytec_defs.h | build
-	$(CC) $(CFLAGS) -c $< -o $@
+$(BUILD)/ozzy-daemon: $(DAEMON) $(ENGINE) $(HEADERS) $(BUILD)/Info.plist | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(DAEMON) $(ENGINE) $(LDLIBS)
 
-build/shm-client: $(CLIENT_SRC) $(CLIENT_HDR) build/ploytec_codec.o | build
-	$(CXX) $(CXXFLAGS) -o $@ $(CLIENT_SRC) build/ploytec_codec.o
+$(BUILD)/test_isoc_plan: tests/test_isoc_plan.c isoc_plan.c $(HEADERS) | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/test_isoc_plan.c isoc_plan.c
 
-all: build/fake-daemon build/shm-client build/OzzyDaemon
+$(BUILD)/test_mailbox: tests/test_mailbox.c $(HEADERS) | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/test_mailbox.c
 
-DAEMON_CXX := main.cpp ConsoleHandover.cpp Session.cpp UserBus.cpp RealTime.cpp SharedMemory.cpp \
-	../../Devices/Dynacord/DynacordEngine.cpp ../../Devices/Dynacord/DynacordRing.cpp \
-	../../OzzyCore/OzzyEngine.cpp ../../Devices/Ploytec/PloytecEngine.cpp
-DAEMON_C := $(COMMON)/dynacord_pacer.c $(COMMON)/dynacord_feedback.c $(COMMON)/dynacord_midi.c \
-	$(COMMON)/ploytec_codec.c
-DAEMON_OBJ := $(addprefix build/,$(notdir $(DAEMON_CXX:.cpp=.o) $(DAEMON_C:.c=.o)))
-DAEMON_HDR := $(FAKE_HDR) ../../OzzyCore/IOzzyBus.h ../../OzzyCore/OzzyEngine.h ../../OzzyCore/OzzyFactory.h \
-	../../Devices/Dynacord/DynacordEngine.h ../../Devices/Ploytec/PloytecEngine.h ../../Shared/OzzyLog.h \
-	ConsoleHandover.h Session.h UserBus.h RealTime.h ../OzzyKext/KextStatus.h
+$(BUILD)/test_handover: tests/test_handover.c handover.c handover.h | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/test_handover.c handover.c
 
-vpath %.c $(sort $(dir $(DAEMON_C)))
-vpath %.cpp $(sort $(dir $(DAEMON_CXX)))
+$(BUILD)/test_segment: tests/test_segment.c segment.c $(HEADERS) | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/test_segment.c segment.c
 
-build/%.o: %.c | build
-	$(CC) $(CFLAGS) -c $< -o $@
+# The layout as the daemon (C, engine types) and the plug-ins (C++, std::atomic) see it
+$(BUILD)/layout_c: tests/layout_print.c $(HEADERS) | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/layout_print.c
 
-$(DAEMON_OBJ): $(DAEMON_HDR)
+$(BUILD)/layout_cxx: tests/layout_print.c $(HEADERS) | $(BUILD)
+	$(CXX) -std=c++17 -I$(OZZY) $(MINOS) -x c++ -o $@ tests/layout_print.c
 
-build/main.o: CXXFLAGS += -DOZZY_VERSION='"$(OZZY_VERSION)"'
-
-# Upstream Xone engine, built only so OzzyFactory links outside the kernel.
-build/PloytecEngine.o: CXXFLAGS += -Wno-unused-parameter -Wno-unused-variable -Wno-error
-
-build/OzzyDaemon: $(DAEMON_OBJ)
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(FRAMEWORKS)
-
--include $(DAEMON_OBJ:.o=.d)
+check: $(addprefix $(BUILD)/,$(TESTS)) $(BUILD)/layout_c $(BUILD)/layout_cxx
+	@fail=0; for t in $(TESTS); do $(BUILD)/$$t || fail=1; done; \
+	tests/check-cli.sh || fail=1; \
+	if $(BUILD)/layout_c | diff -u - $$($(BUILD)/layout_cxx > $(BUILD)/layout_cxx.txt; echo $(BUILD)/layout_cxx.txt); then \
+		echo "layout: ok (C and C++ agree)"; else echo "layout: C and C++ DIFFER"; fail=1; fi; \
+	[ $$fail = 0 ] && echo "all daemon tests passed" || { echo "DAEMON TESTS FAILED"; exit 1; }
 
 clean:
-	rm -rf build
+	rm -rf $(BUILD)
 
-.PHONY: all clean
+.PHONY: all check clean FORCE

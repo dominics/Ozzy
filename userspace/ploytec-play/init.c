@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include "init.h"
 #include "ploytec_protocol.h"
+#include "dynacord_defs.h"
 
 #define TIMEOUT_MS 1000
 

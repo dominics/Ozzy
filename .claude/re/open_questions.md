@@ -2,10 +2,51 @@
 
 ## Open Questions
 
-### Sample rate change: 5-call dance vs official driver
-Our driver sends SET_CUR 5 times alternating 0x86/0x05 (from Windows USB capture). The official
-macOS driver only calls `setFrequency` once per pipe (2 total: input + output). The 5-call
-pattern may be a Windows driver quirk, or redundant. Need to test if 2 calls works for all devices.
+### macOS isoc before 12: frame io() at High Speed (branch `macos-min-target`)
+`IOUSBHostPipe::io(IOUSBHostIsochronousTransaction*...)` is reserved slot 50, new in the macOS 12
+SDK (not in 11.3; headers in `tools/old_sdk_headers/`). Calling it on an older kernel would hit an
+unused slot, so the kext falls back to the frame `io()` (10.11+, deprecated), whose frames sit back
+to back in the descriptor, with the ring's tail and head as an `IOMultiMemoryDescriptor` when it
+wraps. The EMU USB audio kext (Wouter1/EMU-driver, `OEM_DRIVERS/emu_driver_ref/`, facts only)
+uses the same frame `io()` on 10.11+ for High Speed 2008-era interfaces: one frame entry per
+service interval (a microframe at bInterval 1), `firstFrameNumber` in 1 ms frames, started at
+`getFrameNumber()` + 10 or more and advanced by entries × interval / 8. It never passes 0, which
+the header calls XHCI only. Both of Ozzy's paths schedule the same way
+(`KextBus::IsocFrameNumber`), so EHCI Macs work too, including macOS 12+ via OpenCore Legacy
+Patcher. Untested on hardware. Test: an isoc device on macOS 12+ with `UseIsocTransactions()`
+forced to false, and once on an EHCI Mac. The kext asks for IOUSBHostFamily 1.0.1, which 10.11
+probably provides. Unchecked.
+
+### Status 'I' idx0 bit 7: DB4 0x92 vs DB2 0x12
+Not USB speed. The official driver preserves it but never interprets it for A&H devices.
+Meaning unknown. Ozzy logs it as `[b7:x]`.
+
+## Decided / not needed
+
+- **SET_CUR count**: the official macOS driver sends 5, Windows 7, Ozzy 2. Decision (project owner):
+  2 is enough; the 5/7-call sequence is not needed.
+- **Isoc keep-alive on EP 0x02**: the official driver runs it in bulk mode only. Decision (project
+  owner): not needed for Ozzy.
+- **Output packet layout**: Ozzy now picks it from the OUT endpoint's wMaxPacketSize (≤512 → bulk
+  layout), on both macOS and Linux. That fixes the DB2 fw 1.2.0 (interrupt, 512).
+- **DB2 sample rate**: Ozzy now runs the DB2 at 48 kHz only (macOS fixed rate; Linux rate table).
+
+## GitHub claims audit (DB2, issue #72 / PR #70 / PR #83)
+
+Checked against the official v3.4.9 driver and the DB2 Windows capture (2026-10-10):
+
+| Claim | Source | Verdict |
+|-------|--------|---------|
+| DB2 needs 48 kHz; 96k plays at half speed | #70, #72 | **Confirmed.** Official plist table = 48000 only; endpoints can't carry more than 64 kHz in |
+| DB2 only supports 44.1 kHz | #72, #83 description | **Wrong.** Boots at 44.1k, but the official table and the Windows driver use 48k only. (#83's code actually uses 48k) |
+| Interrupt sub-packet is 512, not 482 | #70, #83 | **True for DB2 only.** The layout follows wMaxPacketSize (512 vs 964), not transfer type. Applying it to all interrupt devices breaks DB4 fw 1.4.1 / 4D |
+| 7× SET_CUR needed or the PLL won't lock | #70, #72 | **Not needed** (owner decision). Official macOS sends 5; tested together with the framing fix, so the cause wasn't isolated |
+| Channel layout UseChannelDescriptions silences stereo | #70 | **Unproven, unlikely.** Same HAL works on DB4. Not device-specific |
+| willDoInPlace=true leaves zeros in the ring buffer | #70 | **Wrong.** Ozzy reads `ioMainBuffer` on WriteMix, which is the documented in-place contract. Same HAL works on DB4 |
+| hostTime uninitialised at start | #70 | **Minor, plausible.** Only affects the window before the first USB completion; not DB2-specific |
+| Residual distortion = SoundSource | #72 | Environmental, not a driver bug |
+| `[FullSpeed]` despite High Speed enumeration | #72 title | **Log label bug.** Status bit 7 isn't USB speed; relabelled `[b7:x]` |
+| Repeated disconnects (0xe00002ed) | #72 | **Open.** No root cause yet |
 
 ### Junction encoder vs our bit-interleaved codec
 `pcmTo24Junction6CH` does **channel reordering** (0→0, 3→1, 1→2, 4→3, 2→4, 5→5) and
@@ -26,29 +67,7 @@ license/anti-clone check. Not relevant to our driver but interesting.
 `AJ::configurationDone`, `AJ::sendCPort`, `AJ::getLevelInfo` — purpose unclear. May be
 related to level metering or some control protocol. Has its own pipe assignment via `AJ::assignPipes`.
 
-### CMS 600-3: one bulk IN 0x86 NotResponding at 96 kHz
-In the first 96 kHz OzzyDaemon run (IOUSBLib, 2026-10-09) one bulk read on 0x86 completed with
-0xe00002ed (kIOReturnNotResponding) about 4.4 s in, then the pipe recovered on the next read with
-no restart. Not seen at 48 kHz. Unknown whether the mixer NAKed past the transfer timeout or the
-host controller dropped it; needs a longer 96 kHz soak to see if it repeats.
-
-### CMS 600-3: input frame byte 0x00 one frame late in some sessions
-Seen 2026-10-12 through OzzyDaemon at 48 kHz, in a run of sessions started right after a rate change
-(96 -> 48 and once 44.1 -> 48, 18:48-18:55), then not again in 40+ sessions or after 5 min at 96 kHz.
-In about 8% of frames, byte 0x00 of the 64-byte IN frame carries the previous frame's value. That byte
-holds bit 23 of channels 1 and 3 (bits 0 and 1), so near-zero samples on those inputs decode as full
-scale; bit 23 of channels 2 and 4 is in byte 0x20, which was never late. In frames where both inputs
-changed sign, 88% of channel 1 hits had a channel 3 hit too, so the whole byte is late, with no
-periodicity by USB transfer. The daemon reads bulk IN zero-copy into the ring and the HAL decodes whole
-frames, so the late byte is in the USB data from the mixer. Unknown: whether the rate-change control
-sequence (see the 5-call SET_CUR question above) puts the mixer into this state, and whether a daemon
-restart or power cycle clears it. A later rate change did.
-
 ## Resolved (moved from questions)
-
-- ~~CMS 600-3 has no interfaces from userspace~~ - With no kernel driver matching it, macOS leaves the
-  vendor-class device unconfigured, so IOUSBLib finds 0 interfaces. A userspace driver must
-  `USBDeviceOpen` and `SetConfiguration(1)` itself before opening interfaces 0 and 1 (alt 1).
 
 - ~~Vendor request 'A'~~ — Now understood: ESU clock config (wIndex=0x101) and Wolfson codec (wIndex=0x102/0x106)
 - ~~Index 2 digital output selector~~ — Write-only, `AjExtData[4] & 0xFFFF`, only for devices with `this[0x7AC]`
@@ -64,3 +83,61 @@ restart or power cycle clears it. A later rate change did.
 - **rtsProcessBulkOut** — the actual real-time audio processing loop (partially decompiled, shows MIDI embedding)
 - **Real-time service functions**: `rtsBulkOutBulkIn`, `rtsInterruptOutInterruptIn` — the streaming state machines
 - Windows driver RE for sample rate change pattern comparison
+- **SET_CUR while streaming is not answered** (DB4 fw 1.4.1, Linux usbmon capture 2026-10-11,
+  `captures/db4_linux_18d3e0a/`). `ozzy_pcm_set_rate` sends SET_CUR 48000 → EP 0x86 while the
+  PCM URBs run; the control transfer never completes and is killed after ~2.1 s (`-ENOENT`).
+  The USB reset that follows makes the post-reset handshake set the rate anyway, so that SET_CUR
+  is dead weight that only adds 2 s (removed in 3ff2089; verified on DB4: reset now follows in
+  13 µs). The official driver only sends SET_CUR from the start
+  path (sample_rates.md §5), i.e. before streaming. Related to PR #86's live rate change.
+- **Xone:4D does not survive the Linux rate-change USB reset** (reported in PR #86, 4D fw 1.4.1,
+  not verified here; the DB4 survives it). After `usb_reset_device` descriptor reads time out
+  (-110) and the mixer needs a power cycle; WirePlumber probing at another rate is enough to
+  trigger it. #86 proposed a live rate change instead: drain in-flight URBs, kill them, SET_CUR,
+  clear the PCM endpoint halts, resubmit. Its author also saw that killing a URB mid-packet makes
+  the 4D drop the next control transfer (hence draining first). Not in `main`; #86 was closed
+  with a request for a separate PR. Open: does the official driver ever reset the device on a
+  rate change, or always stop/SET_CUR/restart (the start path in sample_rates.md §5 suggests the latter)?
+  **Answered for Windows (2026-10-21, ploytec_sample_rates.md §5a):** no port reset; it drains,
+  waits ~100 ms, sends SET_CONFIGURATION 0 then 1, and runs the handshake with its SET_CURs.
+- **Does Xone firmware ignore MIDI running status?** PR #80 (Reloop Digital Jockey 2 ME, 200c:1009,
+  also a Ploytec bulk device) reports its firmware drops MIDI out messages that use running status,
+  which ALSA's sequencer bridge emits by default: MIDI in worked, but no LED ever lit until the
+  status byte was restored on every message. Ozzy passes MIDI out bytes through unchanged. If the
+  Xone firmware behaves the same, it could explain MIDI out reports (#19 Xone:4D, #88 Xone:DB2).
+  Not verified on any Xone device.
+  - **The official driver never sends running status** (XONE_DB2 3.4.9 MIDI plugin, Ghidra,
+    `DB2_decompile/XONE_DB2_midi_all.c`): `MidiDevice::Send` → `sendInternal` copies the CoreMIDI
+    packet bytes unchanged into a 64 KB queue in shared memory (`MidiSM`, IOConnectMapMemory type 3)
+    and kicks the kext (`callDriver(0x15)`); the kext's `MidiQueue` is a plain byte ring. No status
+    handling anywhere, but CoreMIDI packets never contain running status, so the device never sees it.
+    (`prepareOutput` builds 4-byte USB-MIDI class packets, used for class-compliant ports only.)
+  - **Linux does send running status**: `sound/core/seq/seq_midi.c` converts sequencer events with
+    `snd_midi_event_decode()` and never calls `snd_midi_event_no_status()`, so a status byte equal to
+    the previous one is dropped. Every app using the ALSA sequencer (Mixxx, DAWs) therefore sends
+    running status to Ozzy's rawmidi device; Ozzy on macOS (CoreMIDI) gets full messages.
+  - `getMaxSysexSpeed()` returns 32500 only for VID 0x1935 (Elektron), so A&H devices get CoreMIDI's
+    default SysEx speed (3125 bytes/s). Relevant for #20.
+- **Kext log lines mostly never reach the macOS unified log** (macOS 26.2, Apple Silicon, tested
+  2026-10-11). `IOLog` and `os_log(OS_LOG_DEFAULT, …)` from OzzyKext both fail the same way: the
+  kernel tags the lines with no sender image (`<compose failure [missing precomposed log]>`) or with
+  another loaded kext's UUID (`<compose failure [UUID]>`), even though `/var/db/uuidtext/` has a
+  correct entry for the OzzyKext UUID. Only isolated bursts get through (seen once at `stop()`, once
+  at `device disconnected`). A minimal Xcode-style reference kext (`tools/refkext/` in the
+  investigation folder) logs fine on the same Mac. Ruled out: build flags (`-fapple-kext`,
+  `KMOD_EXPLICIT_DECL` + libkmod, deployment target), boot timing (runtime reload), log quarantine,
+  Mach-O layout. Not tested: USB matching vs IOResources, the IOUSBHostFamily dependency, Info.plist.
+  Same bug class as Apple forums 133822 ("kext log output slides") and 133313 ("os_log using
+  incorrect or stale text"); Apple only asked for bug reports. The HAL's log lines are reliable.
+- **A wrong byte 0 in Ploytec PCM IN frames, seen only by userspace macOS drivers.** Byte 0 of
+  the 64-byte input frame holds bit 23 of the first channels, so a wrong byte 0 is a full-scale
+  click on a quiet input. nkurence (#85, WZ4, his IOUSBLib harness): one frame near the start of a
+  capture, bit 23 flipped on several odd channels, 2 of 6 captures. dominics/Ozzy TODO.md
+  (CMS 600-3, OzzyDaemon over IOUSBLib): byte 0 repeating the previous frame's in ~8% of frames in
+  some 48 kHz sessions started right after a rate change, gone after another change. Not on the
+  DB4 with the Linux module (2026-11-01): usbmon of 9 starts (attach, PipeWire's change, 7 rate
+  changes), 102,492 IN transfers, 8.2 M frames decoded with ploytec_decode_frame_8ch, no sample
+  above -18 dBFS, first transfers after each restart included (scanner:
+  `tools/linux_usbmon/in_glitch.c` in the investigation folder). nkurence's kext run didn't report
+  it either. So most likely the userspace reading path (buffer reuse, a read completing early),
+  not the device; open until a kext or Linux run on a WZ4 or CMS 600-3 shows it.

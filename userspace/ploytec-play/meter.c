@@ -20,7 +20,7 @@ void meter_feed(struct meter *m, const uint8_t *buf, size_t len)
 			m->misaligned++;
 			continue;
 		}
-		ploytec_decode_frame(s24, buf);
+		ploytec_decode_frame_8ch(s24, buf);
 		for (int c = 0; c < METER_CHANNELS; c++) {
 			int32_t v = s24[3 * c] | s24[3 * c + 1] << 8 | s24[3 * c + 2] << 16;
 			v = abs(v & 0x800000 ? v - 0x1000000 : v);

@@ -1,61 +1,77 @@
 /* SPDX-License-Identifier: MIT */
+/*
+ * Dynacord CMS 600-3: the second MIDI port in its M4_C1 MIDI frame.
+ *
+ * The CMS multiplexes two MIDI ports in the 9-byte transfers on its MIDI endpoints (0x04 out,
+ * 0x83 in): a 4-byte slot per port, then a control byte. Decoded from USB captures of the
+ * Windows driver (dominics/dynacord-cms-pcap):
+ *
+ *   bytes 0-3  port 1, "USB-MIDI": the DIN sockets (the port ploytec_midi.h moves)
+ *   bytes 4-7  port 2, "SystemCtrl": the mixer's FX control
+ *   byte  8    0xE0 out, 0xFD in
+ *
+ * Unused bytes are PLOYTEC_MIDI_IDLE_BYTE (0xFD, an undefined real-time byte, so never MIDI).
+ * Out slots are left-aligned, in slots right-aligned; either way the MIDI bytes of a slot are
+ * its non-idle bytes, in order. The Windows driver fills port 2's out slot with the same
+ * 3-or-4 byte pacing as port 1 (ploytec_midi_xfer_begin).
+ *
+ * Header only, pure C: the engine (ploytec_isoc_engine.c), the platforms and the host tests
+ * all use it without a build change.
+ */
+
 #ifndef DYNACORD_MIDI_H
 #define DYNACORD_MIDI_H
 
-#if defined(__KERNEL__) && defined(__linux__)
-#include <linux/types.h>
-#else
-#include <stddef.h>
-#include <stdint.h>
-#endif
+#include "ploytec_midi.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/*
- * CMS 600-3 MIDI on bulk 0x04 (out) and 0x83 (in). Every transfer is one
- * 9-byte packet: a 4-byte slot per port, then a trailer byte. Each slot
- * carries the next 0-4 bytes of that port's MIDI byte stream; unused bytes
- * are DYNACORD_MIDI_FILL. Out slots are left-aligned, in slots right-aligned.
- */
+/* The CMS 600-3's MIDI ports, in their slot order */
 enum dynacord_midi_port {
-	DYNACORD_MIDI_PORT_USB     = 0,  /* "DYNACORD USB-MIDI": DIN MIDI */
-	DYNACORD_MIDI_PORT_SYSCTRL = 1,  /* "DYNACORD SystemCtrl": FX control */
+	DYNACORD_MIDI_PORT_USB     = 0,   /* "USB-MIDI": the DIN sockets */
+	DYNACORD_MIDI_PORT_SYSCTRL = 1,   /* "SystemCtrl": FX control */
 	DYNACORD_MIDI_PORTS        = 2,
 };
 
+/* Where things sit in a CMS MIDI transfer */
 enum dynacord_midi_layout {
-	DYNACORD_MIDI_PKT_LEN     = 9,
+	DYNACORD_MIDI_XFER_LEN    = 9,
 	DYNACORD_MIDI_SLOT_LEN    = 4,
-	DYNACORD_MIDI_TRAILER     = 8,     /* offset of the trailer byte */
-	DYNACORD_MIDI_FILL        = 0xfd,  /* undefined MIDI real-time byte */
-	DYNACORD_MIDI_OUT_TRAILER = 0xe0,
-	DYNACORD_MIDI_IN_TRAILER  = 0xfd,
+	DYNACORD_MIDI_CONTROL     = 8,      /* offset of the control byte */
+	DYNACORD_MIDI_OUT_CONTROL = 0xE0,   /* PLOYTEC_MIDI_XFER_CONTROL_IDLE */
+	DYNACORD_MIDI_IN_CONTROL  = 0xFD,
 };
 
-/*
- * Reset an out packet to empty slots and the out trailer. Callers then
- * write up to DYNACORD_MIDI_SLOT_LEN bytes at dynacord_midi_slot().
- */
-void dynacord_midi_out_init(uint8_t *pkt);
+/* The names the Windows driver gives the ports */
+#define DYNACORD_MIDI_PORT_USB_NAME     "USB-MIDI"
+#define DYNACORD_MIDI_PORT_SYSCTRL_NAME "SystemCtrl"
 
-/* Start of @port's slot in a packet. */
-static inline uint8_t *dynacord_midi_slot(uint8_t *pkt, enum dynacord_midi_port port)
+/* Offset of @port's slot in a transfer */
+static inline uint32_t dynacord_midi_slot(enum dynacord_midi_port port)
 {
-	return pkt + (int)port * (int)DYNACORD_MIDI_SLOT_LEN;
+	return (uint32_t)port * DYNACORD_MIDI_SLOT_LEN;
 }
 
 /*
- * Find @port's MIDI bytes in an in packet of @len bytes. Sets *@data to
- * the first byte and returns the count (0-4); 0 for an empty slot or a
- * short packet.
+ * dynacord_midi_in_port - @port's MIDI bytes from a MIDI IN transfer of @len bytes received:
+ * copies them to @out and returns how many (0-4). Bytes past @len don't count.
  */
-unsigned int dynacord_midi_in_slot(const uint8_t *pkt, size_t len,
-				   enum dynacord_midi_port port,
-				   const uint8_t **data);
+static inline uint32_t dynacord_midi_in_port(const uint8_t *xfer, uint32_t len, enum dynacord_midi_port port,
+					     uint8_t out[DYNACORD_MIDI_SLOT_LEN])
+{
+	uint32_t at = dynacord_midi_slot(port), count = 0, i;
+
+	for (i = at; i < at + DYNACORD_MIDI_SLOT_LEN && i < len; i++) {
+		out[count] = xfer[i];
+		count += xfer[i] != PLOYTEC_MIDI_IDLE_BYTE;
+	}
+	return count;
+}
 
 #ifdef __cplusplus
 }
 #endif
-#endif
+
+#endif /* DYNACORD_MIDI_H */

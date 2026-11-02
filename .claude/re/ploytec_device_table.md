@@ -12,11 +12,12 @@ every VID/PID the driver supports.
 | USB PID | Device Name | PCM Format | Notes |
 |---------|-------------|------------|-------|
 | 0xFFDB  | Xone:DB4    | 24-bit Ploytec bulk | Confirmed, supported in Ozzy |
-| 0xFFD2  | Xone:DB2    | 24-bit Ploytec bulk | Confirmed, supported in Ozzy |
+| 0xFFD2  | Xone:DB2    | 24-bit Ploytec bulk | Confirmed, supported in Ozzy. **48 kHz only** (official plist table). fw 1.2.0: EP 0x05 interrupt, wMaxPacketSize 512 → 512 framing. Boots at 44.1k. See `ploytec_sample_rates.md`, `ploytec_bulk_devices.md` |
 | 0xFFDD  | Xone:DX     | 24-bit Ploytec bulk | Confirmed, supported in Ozzy. Special-cased in `updateAjInputSelector` |
 | 0xFF4D  | Xone:4D     | 24-bit Ploytec bulk | Confirmed, supported in Ozzy |
-| 0xFFAD  | Wizard 4    | 24-bit Ploytec bulk | Confirmed, supported in Ozzy |
-| 0xFF01  | Xone:2D     | ? | Found in legacy macOS Info.plist only |
+| 0xFFAD  | Wizard 4    | 24-bit Ploytec, **16 in / 2 out** | In Ozzy as experimental (16-lane input, 2-lane output), untested on hardware |
+| 0xFF01  | Xone:2D     | 24-bit Ploytec (same URB sizes as DB4, #77) | In Ozzy as experimental; 6 real analog inputs, 8-ch frames |
+| 0x001E  | Xone:1D     | none (MIDI only) | Not a Ploytec audio device. USB-MIDI class descriptors (AC + MIDIStreaming, 1 in / 1 out jack), full speed, but both bulk endpoints (0x81, 0x01) have **wMaxPacketSize 4**, which is illegal for full-speed bulk (8/16/32/64). Linux snd-usb-audio binds it and MIDI in works (#27 aseqdump); MIDI out untested. macOS (10.15+) does not show it as a MIDI device. Apple's `AppleMIDIUSBDriver.plugin` (macOS 26.2, x86_64 disasm) has no wMaxPacketSize check in its descriptor parser or `FindPipes`; it bails with "Couldn't get pipe for endpoint" if the kernel won't give it a pipe, so the rejection is either elsewhere in the plugin or in IOUSBHost pipe creation (unverified, needs a `com.apple.coremidi` debug log from a real 1D). **Ozzy (macOS):** OzzyKext claims it (personality Xone1D, 2634/30) and runs `UsbMidiEngine`: interface 1 alt 0, 4-byte reads on 0x81 (one event packet per transfer, since a longer transfer would only complete when full), one 4-byte OUT transfer at a time on 0x01, packets converted by `common/usb_midi.c`. Untested on hardware; if the kernel refuses to create the pipes the kext logs "failed to open pipe". Official Mac driver 2.0.8 (2010, x86_64/i386/ppc) = generic Ploytec kext `PGKernelDeviceXONE1D` matching IOUSBDevice 2634/30 + CoreMIDI plugin; its `USBMidiDevice::read/write` are plain bulk transfers of wMaxPacketSize on those pipes (no vendor requests seen there). Captures in `captures/xone1d_issue27/` (replug capture ends right after SET_CONFIGURATION; the July capture is of another bus) |
 | 0x1016  | ?           | ? | Has `setFreqOnOutPipe` support |
 | 0x2416  | ?           | ? | Has `setFreqOnOutPipe` support |
 | 0x5A16  | ?           | ? | Excluded from first `updateAjInputSelector` call in `configurationDone` |
@@ -24,6 +25,8 @@ every VID/PID the driver supports.
 | 0xF1A0  | ?           | ? | Sets frequency to 44100 on digital lock. Has `setFreqOnOutPipe` support |
 | 0xC150  | "CRIMSON_SPL" | ? | SPL Crimson — named in `_IOLog` string |
 | 0xD064  | "DOTEC"     | ? | Dotec-Audio — named in `_IOLog` string. Variable channel count based on rate |
+
+**No serial numbers.** Ploytec firmware has no per-unit serial: the DB2 and DB4 set iSerialNumber = 3 and string 3 is literally `no serial number` (`captures/db2_soulcheck_windows`, `captures/db2_wedigjames`, `captures/db4_linux_18d3e0a`, and the "S/N:" lines in old Ozzy logs); the Xone:1D has iSerialNumber = 0. Two units of the same model can only be told apart by USB port (`locationID` on macOS), so OzzyHAL/OzzyMIDI build device identity from VID:PID + locationID.
 
 ## VID 0x0644 (unknown vendor — TEAC?)
 
@@ -38,14 +41,25 @@ every VID/PID the driver supports.
 All 0x644 devices use the read-modify-write with masks `0x18` / `0xE7` on index 0.
 PIDs checked in `setFreqOnOutPipe` via switch on `(PID + 0x7FC0)`: cases 0 (0x8040), 1 (0x8041), 6 (0x8046).
 
-## ESU (VID 0x2573)
+## ESI Audiotechnik (VID 0x2573, ESU product line)
 
 | USB PID | Device Name | Notes |
 |---------|-------------|-------|
 | 0x0012  | ?           | Sends vendor request 'A' (0x41) in `configurationDone` |
 | < 0x002B | ESU family | Sub-IDs below 0x2B with certain bit patterns → `updateAjInputSelector_Esu186()` |
 
-ESU devices have a completely separate `updateAjInputSelector_Esu186` code path.
+ESI's ESU devices (VID 0x2573 is ESI Audiotechnik; "ESU" is its product line, e.g. ESU1808, which `Esu186` probably refers to) have a completely separate `updateAjInputSelector_Esu186` code path. 0x0A92 (EGO SYStems, ESI's parent) shares some of it (`setEsuCpldByte`).
+
+10-lane output (DB2 kext decompile):
+- `dmaEncode10` (10 host channels, Contour IE): the 8-lane frame plus a fifth lane in bit 4, odd
+  channels 1..9 in bytes 0x00..0x17, even 2..10 in 0x18..0x2F, MSB first.
+- `dmaEncode10_12` (ESU1808, 8 host channels; `_34/_56/_78` per the selected pair, AjExtData+0x10,
+  default 0 = pair 1/2): lanes 1..8 as `dmaEncode08`, lane 10 = channel 1 of the frame, lane 9 =
+  channel 2 of the **previous** frame (carried across calls in `param_1[2]`). Probably the S/PDIF
+  serialiser takes lane 9 one frame late, keeping L/R aligned (inferred). On a 964-byte interrupt
+  output `chooseDMAEncoder` replaces it with the plain `dmaEncode08_Int964` (no mirror).
+  Ozzy: `ploytec_encode_frame_10ch`, `ploytec_spdif_mirror` (any pair; from the previous encoded frame,
+  so no state on macOS; Linux keeps the last frame's even half per packet).
 See [ESU-specific protocol](#esu-specific-protocol-updateajinputselector_esu186) below.
 
 ## VID 0x0499 (Yamaha?)
@@ -65,10 +79,12 @@ The `setFrequency` function retries the SET_CUR request up to 200 times for thes
 |---------|-------------|-------|
 | 0x0019  | ?           | `setFreqOnOutPipe` support only |
 
-## VID 0x200C (unknown vendor)
+## VID 0x200C (Reloop)
 
 | USB PID | Device Name | Notes |
 |---------|-------------|-------|
+| 0x1009  | Digital Jockey 2 Master Edition | In Ozzy (experimental). Junction frame, 6 in / 4 out, 44.1 kHz only (Reloop's rldj2meu.sys hardcodes 0xAC44 for 200c:1009), bulk 512-byte output layout, same endpoints and handshake as the Xone mixers. Firmware ignores MIDI running status. Found by julled (PR #80) |
+| 0x1005  | sibling model | Gets 96 kHz in rldj2meu.sys (PR #80) |
 | 0x1007–0x1027 | ? | Range with bitmask in `setFreqOnOutPipe` |
 | 0x1019  | ?           | Returns early from `updateAjInputSelector` with status 0x12 |
 | 0x1030  | ?           | Uses SET_INTERFACE (bRequest 0x0B) in `configurationDone` |
@@ -165,11 +181,24 @@ The `setFrequency` function retries the SET_CUR request up to 200 times for thes
 | 0x1000  | ?           | 24-bit TUSB 2ch | `(PID \| 0x2000) == 0x3000` check |
 | 0x3000  | Mbox 2?     | 24-bit TUSB 2ch | Referenced via `initDigiDesignMbox2` in `setClockSource` |
 
-## VID 0x09E8 (unknown)
+## Akai Professional (VID 0x09E8)
 
 | USB PID | Device Name | Notes |
 |---------|-------------|-------|
-| 0x207F  | "ACV0"      | Named in `_IOLog`. bcdDevice 0x300 variant uses isoc in + isoc out (no bulk) |
+| 0x0010  | EIE Pro (#73) | In `isPloytecBulkInIsocOutDevice`: **bulk in, isoc out** (not a bulk/interrupt-out device like the Xones). In Ozzy as experimental on Linux (`ploytec_isoc_ops`), untested on hardware. See `akai_eie_pro.md` |
+| 0x207F  | "ACV0"      | Named in `_IOLog`. In `isPloytecBulkInIsocOutDevice`; the bcdDevice 0x300 variant uses isoc in + isoc out (no bulk) |
+
+### Bulk in / isoc out devices (`PGDevice::isPloytecBulkInIsocOutDevice` @ 0xc2a6)
+
+0562:03EB, 0644:(PID-0x800F bitmask 0x6200428101), 0763:4002, 09E8:0010, 09E8:207F,
+0A4A:0014, 0A4A:5B01, 1210:0018-001A, 13B2:0030. `PGKernelDeviceXONEDB2` pipe setup
+(~line 22720 of the decompile): PCM in from interface 1's bulk IN pipe (`+0xa90`, or its
+interrupt IN pipe, then "Use interrupt transfers"), plus interface 1's isoc IN pipe as
+`m_pcInPipeFeedback` (`+0xab8`). The out pipe isn't in this snippet: isoc out with explicit
+feedback is **inferred** from the function name and the feedback pipe (cf. `isPloytecBulkDevice`,
+whose name turned out misleading, `ploytec_bulk_devices.md`).
+`bulkInpEvent` ignores bulk IN errors for these devices on Darwin > 14. If the out pipe is
+isoc, Ozzy has no path for it, and none of these is just a table entry away.
 
 ---
 
@@ -258,6 +287,39 @@ channels 10 → pcmTo24Junction10CH (inferred)
 other       → pcmTo24LSB (fallback)
 ```
 
+### Ploytec junction DMA codecs (`chooseDMADecoder` / `chooseDMAEncoder`)
+This is the "separate path" for Ploytec bulk/interrupt devices, and the frame format Ozzy implements.
+From the XONE_DB2 3.4.9 kext (Ghidra, `DB2_decompile/XONE_DB2_kext_all.c`); the WIZARD_4 3.3.11 kext
+has the same function set.
+
+**Input** (`this+0x55b8`), picked by the input channel count (settings `+4`):
+- 2..16 channels → `dmaDecode16To02..16At32Bit`, requires `this+0x55b0 == 0x10` (16 lanes)
+- 18..32 channels → `dmaDecode32To18..32At32Bit`, requires `this+0x55b0 == 0x20` (32 lanes, frame not decoded yet)
+- PID 0xD064 (Dotec) has its own `_DOTEC` variants
+
+The 16-lane input frame is **64 bytes** for any channel count up to 16 (8 frames per call, returns
+0x40 bytes per 8 ch / 0x80 per 16 ch of output):
+```
+bytes 0x00..0x17  bit b (0..7) = sample bit (23 - byte) of channel 2b+1   (odd channels)
+bytes 0x20..0x37  bit b (0..7) = sample bit (23 - byte) of channel 2b+2   (even channels)
+bytes 0x18..0x1F, 0x38..0x3F unused
+```
+`dmaDecode16To08` uses bits 0..3 (= Ozzy's 8-channel decoder), `dmaDecode16To16` uses bits 0..7.
+
+**Output** (`this+0x55c0`), picked by the output channel count (settings `+0xc`): `dmaEncode02`,
+`04`, `06` (`dmaEncode06_Int964` when the OUT endpoint has wMaxPacketSize 0x3C4 = 964), `08`, …
+All write the same **48-byte frame**, 10 frames per 480-byte block:
+```
+bytes 0x00..0x17  bit b (0..3) = sample bit (31 - byte) of channel 2b+1
+bytes 0x18..0x2F  bit b (0..3) = sample bit (31 - byte) of channel 2b+2
+```
+`dmaEncode08` uses bits 0..3 (= Ozzy's encoder), `dmaEncode02` only bit 0 (channels 1/2), so a
+2-channel device is the 8-channel frame with channels 3..8 silent.
+
+Consequence: input lanes (up to 16) and output lanes (up to 8) share one frame format; a device
+differs only in how many lanes carry audio. The MixWizard WZ4 (16 in / 2 out) uses
+`dmaDecode16To16` + `dmaEncode02`.
+
 ### US-144 special variants (24-bit)
 For devices with `this[0x1888]` and `this[0x7a9]` set, based on offsets `+0x1464` and `+0x1468`:
 - `pcmTo24LSB_US144_00`, `pcmTo24LSB_US144_10`, `pcmTo24LSB_US144_11`
@@ -291,8 +353,10 @@ m_pcInterruptInPipe       → this+0xaa0
 m_pcInterruptOutPipe      → this+0xaa8
 ```
 
-For Ploytec bulk: endpoint 0x05 is found via `getPipeByAddress('\x05')`. If the pipe
-has type 0x04, falls back to interrupt out pipe.
+For Ploytec bulk: endpoint 0x05 is found via `getPipeByAddress('\x05')`. If there is no
+EP 0x05, or its **bInterval** is 4 (`pipe+0x16`; `PGPipeDescriptor::scan` @0x209b2 stores
+bInterval there, the transfer type is `bmAttributes & 3` at `+0xe`), it falls back to
+`getInterruptOutPipe()`. An earlier version of this file read `+0x16 == 4` as a type check.
 
 ---
 
@@ -464,9 +528,14 @@ Currently supported in Ozzy (all VID 0x0A4A):
 - Xone:DB2 (0xFFD2)
 - Xone:DX (0xFFDD)
 - Xone:4D (0xFF4D)
-- Wizard 4 (0xFFAD)
 
 Potential future support (same vendor, Ploytec chipset):
+- MixWizard WZ4 USB option card (0xFFAD, A&H part 004-232JIT): **16 channels to the computer,
+  2 back** (stereo return), 44.1/48/88.2/96 kHz, 24 bit (A&H application note AP8987 issue 2, in
+  the investigation folder under `WZ4/`). Same junction frame format as the Xone mixers, with 16
+  input lanes and 2 output lanes (`dmaDecode16To16` + `dmaEncode02`, see "Ploytec junction DMA
+  codecs"). Supported as experimental since 2026-10-11; before that it was in the Linux table as
+  8×8, which could only have produced garbage.
 - Xone:2D (0xFF01) — found in legacy driver, may work with existing code
 - SPL Crimson (0xC150) — different channel topology
 - Dotec-Audio (0xD064) — variable channel count based on sample rate

@@ -1,0 +1,399 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * Ozzy Device List
+ *
+ * Every device Ozzy drives, one row each. This is the only place a device is
+ * added: the Linux USB ID table, the macOS kext's matching personalities
+ * (generated into its Info.plist at install time), the engine/ops choice and
+ * the channel counts and rates all come from here. See ozzy_devices.h for how
+ * the rows are read, and .claude/re/device_inventory.md for candidates.
+ *
+ *   OZZY_DEVICE(key, vid, pid, name, family, in, out, rates, status, quirks, latency)
+ *
+ *   key        identifier: the kext personality name
+ *   family     PLOYTEC_XONE  Ploytec junction protocol, bulk/interrupt out (Xone mixers)
+ *              PLOYTEC_ISOC  Ploytec bulk in / isochronous out (Akai EIE Pro)
+ *              USB_MIDI      USB MIDI class device that needs Ozzy anyway
+ *              PLOYTEC_US3XX Ploytec isochronous in and out, MIDI as USB-MIDI packets (Tascam US-366)
+ *   in, out    audio channels (lanes used in the device's frames)
+ *   rates      OZZY_RATE_xxx bits
+ *   status     SUPPORTED or EXPERIMENTAL (untested on hardware or by few users)
+ *   quirks     OZZY_QUIRK_xxx bits, 0 for none
+ *   latency    what the device itself adds between USB and its sockets, which the host's
+ *              clock cannot see: OZZY_LATENCY(out, in, out, in, ...), frames, one pair per
+ *              rate in rates, ascending; OZZY_NO_LATENCY where it was not measured
+ *
+ * Each row notes where its numbers come from, and is wrapped in
+ * #ifndef OZZY_DISABLE_<key>: building with -DOZZY_DISABLE_<key> leaves the device
+ * out everywhere (Linux: make OZZY_DISABLE="<key> ...", macOS:
+ * OZZY_DISABLE="<key> ..." ./install.command). A platform only drives the
+ * families it has code for: Linux leaves USB_MIDI devices to snd-usb-audio.
+ *
+ * Copyright (C) 2024 Marcel Bierling <marcel@hackerman.art>
+ */
+
+/* XONE_DB4.kext 3.4.9. Latency: fw 1.4.1 on macOS against the MacBook Pro's own audio,
+ * 2026-10-25 (.claude/re/ploytec_bulk_devices.md) */
+#ifndef OZZY_DISABLE_XoneDB4
+OZZY_DEVICE(XoneDB4, 0x0A4A, 0xFFDB, "Xone:DB4", PLOYTEC_XONE, 8, 8,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, SUPPORTED, 0,
+	    OZZY_LATENCY(155, 22, 157, 31, 217, 107, 226, 110))
+#endif
+
+/* XONE_DB2.kext 3.4.9: 48 kHz only */
+#ifndef OZZY_DISABLE_XoneDB2
+OZZY_DEVICE(XoneDB2, 0x0A4A, 0xFFD2, "Xone:DB2", PLOYTEC_XONE, 8, 8,
+	    OZZY_RATE_48K, SUPPORTED, 0, OZZY_NO_LATENCY)
+#endif
+
+/* No official table yet: same as the DB4 */
+#ifndef OZZY_DISABLE_XoneDX
+OZZY_DEVICE(XoneDX, 0x0A4A, 0xFFDD, "Xone:DX", PLOYTEC_XONE, 8, 8,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, SUPPORTED, 0, OZZY_NO_LATENCY)
+#endif
+
+/* No official table yet: same as the DB4 */
+#ifndef OZZY_DISABLE_Xone4D
+OZZY_DEVICE(Xone4D, 0x0A4A, 0xFF4D, "Xone:4D", PLOYTEC_XONE, 8, 8,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, SUPPORTED, 0, OZZY_NO_LATENCY)
+#endif
+
+/* 6 analog inputs on 8 lanes (#77), no official table */
+#ifndef OZZY_DISABLE_Xone2D
+OZZY_DEVICE(Xone2D, 0x0A4A, 0xFF01, "Xone:2D", PLOYTEC_XONE, 8, 8,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL, 0, OZZY_NO_LATENCY)
+#endif
+
+/* WIZARD_4.kext 3.3.11: 16 in / 2 out */
+#ifndef OZZY_DISABLE_Wizard4
+OZZY_DEVICE(Wizard4, 0x0A4A, 0xFFAD, "MixWizard WZ4 USB", PLOYTEC_XONE, 16, 2,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL, 0, OZZY_NO_LATENCY)
+#endif
+
+/*
+ * Reloop's driver (rldj2meu.sys) sets 6 in / 4 out and hardcodes 44.1 kHz for 200c:1009 (96 kHz
+ * audibly distorts on this DAC). A loopback test showed Line In 1/2 on in 1-4 and the mic on
+ * in 5/6. Its firmware ignores MIDI running status, which the Linux MIDI path expands. Found by
+ * julled in PR #80.
+ */
+#ifndef OZZY_DISABLE_ReloopDJ2
+OZZY_DEVICE(ReloopDJ2, 0x200C, 0x1009, "Reloop Digital Jockey 2 ME", PLOYTEC_XONE, 6, 4,
+	    OZZY_RATE_44K1, EXPERIMENTAL, 0, OZZY_NO_LATENCY)
+#endif
+
+/* AKAI_EIE.kext 3.3.17 (kConfigurationData, High Speed): 4 in / 4 out. Bulk in / isoc out */
+#ifndef OZZY_DISABLE_AkaiEIEPro
+OZZY_DEVICE(AkaiEIEPro, 0x09E8, 0x0010, "Akai EIE Pro", PLOYTEC_ISOC, 4, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL, 0, OZZY_NO_LATENCY)
+#endif
+
+/*
+ * Dynacord CMS 600-3 (and its PowerMate-3 / CMS-3 siblings on the same card), the Ploytec revision
+ * (#15): the EIE's layout (isoc out 0x02 with count feedback on 0x81, Xone frames on bulk 0x86,
+ * M4_C1 MIDI on 0x83 / 0x04), 4 in / 4 out. Facts and rates from dominics/Ozzy, which drives
+ * it on real hardware, and its captures (dominics/dynacord-cms-pcap): 44.1, 48 and 96 kHz,
+ * the Xone handshake, both interfaces selected again on a rate change (Ozzy's restarts do).
+ * Its MIDI frame has a second port at offset 4 ("SystemCtrl", FX control, OZZY_QUIRK_MIDI_PORT2);
+ * the first is the DIN sockets. The later HW:03 revision is class compliant: if it
+ * shares this ID, Ozzy leaves it to the class driver (its interface 0 is Audio class).
+ */
+#ifndef OZZY_DISABLE_DynacordCMS600
+OZZY_DEVICE(DynacordCMS600, 0x0562, 0x03EB, "Dynacord CMS 600-3", PLOYTEC_ISOC, 4, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_96K, EXPERIMENTAL, OZZY_QUIRK_MIDI_PORT2, OZZY_NO_LATENCY)
+#endif
+
+/*
+ * Alesis MultiMix 8 USB 2.0 (and the 8 FX and 16, which share the ID): the same layout,
+ * from martinspinler's MultiMix 8 (#15): isoc out 0x02 plain S24_3LE, a 3-byte frame count on
+ * isoc 0x81, Xone frames on bulk 0x86, no MIDI. 10 in / 2 out as on his unit and in Alesis's
+ * spec (Alesis's plist says 4 / 4); rates from the plist (the spec says up to 96k). The 16 may
+ * have more inputs: descriptors wanted (#90).
+ */
+#ifndef OZZY_DISABLE_AlesisMultiMix
+OZZY_DEVICE(AlesisMultiMix, 0x13B2, 0x0030, "Alesis MultiMix USB 2.0", PLOYTEC_ISOC, 10, 2,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K, EXPERIMENTAL, 0, OZZY_NO_LATENCY)
+#endif
+
+/*
+ * USB MIDI class, but its bulk endpoints have wMaxPacketSize 4, which macOS's class driver
+ * rejects. Linux's snd-usb-audio drives it (Ozzy's Linux side has no USB_MIDI family) (#27).
+ */
+#ifndef OZZY_DISABLE_Xone1D
+OZZY_DEVICE(Xone1D, 0x0A4A, 0x001E, "Xone:1D", USB_MIDI, 0, 0,
+	    0, EXPERIMENTAL, 0, OZZY_NO_LATENCY)
+#endif
+
+/*
+ * Bulk in / isoc out devices from the official kexts (kConfigurationData, High Speed, decoded
+ * with tools/ploytec_config_decode.py; .claude/re/device_inventory.md). Untested on hardware.
+ */
+
+/* M-Audio M-Track Quad 3.3.11 kext: 4 in / 4 out, 44.1-96k, kInACR 3 */
+#ifndef OZZY_DISABLE_MTrackQuad
+OZZY_DEVICE(MTrackQuad, 0x0763, 0x4002, "M-Audio M-Track Quad", PLOYTEC_ISOC, 4, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL, 0, OZZY_NO_LATENCY)
+#endif
+
+/* Lexicon I-ONIX / IO Desktop 3.3.11 kext: U22/IO22 2 in / 2 out, kInACR 3 */
+#ifndef OZZY_DISABLE_LexiconIO22
+OZZY_DEVICE(LexiconIO22, 0x1210, 0x001A, "Lexicon I-ONIX U22 / IO22", PLOYTEC_ISOC, 2, 2,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL, 0, OZZY_NO_LATENCY)
+#endif
+
+/* Same kext: U42S/IO42 6 in (4 mic/line + S/PDIF) / 4 out (main + S/PDIF); plist flag 0x7a8 */
+#ifndef OZZY_DISABLE_LexiconIO42
+OZZY_DEVICE(LexiconIO42, 0x1210, 0x0018, "Lexicon I-ONIX U42S / IO42", PLOYTEC_ISOC, 6, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL,
+	    OZZY_QUIRK_AJ_BIT0 | OZZY_QUIRK_DIGITAL_IN, OZZY_NO_LATENCY)
+#endif
+
+/* Same kext: U82S/IO82 10 in (8 mic/line + S/PDIF) / 4 out */
+#ifndef OZZY_DISABLE_LexiconIO82
+OZZY_DEVICE(LexiconIO82, 0x1210, 0x0019, "Lexicon I-ONIX U82S / IO82", PLOYTEC_ISOC, 10, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL,
+	    OZZY_QUIRK_AJ_BIT0 | OZZY_QUIRK_DIGITAL_IN, OZZY_NO_LATENCY)
+#endif
+
+/*
+ * Akai MPC Renaissance ("ACV0") 3.3.11 kext: 4 in / 4 out, but only inputs 1/2 are real (the
+ * official driver zeroes 3/4, _postprocessACV0BugFix), so Ozzy takes 2. No kInACR: its MIDI IN
+ * frame carries two ports (inACR_M4_M4_C1); Ozzy reads the first. The bcdDevice 0x0300
+ * variant streams isoc in instead of bulk in and is not supported (probe fails on PCM in).
+ * Plist flags 0x7a8 and 0x7a6 (S/PDIF out registers).
+ */
+#ifndef OZZY_DISABLE_MPCRenaissance
+OZZY_DEVICE(MPCRenaissance, 0x09E8, 0x207F, "Akai MPC Renaissance", PLOYTEC_ISOC, 2, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL,
+	    OZZY_QUIRK_AJ_BIT0 | OZZY_QUIRK_SPDIF_OUT | OZZY_QUIRK_DIGITAL_IN, OZZY_NO_LATENCY)
+#endif
+
+/*
+ * Numark 3.3.11 kexts (Ploytec-signed). NS7: 4 in / 4 out at 44.1k, kInACR 8 (NS7 MIDI framing),
+ * kMsWait 200 (also NS6 and MixDeck; not in the V7 and 4Trak plists)
+ */
+#ifndef OZZY_DISABLE_NumarkNS7
+OZZY_DEVICE(NumarkNS7, 0x15E4, 0x0071, "Numark NS7", PLOYTEC_ISOC, 4, 4,
+	    OZZY_RATE_44K1, EXPERIMENTAL, OZZY_QUIRK_MIDI_NS7 | OZZY_QUIRK_WAIT_200MS, OZZY_NO_LATENCY)
+#endif
+
+/* V7 (kext class PGKernelDeviceNUMARKNK14): 4 in / 4 out at 44.1k, kInACR 8 */
+#ifndef OZZY_DISABLE_NumarkV7
+OZZY_DEVICE(NumarkV7, 0x15E4, 0x0075, "Numark V7", PLOYTEC_ISOC, 4, 4,
+	    OZZY_RATE_44K1, EXPERIMENTAL, OZZY_QUIRK_MIDI_NS7, OZZY_NO_LATENCY)
+#endif
+
+/* NS6: 4 in / 4 out at 44.1k, kInACR 8 */
+#ifndef OZZY_DISABLE_NumarkNS6
+OZZY_DEVICE(NumarkNS6, 0x15E4, 0x0079, "Numark NS6", PLOYTEC_ISOC, 4, 4,
+	    OZZY_RATE_44K1, EXPERIMENTAL, OZZY_QUIRK_MIDI_NS7 | OZZY_QUIRK_WAIT_200MS, OZZY_NO_LATENCY)
+#endif
+
+/* 4Trak: 2 in / 4 out at 44.1k, kInACR 8 */
+#ifndef OZZY_DISABLE_Numark4Trak
+OZZY_DEVICE(Numark4Trak, 0x15E4, 0x0026, "Numark 4Trak", PLOYTEC_ISOC, 2, 4,
+	    OZZY_RATE_44K1, EXPERIMENTAL, OZZY_QUIRK_MIDI_NS7, OZZY_NO_LATENCY)
+#endif
+
+/* MixDeck (kext class PGKernelDeviceNUMARKNC06): 4 in / 4 out at 44.1/88.2k, kInACR 2 (M4_C1) */
+#ifndef OZZY_DISABLE_NumarkMixDeck
+OZZY_DEVICE(NumarkMixDeck, 0x15E4, 0x0040, "Numark MixDeck", PLOYTEC_ISOC, 4, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_88K2, EXPERIMENTAL, OZZY_QUIRK_WAIT_200MS, OZZY_NO_LATENCY)
+#endif
+
+/*
+ * Omni Control (#93), Windows driver 2.9.13 (generic Ploytec nkc2_usb.sys, no Mac plist): 4 in /
+ * 4 out at High Speed, 44.1-96k, two-port MIDI frame (M4_M4_C1, Ozzy reads port 1), no
+ * device-specific requests. The driver overrides the counts from the 'V' reply (bytes 3/4 x2).
+ * Tested on hardware (#93, #95, gonzo-LE, Linux with Mixxx): audio, MIDI and a weekend stress
+ * test; the mic input was not tried.
+ */
+#ifndef OZZY_DISABLE_NumarkOmniControl
+OZZY_DEVICE(NumarkOmniControl, 0x15E4, 0x0074, "Numark Omni Control", PLOYTEC_ISOC, 4, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, SUPPORTED, 0, OZZY_NO_LATENCY)
+#endif
+
+/*
+ * Musonik (ex-Terrasoniq) PHASE X64 USB (#93), kext 2.0.4 (PGKernelDeviceDrvPHASEX64, no plist
+ * table) and Windows 2.9.34: 6 in (4 analog; lanes 5/6 a bit-exact copy of what plays on
+ * out 1/2) / 4 out, 44.1-96k, M4_C1 MIDI. The kext's selector bit 0, digital in and S/PDIF
+ * out lists hold it, and it sleeps 1000 ms before the setup requests. The input switches are two WM8776 codecs;
+ * Ozzy writes Windows' defaults (Mic/Line on 1/2, Aux on 3/4). Phono needs host RIAA, which
+ * Ozzy doesn't do. Hardware-checked facts (lanes 5/6, MIDI only while a stream runs, a locked
+ * S/PDIF input overrides the clock) from flarkflarkflark's GPL ALSA driver, facts only (#97):
+ * https://github.com/flarkflarkflark/phasex64-linux
+ */
+#ifndef OZZY_DISABLE_MusonikPhaseX64
+OZZY_DEVICE(MusonikPhaseX64, 0x0A4A, 0x5B01, "Musonik PHASE X64 USB", PLOYTEC_ISOC, 6, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL,
+	    OZZY_QUIRK_AJ_BIT0 | OZZY_QUIRK_DIGITAL_IN | OZZY_QUIRK_SPDIF_OUT |
+	    OZZY_QUIRK_WAIT_1000MS | OZZY_QUIRK_WM8776, OZZY_NO_LATENCY)
+#endif
+
+/*
+ * Reloop Jockey 3 Master Edition 3.4.10 kext (kConfigurationData, same flags as the DB2/DB4):
+ * 6 in / 4 out, 44.1-96k, kInACR 1 (the Xone MIDI rule). The upstream Linux jockey3 patch v3
+ * uses 0x1009 for it; Reloop's kexts say 0x1009 is the Digital Jockey 2 ME and 0x1019 this.
+ * The official driver sends it no AJ input selector requests (updateAjInputSelector).
+ */
+#ifndef OZZY_DISABLE_ReloopJockey3ME
+OZZY_DEVICE(ReloopJockey3ME, 0x200C, 0x1019, "Reloop Jockey 3 Master Edition", PLOYTEC_XONE, 6, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL,
+	    OZZY_QUIRK_NO_AJ_SELECTOR, OZZY_NO_LATENCY)
+#endif
+
+/*
+ * Reloop Jockey 3 Remix 3.4.10 kext (no kConfigurationData): 6 in / 4 out from the kext's
+ * fallback table. Rates: all four per fvdpol/alsa-jockey3, whose author tests on this unit (?)
+ */
+#ifndef OZZY_DISABLE_ReloopJockey3Remix
+OZZY_DEVICE(ReloopJockey3Remix, 0x200C, 0x1037, "Reloop Jockey 3 Remix", PLOYTEC_XONE, 6, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL, 0, OZZY_NO_LATENCY)
+#endif
+
+/*
+ * ESI U-series 3.4.10 kexts (Ploytec, no kConfigurationData): channels from the kext's fallback
+ * table, rates from ESI's specs (24-bit/96k). The ESI selector, 'A' request and CPLD byte come
+ * from the generic PGDevice code (ozzy_quirks.h). Untested on hardware.
+ */
+
+/* ESI U168 XT: 16 in / 8 out */
+#ifndef OZZY_DISABLE_EsiU168XT
+OZZY_DEVICE(EsiU168XT, 0x2573, 0x0012, "ESI U168 XT", PLOYTEC_XONE, 16, 8,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL,
+	    OZZY_QUIRK_ESI | OZZY_QUIRK_ESI_U168 | OZZY_QUIRK_ESI_CPLD | OZZY_QUIRK_ESI_CPORT, OZZY_NO_LATENCY)
+#endif
+
+/* ESI U86 XT: 8 in / 6 out */
+#ifndef OZZY_DISABLE_EsiU86XT
+OZZY_DEVICE(EsiU86XT, 0x2573, 0x0013, "ESI U86 XT", PLOYTEC_XONE, 8, 6,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL,
+	    OZZY_QUIRK_ESI | OZZY_QUIRK_ESI_CPLD, OZZY_NO_LATENCY)
+#endif
+
+/* ESI U108 PRE: 10 in / 8 out */
+#ifndef OZZY_DISABLE_EsiU108PRE
+OZZY_DEVICE(EsiU108PRE, 0x2573, 0x002A, "ESI U108 PRE", PLOYTEC_XONE, 10, 8,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL,
+	    OZZY_QUIRK_ESI | OZZY_QUIRK_ESI_CPLD, OZZY_NO_LATENCY)
+#endif
+
+/*
+ * ESI ESU1808 3.4.10 kext (no kConfigurationData): 16 in / 8 out from the fallback table, rates
+ * from ESI's spec (24-bit/96k). S/PDIF out mirrors output pair 1/2 in lanes 9/10 (dmaEncode10_12);
+ * the CPLD byte, but neither ESI's selector nor its 'A' request (those are VID 0x2573 only).
+ */
+#ifndef OZZY_DISABLE_EsiESU1808
+OZZY_DEVICE(EsiESU1808, 0x0A92, 0x0111, "ESI ESU1808", PLOYTEC_XONE, 16, 8,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL,
+	    OZZY_QUIRK_ESI_CPLD | OZZY_QUIRK_SPDIF_MIRROR, OZZY_NO_LATENCY)
+#endif
+
+/*
+ * Midiplus AudioLink PLUS 4x4 ("AudioLink Plus II") 3.3.20 kext (no kConfigurationData):
+ * 6 in / 6 out from the fallback table (4 analog + S/PDIF, inferred), rates from Midiplus's
+ * spec (24-bit/96k). No device-specific requests in the generic PGDevice code.
+ */
+#ifndef OZZY_DISABLE_MidiplusAudioLink4x4
+OZZY_DEVICE(MidiplusAudioLink4x4, 0x1ACC, 0x0103, "Midiplus AudioLink PLUS 4x4", PLOYTEC_XONE, 6, 6,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL, 0, OZZY_NO_LATENCY)
+#endif
+
+/*
+ * Tascam (TEAC) bulk in / isoc out kexts by Ploytec (kConfigurationData: High Speed, 44.1-96k,
+ * kInACR 3 = M4_C1 MIDI; plist flags per row, decoded with tools/ploytec_config_decode.py).
+ * Their kMsWait 100 never takes effect (initDeviceSpecificData clears it), except on the US-200.
+ * Untested on hardware.
+ */
+
+/* US1xx kext (TASCAM_US1xx.kext): 4 in / 4 out. Linux: snd-usb-us122l and us144mkii drive it,
+ * so the Linux Makefile leaves it out by default */
+#ifndef OZZY_DISABLE_TascamUS144
+OZZY_DEVICE(TascamUS144, 0x0644, 0x800F, "Tascam US-144", PLOYTEC_ISOC, 4, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL,
+	    OZZY_QUIRK_AJ_BIT0 | OZZY_QUIRK_SPDIF_OUT | OZZY_QUIRK_DIGITAL_IN, OZZY_NO_LATENCY)
+#endif
+
+/* usb2audio 3.25.0 kext: 4 in / 4 out. Linux: us144mkii (6.18) drives it, so the Linux Makefile
+ * leaves it out by default. Its input/output routing post-processors are off at the defaults */
+#ifndef OZZY_DISABLE_TascamUS144MKII
+OZZY_DEVICE(TascamUS144MKII, 0x0644, 0x8020, "Tascam US-144MKII", PLOYTEC_ISOC, 4, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL,
+	    OZZY_QUIRK_AJ_BIT0 | OZZY_QUIRK_SPDIF_OUT | OZZY_QUIRK_DIGITAL_IN |
+	    OZZY_QUIRK_OUT_ROUTING | OZZY_QUIRK_IN_ROUTING, OZZY_NO_LATENCY)
+#endif
+
+/* us200 3.22.0 kext: 2 in / 4 out, no digital I/O; the only Tascam that keeps a 100 ms wait */
+#ifndef OZZY_DISABLE_TascamUS200
+OZZY_DEVICE(TascamUS200, 0x0644, 0x8034, "Tascam US-200", PLOYTEC_ISOC, 2, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL,
+	    OZZY_QUIRK_WAIT_100MS | OZZY_QUIRK_OUT_ROUTING, OZZY_NO_LATENCY)
+#endif
+
+/* us600 3.22.0 kext: 6 in / 4 out; its input routing post-processor is a no-op at the defaults */
+#ifndef OZZY_DISABLE_TascamUS600
+OZZY_DEVICE(TascamUS600, 0x0644, 0x8035, "Tascam US-600", PLOYTEC_ISOC, 6, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL,
+	    OZZY_QUIRK_AJ_BIT0 | OZZY_QUIRK_SPDIF_OUT | OZZY_QUIRK_DIGITAL_IN |
+	    OZZY_QUIRK_OUT_ROUTING | OZZY_QUIRK_IN_ROUTING, OZZY_NO_LATENCY)
+#endif
+
+/* us1641 3.22.0 kext: 16 in / 4 out */
+#ifndef OZZY_DISABLE_TascamUS1641
+OZZY_DEVICE(TascamUS1641, 0x0644, 0x8017, "Tascam US-1641", PLOYTEC_ISOC, 16, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, SUPPORTED,
+	    OZZY_QUIRK_AJ_BIT0 | OZZY_QUIRK_SPDIF_OUT | OZZY_QUIRK_DIGITAL_OUT_SEL |
+	    OZZY_QUIRK_DIGITAL_IN, OZZY_NO_LATENCY)
+#endif
+
+/* us1800 3.25.0 kext: 16 in / 4 out */
+#ifndef OZZY_DISABLE_TascamUS1800
+OZZY_DEVICE(TascamUS1800, 0x0644, 0x8030, "Tascam US-1800", PLOYTEC_ISOC, 16, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL,
+	    OZZY_QUIRK_AJ_BIT0 | OZZY_QUIRK_SPDIF_OUT | OZZY_QUIRK_DIGITAL_OUT_SEL |
+	    OZZY_QUIRK_DIGITAL_IN, OZZY_NO_LATENCY)
+#endif
+
+/* us2000 3.22.0 kext: 16 in / 4 out */
+#ifndef OZZY_DISABLE_TascamUS2000
+OZZY_DEVICE(TascamUS2000, 0x0644, 0x8025, "Tascam US-2000", PLOYTEC_ISOC, 16, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL,
+	    OZZY_QUIRK_AJ_BIT0 | OZZY_QUIRK_SPDIF_OUT | OZZY_QUIRK_DIGITAL_OUT_SEL |
+	    OZZY_QUIRK_DIGITAL_IN, OZZY_NO_LATENCY)
+#endif
+
+/* US-366 (#91), from d-hey's capture of Tascam's Windows driver 1.04 (firmware 1.03,
+ * .claude/re/tascam_us366.md): isochronous both ways, 6 out / 4 in in the mixer mode it reported
+ * ('I' wIndex 1 = 0x0F). 48 and 96 kHz were on the wire; 44.1 and 88.2 are a guess (5/6 and 11/12
+ * frames per microframe, nominal). Untested on hardware. */
+#ifndef OZZY_DISABLE_TascamUS366
+OZZY_DEVICE(TascamUS366, 0x0644, 0x8041, "Tascam US-366", PLOYTEC_US3XX, 4, 6,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL, 0, OZZY_NO_LATENCY)
+#endif
+
+/*
+ * Smyth Research Realiser A16 3.4.13 kext (Ploytec, no kConfigurationData): 2 in / 16 out from the
+ * fallback table (dmaEncode16). Only the boot rate is known. No device-specific requests that
+ * change Ozzy's handshake (the official configurationDone skips its first selector call, the
+ * second still runs).
+ */
+#ifndef OZZY_DISABLE_SmythRealiserA16
+OZZY_DEVICE(SmythRealiserA16, 0x0A4A, 0x5A16, "Smyth Research Realiser A16", PLOYTEC_XONE, 2, 16,
+	    OZZY_RATE_44K1, EXPERIMENTAL, 0, OZZY_NO_LATENCY)
+#endif
+
+/*
+ * Reloop devices without kConfigurationData in their kexts: channels and boot rate from the
+ * fallback table (PGDevice::findInterfacesInConfig), no device-specific requests.
+ */
+
+/* Reloop Contour Interface Edition: 2 in / 10 out (dmaEncode10). Only the boot rate is known */
+#ifndef OZZY_DISABLE_ReloopContourIE
+OZZY_DEVICE(ReloopContourIE, 0x200C, 0x100A, "Reloop Contour Interface Edition", PLOYTEC_XONE, 2, 10,
+	    OZZY_RATE_44K1, EXPERIMENTAL, 0, OZZY_NO_LATENCY)
+#endif
+
+/* Reloop IQ2 MIDI: 4 in / 4 out, rates from Reloop's spec (24-bit/96k) */
+#ifndef OZZY_DISABLE_ReloopIQ2MIDI
+OZZY_DEVICE(ReloopIQ2MIDI, 0x200C, 0x1005, "Reloop IQ2 MIDI", PLOYTEC_XONE, 4, 4,
+	    OZZY_RATE_44K1 | OZZY_RATE_48K | OZZY_RATE_88K2 | OZZY_RATE_96K, EXPERIMENTAL, 0, OZZY_NO_LATENCY)
+#endif

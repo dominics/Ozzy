@@ -1,6 +1,6 @@
 #include <stdlib.h>
 #include "pacer.h"
-#include "ploytec_defs.h"
+#include "dynacord_defs.h"
 
 void pacer_init(struct pacer *p, unsigned rate)
 {
