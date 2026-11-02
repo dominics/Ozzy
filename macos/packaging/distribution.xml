@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+	<title>Ozzy for Dynacord CMS 600-3</title>
+	<options customize="never" require-scripts="true" hostArchitectures="arm64"/>
+	<domains enable_localSystem="true" enable_currentUserHome="false" enable_anywhere="false"/>
+	<volume-check>
+		<allowed-os-versions>
+			<os-version min="26.1"/>
+		</allowed-os-versions>
+	</volume-check>
+	<choices-outline>
+		<line choice="com.ozzy.userspace"/>
+	</choices-outline>
+	<choice id="com.ozzy.userspace" visible="false">
+		<pkg-ref id="com.ozzy.userspace"/>
+	</choice>
+	<pkg-ref id="com.ozzy.userspace" version="@VERSION@" onConclusion="none">ozzy-userspace.pkg</pkg-ref>
+</installer-gui-script>
