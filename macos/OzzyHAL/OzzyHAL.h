@@ -193,6 +193,8 @@ private:
     void StopDeviceIO();
     void NotifyClients(AudioServerPlugInHostRef host);
     uint32_t mTimestampSeed = 1;
+    // The last real anchor GetZeroTimeStamp handed out (host time 0: none since IO started)
+    uint64_t mAnchorSample = 0, mAnchorHost = 0;
 
     // Kext connection. The monitor thread maps and unmaps; CoreAudio's threads use the
     // mapping between AcquireSHM and ReleaseSHM, and Unmap waits for them to finish.

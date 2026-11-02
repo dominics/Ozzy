@@ -684,6 +684,7 @@ kern_return_t OzzyHALDevice::StartDeviceIO() {
     if (shm) shm->audio.hal_write_position.store(0, std::memory_order_relaxed);
     ReleaseSHM();
     LogOzzyHAL("device %{public}u: start I/O", mSlot);
+    mAnchorSample = mAnchorHost = 0;
     mIOStarted = true;
     mTimestampSeed++;
     return kIOReturnSuccess;
@@ -704,8 +705,20 @@ HRESULT OzzyHALDevice::GetZeroTimeStamp(Float64* outSampleTime, UInt64* outHostT
     }
 
     uint64_t sTime = 0, hTime = 0;
-    ozzy_timestamp_read(&shm->audio.timestamp, &sTime, &hTime);
+    bool got = ozzy_timestamp_read(&shm->audio.timestamp, &sTime, &hTime);
     ReleaseSHM();
+
+    // Host time 0 is the engine's "no anchor yet" (a start or restart); a failed read, a
+    // writer that kept the seqlock busy. Either way serve the last real anchor, and never
+    // hand CoreAudio a (0, 0) one.
+    if (!got || hTime == 0) {
+        if (mAnchorHost == 0) return kAudioHardwareNotRunningError;
+        sTime = mAnchorSample;
+        hTime = mAnchorHost;
+    } else {
+        mAnchorSample = sTime;
+        mAnchorHost = hTime;
+    }
 
     if (outSampleTime) *outSampleTime = (Float64)sTime;
     if (outHostTime) *outHostTime = hTime;
