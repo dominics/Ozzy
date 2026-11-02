@@ -25,6 +25,8 @@ Uninstall: `brew uninstall --cask ozzy-cms600`, `macos/uninstall-userspace.comma
 
 **Power-cycle quirk**: the mixer only enumerates if it is powered on with the USB cable already plugged in. If it does not show up, power it off, plug in the cable, then power it on.
 
+More on how it behaves (several users, sleep, latency, logs, security): [macos/USERSPACE.md](macos/USERSPACE.md). Open follow-ups: [TODO.md](TODO.md).
+
 ---
 <!-- /fork -->
 
