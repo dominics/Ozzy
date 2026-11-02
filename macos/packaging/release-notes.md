@@ -36,7 +36,7 @@ These change the Linux module's support for the CMS 600-3, which has been compil
 
 ### Upgrading
 
-- From 0.3.x: the output volume and mute set with 0.3.x now carry over (0.4.0 came up at full volume, unmuted), unless they were changed under 0.4.0, which then wins. Since 0.4.0 the mixer's device ID includes its USB port, as it has no serial number: after an upgrade from 0.3.x it appears as a new device once, so apps may need it picked again, and in another USB port it is another device with its own settings.
+- From 0.3.x: the output volume and mute set with 0.3.x now carry over (0.4.0 came up at full volume, unmuted), unless the mixer already has any setting of its own from 0.4.0 (volume, mute or stereo pair), which then wins. Since 0.4.0 the mixer's device ID includes its USB port, as it has no serial number: after an upgrade from 0.3.x it appears as a new device once, so apps may need it picked again, and in another USB port it is another device with its own settings.
 - The first time 0.4.1 drives the mixer it comes up at 48 kHz; after that it keeps the rate you set.
 - `debuglogs.command` now includes the userspace driver's own log, `~/Library/Logs/OzzyDaemon.log`, and whether its LaunchAgent is running.
 
