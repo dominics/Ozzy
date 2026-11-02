@@ -8,7 +8,7 @@
  * C++ (the plug-ins).
  *
  * A daemon's segment outlives the daemon: one that crashed or hung leaves magic, session_id
- * and hardware_present as they were in every mapping, and one that hands the device to another
+ * and hardware_present as they were in each mapping, and one that hands the device to another
  * user's daemon unlinks the name (the new daemon creates a new object under it). So a daemon
  * backend is alive only while the heartbeat moves (the daemon ticks it each 250 ms) and the
  * trailer is valid; once it isn't, the plug-in unmaps and opens the name again on a later scan.

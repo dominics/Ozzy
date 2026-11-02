@@ -58,7 +58,7 @@ codesign -dv "$P/Library/Application Support/Ozzy/OzzyDaemon" 2>&1 | grep -qx 'I
 
 plutil -lint "$P/Library/LaunchAgents/com.ozzy.daemon.plist" >/dev/null || fail "LaunchAgent plist invalid"
 grep -q -- '--log-file' "$P/Library/LaunchAgents/com.ozzy.daemon.plist" || fail "LaunchAgent lacks --log-file"
-# The agent runs as every user who logs in, so its binary must sit in a directory only root can write.
+# The agent runs as each user who logs in, so its binary must sit in a directory only root can write.
 grep -q '<string>/Library/Application Support/Ozzy/OzzyDaemon</string>' "$P/Library/LaunchAgents/com.ozzy.daemon.plist" \
 	|| fail "LaunchAgent does not run /Library/Application Support/Ozzy/OzzyDaemon"
 bom="$(lsbom -d -p MUGf "$COMP/Bom")"

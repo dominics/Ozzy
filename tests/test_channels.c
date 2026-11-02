@@ -3,7 +3,7 @@
  * OzzyHAL's channel names and stereo pairs (macos/OzzyHAL/OzzyChannels.h): the CMS 600-3's
  * names and roles by 1-based element, nothing out of range or for unlisted models, and the
  * stereo pair's checks, fallback and packing, and the CMS 600-3's MON and AUX mono inputs.
- * Every channel map's key is a device-table model with that many channels.
+ * Each channel map's key is a device-table model with that many channels.
  */
 
 #include "macos/OzzyHAL/OzzyChannels.h"
