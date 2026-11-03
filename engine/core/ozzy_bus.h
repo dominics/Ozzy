@@ -80,8 +80,10 @@ enum ozzy_pcm_dir {
  *                does it before its handshake (ozzy_engine_reselect). Process context, nothing
  *                in flight. Optional.
  * @pcm_stalled:  the device stopped streaming: its feedback went silent while PCM out kept
- *                going (OZZY_FB_STALL_MS). Stop the streams; a restart (the handshake) is what
- *                brings it back. Once per start, from the completion path. Optional.
+ *                going (OZZY_FB_STALL_MS), or a PCM transfer couldn't be submitted again from
+ *                its completion (ozzy_isoc_output_lost). Stop the streams; a restart (the
+ *                handshake) is what brings it back. Once per start, from the completion path.
+ *                Optional.
  */
 struct ozzy_bus_ops {
 	bool (*submit)(void *ctx, uint8_t pipe, void *buf, uint32_t size, void *xfer);

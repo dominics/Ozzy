@@ -373,6 +373,38 @@ static void check_feedback_latch(int how, bool want_broken)
 	free(e);
 }
 
+/*
+ * A PCM transfer that can't be submitted again from its completion (OUT, feedback or PCM in):
+ * the bus hears of it once, so the streams stop rather than run on a short queue
+ */
+static void check_lost_resubmit(uint8_t pipe)
+{
+	const struct ozzy_device *model = ozzy_device_lookup(0x0562, 0x03EB);
+	static struct ozzy_shared_memory shm;
+	struct fake_bus fb;
+	struct fake_xfer x;
+	struct ozzy_engine *e;
+	unsigned int i, done = 0;
+
+	memset(&shm, 0, sizeof(shm));
+	fake_bus_init(&fb, &shm, true, NULL);
+	e = ozzy_engine_init(malloc(ozzy_engine_size(model)), model);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_OUT, 0x02, 1, 156, 1);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_IN, 0x86, 2, 512, 1);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_FEEDBACK, 0x81, 1, 3, 4);
+	ozzy_engine_attach(e, &fb.bus, &shm);
+	CHECK(ozzy_engine_start(e), "CMS start");
+	for (i = 0; i < 400 && fake_bus_pop(&fb, &x); i++) {
+		if (i == 40)
+			fb.refuse_pipe = pipe;   /* from here on its resubmissions fail */
+		done += i >= 40 && x.pipe == pipe;
+		fake_bus_complete(&fb, e, &x, fill, NULL);
+	}
+	CHECK(done && fb.pcm_stalled == 1, "pipe 0x%02x: %u resubmissions failed, the bus told %u times", pipe, done,
+	      fb.pcm_stalled);
+	free(e);
+}
+
 int main(void)
 {
 	const struct ozzy_device *model = ozzy_device_lookup(0x0644, 0x8020);
@@ -397,6 +429,9 @@ int main(void)
 	halt_as_zero = false;
 	check_feedback_latch(0, false);   /* lost by the bus */
 	check_feedback_latch(1, true);    /* empty from the device */
+	check_lost_resubmit(0x02);
+	check_lost_resubmit(0x81);
+	check_lost_resubmit(0x86);
 	CHECK(model && model->family == OZZY_FAMILY_PLOYTEC_ISOC, "US-144MKII in the device list");
 	for (i = 0; i < sizeof(out_ring); i++)
 		out_ring[i] = (uint8_t)(i * 7 + 3);

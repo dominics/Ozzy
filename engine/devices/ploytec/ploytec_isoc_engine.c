@@ -235,8 +235,10 @@ static void isoc_complete(struct ozzy_engine *e, uint8_t pipe, void *xfer, int s
 		if (status == 0 && bytes != ploytec_in_xfer_bytes(pe->in_frames))
 			ozzy_engine_stats_short(e, OZZY_PCM_IN);
 		ploytec_decode_pcm_in(e, pe->decode, pe->in_frames, idx, status == 0 ? bytes : 0);
-		if (!ploytec_submit_pcm_in(e, pe->in_addr, pe->in_frames, next))
+		if (!ploytec_submit_pcm_in(e, pe->in_addr, pe->in_frames, next)) {
 			ploytec_log("isoc: input submission failed (idx: %u)", next);
+			ozzy_isoc_output_lost(&pe->output);
+		}
 	} else if (pipe == pe->midi_in_addr) {
 		if (status == 0)
 			ploytec_midi_in_to_ring(&pe->midi, shm, ploytec_midi_in_slot(e, idx),

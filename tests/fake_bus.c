@@ -21,6 +21,8 @@ static bool fb_submit(void *ctx, uint8_t pipe, void *buf, uint32_t size, void *x
 	if (fb->trace)
 		fprintf(fb->trace, "submit %02x off=%ld size=%u xfer=%lu\n", pipe, shm_offset(fb, buf), size,
 			(unsigned long)(uintptr_t)xfer);
+	if (fb->refuse_pipe && pipe == fb->refuse_pipe)
+		return false;
 	fake_bus_push(fb, &x);
 	return true;
 }
@@ -39,6 +41,8 @@ static bool fb_submit_isoc(void *ctx, uint8_t pipe, void *buf, uint32_t buf_size
 			fprintf(fb->trace, " %u/%u", packets[i].offset, packets[i].length);
 		fprintf(fb->trace, "\n");
 	}
+	if (fb->refuse_pipe && pipe == fb->refuse_pipe)
+		return false;
 	fake_bus_push(fb, &x);
 	return true;
 }

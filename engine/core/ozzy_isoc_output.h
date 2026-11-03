@@ -83,7 +83,7 @@ struct ozzy_isoc_output {
 	uint64_t played_frames;    /* frames of completed transfers (the device's sample time) */
 	uint64_t next_anchor;      /* sample time of the next timestamp anchor */
 	uint64_t fb_valid_time;    /* bus time of the last feedback packet with a value in range, 0: none yet */
-	bool fb_stalled;           /* told the bus (ozzy_bus_pcm_stalled) this run */
+	bool fb_stalled;           /* told the bus (ozzy_bus_pcm_stalled) this run: a stall or a lost transfer */
 	bool fb_logged;
 	struct ozzy_isoc_output_xfer out[ISOC_OUT_TRANSFERS_MAX];
 	struct ozzy_isoc_output_xfer fb_xfer[ISOC_FB_TRANSFERS];
@@ -107,6 +107,13 @@ static inline void ozzy_isoc_output_stop(struct ozzy_isoc_output *out)
 {
 	out->running = false;
 }
+
+/*
+ * A transfer of the device's PCM streams (this output's, or the engine's PCM in) couldn't be
+ * submitted again from its completion, so the queue is a transfer short from now on: tell the
+ * bus (ozzy_bus_pcm_stalled), once per start, so the streams stop and a restart fills it again
+ */
+void ozzy_isoc_output_lost(struct ozzy_isoc_output *out);
 
 /* An isochronous completion; false if it isn't one of this output's pipes */
 bool ozzy_isoc_output_complete(struct ozzy_isoc_output *out, uint8_t pipe, void *xfer, int status,

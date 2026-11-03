@@ -185,6 +185,15 @@ static void check_stall(struct ozzy_isoc_output *out)
 	ozzy_bus_pcm_stalled(out->bus);
 }
 
+void ozzy_isoc_output_lost(struct ozzy_isoc_output *out)
+{
+	if (!out->running || out->fb_stalled)
+		return;
+	out->fb_stalled = true;
+	ozzy_log("isoc: a transfer couldn't be submitted again: stopping the streams");
+	ozzy_bus_pcm_stalled(out->bus);
+}
+
 bool ozzy_isoc_output_complete(struct ozzy_isoc_output *out, uint8_t pipe, void *xfer, int status,
 			       struct ozzy_isoc_packet *packets, uint32_t count)
 {
@@ -198,7 +207,8 @@ bool ozzy_isoc_output_complete(struct ozzy_isoc_output *out, uint8_t pipe, void 
 		check_stall(out);
 		if (!out->config.xfer[0])
 			clear_sent(out, &out->out[i]);
-		submit_out(out, i);
+		if (!submit_out(out, i))
+			ozzy_isoc_output_lost(out);
 		return true;
 	}
 	if (pipe == out->config.fb_addr && out->config.fb_addr) {
@@ -220,7 +230,8 @@ bool ozzy_isoc_output_complete(struct ozzy_isoc_output *out, uint8_t pipe, void 
 			if (out->fb.uframes && isoc_fb_in_range(&out->fb, pkt, len))
 				out->fb_valid_time = packets[p].time ? packets[p].time : ozzy_bus_time(out->bus);
 		}
-		submit_feedback(out, i);
+		if (!submit_feedback(out, i))
+			ozzy_isoc_output_lost(out);
 		return true;
 	}
 	return false;

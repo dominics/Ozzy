@@ -37,6 +37,7 @@ struct fake_bus {
 	uint64_t packet_lead;              /* isoc packet times this far after @now (a bus clock ahead) */
 	unsigned int stats_changed;        /* stats_changed calls */
 	unsigned int pcm_stalled;          /* pcm_stalled calls */
+	uint8_t refuse_pipe;               /* submissions to this pipe fail (0: none) */
 	bool timer_on;
 	uint64_t progress[OZZY_PCM_DIRS];  /* last pcm_progress */
 	bool rings;                        /* has pcm_progress (a ring platform) */
