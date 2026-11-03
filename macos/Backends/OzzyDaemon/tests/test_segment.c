@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: MIT */
-/* The daemon's POSIX shm segment: create, mode, trailer, live and stale segments, destroy */
+/* The daemon's POSIX shm segment: create, mode, trailer, live and stale segments, destroy, abandon */
 
 #include "../segment.h"
 #include "../../../../tests/check.h"
@@ -103,6 +103,22 @@ int main(void)
 	munmap(a.base, a.size);   /* a crash: mapped by nobody, heartbeat still */
 	close(a.fd);
 	CHECK(segment_clear_stale(name, 50) && !exists(), "a stale segment is removed");
+
+	/* Abandoned after a stuck abort: unlinked and marked gone, but still mapped, so a transfer
+	 * IOKit still holds writes into memory nothing else has */
+	CHECK(segment_create(&a, name, 50) == SEGMENT_CREATED, "create a fifth time");
+	a.shm->magic = OZZY_MAGIC;
+	{
+		volatile struct ozzy_shared_memory *kept = a.shm;
+		void *base = a.base;
+		size_t size = a.size;
+
+		segment_abandon(&a);
+		CHECK(!exists() && !a.base && a.fd < 0, "abandon unlinks and forgets the segment");
+		CHECK(kept->magic == 0 && !kept->audio.hardware_present, "the plug-ins see it gone");
+		kept->audio.input_buffer[0] = 1;   /* still mapped: no fault */
+		munmap(base, size);
+	}
 
 	return CHECK_DONE("segment");
 }

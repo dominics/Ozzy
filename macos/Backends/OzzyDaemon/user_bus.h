@@ -142,7 +142,12 @@ uint32_t ubus_pipe_refused(struct user_bus *b, uint8_t address);
 /* Host clock ticks for @ms */
 uint64_t ubus_ms_to_ticks(const struct user_bus *b, uint64_t ms);
 
-/* Stop the timer and the I/O thread, abort what's in flight, close the interfaces and device */
-void ubus_close(struct user_bus *b);
+/*
+ * Stop the timer and the I/O thread, abort what's in flight, close the interfaces and device.
+ * False if transfers were still outstanding after the abort's wait: their requests and bounce
+ * buffers are left allocated, and so should be the memory they point into (the engine's and
+ * the segment's), since IOKit may still write there.
+ */
+bool ubus_close(struct user_bus *b);
 
 #endif

@@ -257,7 +257,8 @@ void segment_beat_stop(struct segment *seg)
 	segment_release(seg);
 }
 
-void segment_destroy(struct segment *seg)
+/* segment_destroy, or segment_abandon when @unmap is false */
+static void retire(struct segment *seg, bool unmap)
 {
 	segment_beat_stop(seg);
 	if (seg->base) {
@@ -271,7 +272,8 @@ void segment_destroy(struct segment *seg)
 		seg->shm->audio.hardware_present = false;
 		seg->shm->magic = 0;
 		__atomic_store_n((volatile uint32_t *)&seg->shm->heartbeat, mark, __ATOMIC_RELEASE);
-		munmap(seg->base, seg->size);
+		if (unmap)
+			munmap(seg->base, seg->size);
 		seg->base = NULL;
 		seg->shm = NULL;
 		seg->trailer = NULL;
@@ -295,4 +297,14 @@ void segment_destroy(struct segment *seg)
 		close(seg->fd);
 		seg->fd = -1;
 	}
+}
+
+void segment_destroy(struct segment *seg)
+{
+	retire(seg, true);
+}
+
+void segment_abandon(struct segment *seg)
+{
+	retire(seg, false);
 }
