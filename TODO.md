@@ -44,4 +44,4 @@ These were set without a measurement behind them.
 
 ## Test tools
 
-- [ ] The hardware test tools used for releases (a duplex loopback recorder with a two-tone analyser, and a MIDI port loop / SysEx echo by port name) live outside the repo. Commit them if more hardware testing is coming.
+- [x] The hardware test tools used for releases (a duplex loopback recorder with a two-tone analyser, and a MIDI port loop / SysEx echo by port name) are in `tools/cms600`, with `loopback.sh` for the release run.
