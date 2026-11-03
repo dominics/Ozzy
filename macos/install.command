@@ -83,7 +83,7 @@ if $KEXT_INSTALLED || $DEXT_INSTALLED || $DAEMON_INSTALLED || $LEGACY_HAL; then
     echo "   conflicts and prevent your audio device from working!"
     echo ""
     echo "You must uninstall the existing driver first using:"
-    echo "  ./uninstall_ozzy.command"
+    echo "  ./uninstall.command"
     echo ""
     echo "Or manually remove:"
     if $KEXT_INSTALLED; then
