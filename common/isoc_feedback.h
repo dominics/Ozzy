@@ -22,7 +22,9 @@
  * Musonik PHASE X64 sends empty packets for more than 40 ms after a start; #97).
  * Past @max_errors without a clean ring lap in between, feedback is ignored (the
  * official Ploytec driver stops the stream after 40 there; this keeps playing at
- * the nominal rate).
+ * the nominal rate). A packet the bus lost (an error status, isoc_fb_lost) plays
+ * its interval at the nominal rate and is not counted, though its lap doesn't
+ * count as clean either.
  *
  * The two sides share only the ring, with no lock: each side owns its own
  * index, and entries are single bytes. High Speed only.
@@ -107,7 +109,7 @@ struct isoc_fb {
 	uint32_t q_acc;         /* Q16_16: fractional frames carried to the next microframe */
 	bool started;           /* a valid packet came in: wrong lengths count from now on */
 	uint32_t errors;        /* wrong-length packets since the last clean lap */
-	uint32_t lap_errors;    /* wrong-length packets in this lap */
+	uint32_t lap_errors;    /* wrong-length or lost packets in this lap */
 	bool broken;            /* errors passed the limit: feedback is ignored */
 };
 
@@ -196,14 +198,15 @@ static inline uint32_t isoc_fb_value(const struct isoc_fb *fb, const uint8_t *pk
 }
 
 /*
- * isoc_fb_packet - Take one feedback packet (@len bytes received) and fill the
- * ring entries of its interval. Returns true once, when the wrong-length packets
+ * isoc_fb_take - Fill the ring entries of one feedback packet's interval: from
+ * @pkt (@len bytes received), or at the nominal rate when @lost (the bus lost
+ * the packet, @pkt unused). Returns true once, when the wrong-length packets
  * pass the limit and feedback stops being used.
  */
-static inline bool isoc_fb_packet(struct isoc_fb *fb, const uint8_t *pkt, uint32_t len)
+static inline bool isoc_fb_take(struct isoc_fb *fb, const uint8_t *pkt, uint32_t len, bool lost)
 {
 	uint32_t u = fb->uframes;
-	uint32_t valid = len == fb->cfg.packet_size;
+	uint32_t valid = !lost && len == fb->cfg.packet_size;
 	uint32_t v = valid ? isoc_fb_value(fb, pkt) : 0;
 	uint32_t whole = fb->cfg.format == ISOC_FB_Q16_16 ? v >> 16 : v;
 	uint32_t ok = valid & (whole >= fb->lo) & (whole <= fb->hi) & !fb->broken;
@@ -224,14 +227,33 @@ static inline bool isoc_fb_packet(struct isoc_fb *fb, const uint8_t *pkt, uint32
 
 	fb->started |= valid;
 	wrong = !valid & fb->started;
-	fb->errors += wrong;
-	fb->lap_errors += wrong;
+	fb->errors += wrong & !lost;   /* a lost packet isn't the device's wrong length */
+	fb->lap_errors += wrong | lost;
 	lap_end = u && (fb->wr & (ISOC_FB_RING - 1)) < u;
 	fb->errors *= !(lap_end && fb->lap_errors == 0);
 	fb->lap_errors *= !lap_end;
 	fb->broken |= fb->cfg.max_errors && fb->errors > fb->cfg.max_errors;
 
 	return fb->broken && !was_broken;
+}
+
+/*
+ * isoc_fb_packet - Take one feedback packet (@len bytes received) and fill the
+ * ring entries of its interval. Returns true once, when the wrong-length packets
+ * pass the limit and feedback stops being used.
+ */
+static inline bool isoc_fb_packet(struct isoc_fb *fb, const uint8_t *pkt, uint32_t len)
+{
+	return isoc_fb_take(fb, pkt, len, false);
+}
+
+/*
+ * isoc_fb_lost - A feedback packet the bus lost (an error status, no data): its
+ * interval plays at the nominal rate, and it doesn't count towards @max_errors.
+ */
+static inline void isoc_fb_lost(struct isoc_fb *fb)
+{
+	isoc_fb_take(fb, (const uint8_t *)0, 0, true);
 }
 
 /*
