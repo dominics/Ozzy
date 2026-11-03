@@ -12,6 +12,7 @@
 #include "common/devices/ploytec/ploytec_protocol.h"
 #include "common/devices/ploytec/ploytec_codec.h"
 #include "engine/core/ozzy_isoc_output.h"
+#include "engine/devices/ploytec/ploytec_isoc_engine.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -312,6 +313,60 @@ static void check_stall(uint64_t packet_lead)
 	free(e);
 }
 
+/* Feedback packets from @from to @to (counted across the run) arrive as @how: 0 lost by the bus
+ * (an error status, nothing received), 1 empty (the firmware's own empty packet), the rest
+ * valid. A lost or empty packet carries no bytes. */
+struct fb_window {
+	unsigned int seen, from, to;
+	int how;
+};
+
+static void fill_feedback_window(struct fake_xfer *x, void *arg)
+{
+	struct fb_window *w = arg;
+	uint32_t k;
+
+	for (k = 0; x->isoc && k < x->count; k++, w->seen++) {
+		bool in = w->seen >= w->from && w->seen < w->to;
+
+		x->buf[x->packets[k].offset] = 48;
+		x->packets[k].status = in && w->how == 0 ? -71 : 0;   /* -EPROTO, as Linux reports it */
+		x->packets[k].actual = in ? 0 : x->packets[k].length;
+	}
+}
+
+/*
+ * More than PLOYTEC_ISOC_FB_MAX_ERRORS feedback packets without a clean lap, through the
+ * submit and complete path: packets the bus lost (an error status) leave the feedback in use,
+ * as the official driver and 0.3.0 skipped them; empty packets the device sent switch it off
+ */
+static void check_feedback_latch(int how, bool want_broken)
+{
+	const struct ozzy_device *model = ozzy_device_lookup(0x0562, 0x03EB);
+	static struct ozzy_shared_memory shm;
+	struct fb_window w = { 0, 40, 40 + 3 * PLOYTEC_ISOC_FB_MAX_ERRORS, how };
+	struct fake_bus fb;
+	struct fake_xfer x;
+	struct ozzy_engine *e;
+	unsigned int i;
+
+	memset(&shm, 0, sizeof(shm));
+	fake_bus_init(&fb, &shm, true, NULL);
+	e = ozzy_engine_init(malloc(ozzy_engine_size(model)), model);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_OUT, 0x02, 1, 156, 1);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_IN, 0x86, 2, 512, 1);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_FEEDBACK, 0x81, 1, 3, 4);
+	ozzy_engine_attach(e, &fb.bus, &shm);
+	CHECK(ozzy_engine_start(e), "CMS start");
+	for (i = 0; i < 2000 && w.seen < w.to + 64 && fake_bus_pop(&fb, &x); i++)
+		fake_bus_complete(&fb, e, &x, x.pipe == 0x81 ? fill_feedback_window : NULL, &w);
+	CHECK(w.seen >= w.to + 64, "only %u feedback packets", w.seen);
+	CHECK(((struct ploytec_isoc_engine *)e)->output.fb.broken == want_broken,
+	      "%u %s feedback packets: feedback %s", w.to - w.from, how == 0 ? "lost" : "empty",
+	      want_broken ? "still in use" : "switched off");
+	free(e);
+}
+
 int main(void)
 {
 	const struct ozzy_device *model = ozzy_device_lookup(0x0644, 0x8020);
@@ -331,6 +386,8 @@ int main(void)
 	check_out_queue(0x09E8, 0x0010, ISOC_OUT_TRANSFERS);        /* EIE Pro */
 	check_stall(0);
 	check_stall(3000);   /* packet times a bus clock puts after the completion */
+	check_feedback_latch(0, false);   /* lost by the bus */
+	check_feedback_latch(1, true);    /* empty from the device */
 	CHECK(model && model->family == OZZY_FAMILY_PLOYTEC_ISOC, "US-144MKII in the device list");
 	for (i = 0; i < sizeof(out_ring); i++)
 		out_ring[i] = (uint8_t)(i * 7 + 3);

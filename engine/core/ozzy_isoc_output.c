@@ -212,7 +212,9 @@ bool ozzy_isoc_output_complete(struct ozzy_isoc_output *out, uint8_t pipe, void 
 				out->fb_logged = true;
 				ozzy_log("isoc: first feedback packet: %u bytes %02x %02x %02x", len, pkt[0], pkt[1], pkt[2]);
 			}
-			if (isoc_fb_packet(&out->fb, pkt, len))
+			if (packets[p].status != 0)
+				isoc_fb_lost(&out->fb);   /* the bus's error, not the device's wrong length */
+			else if (isoc_fb_packet(&out->fb, pkt, len))
 				ozzy_log("isoc: more than %u feedback packets were not %u bytes long, PCM out runs at the nominal rate",
 					 out->fb.cfg.max_errors, out->fb.cfg.packet_size);
 			if (out->fb.uframes && len == out->fb.cfg.packet_size)
