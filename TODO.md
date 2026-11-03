@@ -35,7 +35,7 @@ These were set without a measurement behind them.
 - [ ] A possible stale byte 0 on bulk PCM IN: in some 48 kHz sessions started right after a rate change (0.3.x, OzzyDaemon over IOUSBLib), byte 0 of the 64-byte input frame repeated the previous frame's in about 8% of frames. It holds bit 23 of inputs 1 and 3, so quiet signals there click at full scale. Not reproduced since, and a later rate change cleared it; suspect it first if inputs 1 or 3 click. Notes in [.claude/re/open_questions.md](.claude/re/open_questions.md).
 - [ ] Check whether OzzyMIDI still drops MIDI bytes after a MIDIServer restart until the device-online block has run, and whether the HAL still sends a duplicate `PropertiesChanged(NominalSampleRate)` (both seen with 0.3.x).
 - [ ] Linux has only been compiled for 0.4.x, never run on the CMS 600-3: 5-minute runs at each rate, both MIDI ports, unplug while streaming. Also from the port: the minimum playback period is now 768 frames (JACK `-p 256` and `-p 512` are refused) and the rawmidi port names are cut at 32 characters.
-- [ ] CI runs only on pushes to `release` and on `v*` tags, so a regression on the trunk shows up at release time. Run the host tests on trunk pushes too.
+- [x] CI ran only on pushes to `release` and on `v*` tags, so a regression on the trunk showed up at release time. Pushes to `dynacord-cms600` now run the lint and host tests too, without building the package.
 
 ## Features asked for
 
