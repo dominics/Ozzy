@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * OzzyHAL's output volume curve (macos/OzzyHAL/OzzyVolume.h): the end points, clamping, the
+ * OzzyHAL's volume curve, output and input, (macos/OzzyHAL/OzzyVolume.h): the end points, clamping, the
  * scalar <-> dB conversions as inverses, equal scalar steps as equal dB steps, and the gain
  * ramp over a buffer.
  */

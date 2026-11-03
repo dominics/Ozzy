@@ -819,6 +819,7 @@ OSStatus OzzyHALDevice::ioOperation(UInt32 inOperationID, UInt32 inIOBufferFrame
             uint64_t sampleTime = (uint64_t)inIOCycleInfo->mInputTime.mSampleTime;
             mReadInput((float*)ioMainBuffer, shm->audio.input_buffer, sampleTime, inIOBufferFrameSize, mInRingFrames);
             ozzy_route_frames((uint8_t*)ioMainBuffer, inIOBufferFrameSize, &mInRoute, 2 * sizeof(float));
+            mExtras.ApplyInputGain((float*)ioMainBuffer, inIOBufferFrameSize, mInputChannels);
         }
     }
     ReleaseSHM();
@@ -1348,12 +1349,11 @@ extern "C" HRESULT OzzyGetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
             case kAudioObjectPropertyBaseClass: return WriteClassID(inMax, outSize, outData, kAudioObjectClassID);
             case kAudioObjectPropertyClass: return WriteClassID(inMax, outSize, outData, kAudioDeviceClassID);
             case kAudioObjectPropertyControlList: {
-                // The clock source (if any), then the fork's volume and mute
+                // The clock source (if any), then the fork's volume and mute, output and input
                 AudioObjectID ids[1 + kOzzyExtraControls];
                 UInt32 count = 0;
                 if (hasClock) ids[count++] = dev->GetClockControlID();
-                ids[count++] = dev->GetDeviceID() + kOzzyObjectVolumeControl;
-                ids[count++] = dev->GetDeviceID() + kOzzyObjectMuteControl;
+                for (UInt32 kind : kOzzyExtraControlKinds) ids[count++] = dev->GetDeviceID() + kind;
                 if (outData && inMax < count * sizeof(AudioObjectID)) return kAudioHardwareBadPropertySizeError;
                 if (outData) memcpy(outData, ids, count * sizeof(AudioObjectID));
                 if (outSize) *outSize = count * sizeof(AudioObjectID);
@@ -1385,7 +1385,7 @@ extern "C" HRESULT OzzyGetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
                 if (outData && inMax < count * sizeof(AudioObjectID)) return kAudioHardwareBadPropertySizeError;
                 AudioObjectID* list = (AudioObjectID*)outData;
                 if (list) { list[0] = dev->GetOutputStreamID(); list[1] = dev->GetInputStreamID(); if (hasClock) list[2] = dev->GetClockControlID(); }
-                if (list) { list[count - 2] = dev->GetDeviceID() + kOzzyObjectVolumeControl; list[count - 1] = dev->GetDeviceID() + kOzzyObjectMuteControl; }
+                if (list) for (UInt32 i = 0; i < kOzzyExtraControls; i++) list[count - kOzzyExtraControls + i] = dev->GetDeviceID() + kOzzyExtraControlKinds[i];
                 if (outSize) *outSize = count * sizeof(AudioObjectID); return kAudioHardwareNoError;
             }
             case kAudioDevicePropertyStreamConfiguration: {

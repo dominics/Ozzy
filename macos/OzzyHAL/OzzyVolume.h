@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*
- * The output volume curve of OzzyHAL's volume control. The scalar that the menu bar slider and
- * the volume keys move is linear in decibels across [OZZY_VOLUME_MIN_DB, OZZY_VOLUME_MAX_DB],
+ * The volume curve of OzzyHAL's output and input volume controls. The scalar that the menu bar
+ * slider and the volume keys move is linear in decibels across [OZZY_VOLUME_MIN_DB, OZZY_VOLUME_MAX_DB],
  * so each step changes the level by the same amount; scalar 0 is silence rather than
  * OZZY_VOLUME_MIN_DB. C, usable from C++ (OzzyHAL) and the host tests (tests/test_volume.c).
  */

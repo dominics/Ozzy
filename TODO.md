@@ -15,6 +15,7 @@ Run with the mixer's loopback (outputs 1-2 and 3-4 back into inputs 1-2), record
 - [ ] A failed start is retried: unplug and replug during the handshake, and power-cycle the mixer with USB connected.
 - [ ] No false watchdog recoveries in 10 minutes idle and 10 minutes streaming, including bulk 0x86 while no app has the device open.
 - [ ] Upgrades from 0.4.0 and from 0.3.0 keep a lowered output volume and mute.
+- [ ] The input volume and mute in Sound settings lower and silence the loopback recording without clicks, and both are kept across a replug and a `coreaudiod` restart.
 - [ ] Linux: a forced underrun stops the stream with an XRUN, and a failed rate change leaves the mixer stopped rather than resetting its USB.
 
 ## Values to measure on hardware
@@ -39,8 +40,7 @@ These were set without a measurement behind them.
 
 ## Features asked for
 
-- [ ] A system-wide input mute.
-- [ ] Input volume, like the output volume (`macos/OzzyHAL/OzzyVolume.h`). Settle first how to keep apps' automatic gain control (video call apps, browsers) from driving it; mute has no such conflict, so it can go first.
+- [x] Input volume and mute, like the output ones, on the main device's input (`macos/OzzyHAL/OzzyHALExtras.h`).
 
 ## Test tools
 
