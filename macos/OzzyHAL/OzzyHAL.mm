@@ -248,15 +248,42 @@ void OzzyHALDevice::ApplyDeviceConfig() {
           PLOYTEC_FRAMES_PER_OUT_SUBPKT;
     uint32_t inMax = OZZY_PCM_RING_BYTES / (plainIn ? mInputChannels * 3 : PLOYTEC_IN_FRAME_SIZE);
     bool fits = FitFrames(&mOutRingFrames, outMax) & FitFrames(&mInRingFrames, inMax);
-    if (!(FitFrames(&mTimestampFrames, mOutRingFrames) & fits))
+    // The anchors no closer together than the smallest IO buffer setting puts them (CoreAudio
+    // caps its IO buffer at 3/8 of their spacing), and both rings hold a whole spacing
+    if (mTimestampFrames < ozzy_anchor_frames(0, 1)) {
+        LogOzzyHALError("device %{public}u: the driver's anchors are %{public}u frames apart, raised to %{public}u",
+                        mSlot, mTimestampFrames, ozzy_anchor_frames(0, 1));
+        mTimestampFrames = ozzy_anchor_frames(0, 1);
+    }
+    if (!(FitFrames(&mTimestampFrames, mOutRingFrames < mInRingFrames ? mOutRingFrames : mInRingFrames) & fits))
         LogOzzyHALError("device %{public}u: the driver's ring layout doesn't fit its buffers, cut to %{public}u out / %{public}u in frames, anchors every %{public}u",
                         mSlot, mOutRingFrames, mInRingFrames, mTimestampFrames);
+    // Each side reads ahead of (output) or behind (input) the clock by less than its ring
+    bool outSafe = FitFrames(&mSafetyOffset, mOutRingFrames - 1);
+    bool inSafe = FitFrames(&mInputSafetyOffset, mInRingFrames - 1);
+    if (!(outSafe & inSafe))
+        LogOzzyHALError("device %{public}u: the driver's safety offsets don't fit its rings, cut to %{public}u out / %{public}u in frames",
+                        mSlot, mSafetyOffset, mInputSafetyOffset);
     RebuildStreamConfigs();
     LogOzzyHAL("device %{public}u: Ploytec codec (%{public}s output, %{public}s input, %{public}u in / %{public}u out) for VID:0x%{public}04X",
                mSlot, plain ? "plain" : isBulk ? "bulk" : "interrupt", plainIn ? "plain" : "Ploytec", mInputChannels,
                mOutputChannels, shm->vendor_id);
 
+    // The device's model: its rates, here and for the rates CoreAudio may pick below
+    const struct ozzy_device* model = ozzy_device_lookup(shm->vendor_id, shm->product_id);
+    mModel = model;
+
     uint32_t rate = shm->audio.sample_rate.load();
+    // None, or a rate the model doesn't run at: its highest, the one a start asks for without a
+    // request (the engines refuse to run at a rate the model doesn't list)
+    uint32_t modelRates[OZZY_MAX_RATES];
+    unsigned int modelRateCount = model ? ozzy_device_rates(model, modelRates) : 0;
+    if (modelRateCount && !ozzy_device_has_rate(model, rate)) {
+        if (rate)
+            LogOzzyHALError("device %{public}u: the driver published %{public}u Hz, which the %{public}s doesn't run at; using %{public}u Hz",
+                            mSlot, rate, model->name, modelRates[modelRateCount - 1]);
+        rate = modelRates[modelRateCount - 1];
+    }
     if (rate == 0) rate = 96000;
     mCurrentStreamFormat.mSampleRate = rate;
 
@@ -277,8 +304,6 @@ void OzzyHALDevice::ApplyDeviceConfig() {
     }
 
     // The rates CoreAudio may pick: the device's, or only the S/PDIF lock rate
-    const struct ozzy_device* model = ozzy_device_lookup(shm->vendor_id, shm->product_id);
-    mModel = model;
     mHostRateCount = model ? ozzy_device_host_rates(model, mClockLocked ? mLockRate : 0, mHostRates) : 0;
     if (!mHostRateCount) {
         mHostRates[0] = rate;
