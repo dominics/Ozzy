@@ -17,7 +17,7 @@ Install and uninstall are described in the [README](../README.md#about-this-fork
 - **A start that fails** (a control request timing out at plug-in, say) is tried again 4 times, 500 ms apart, then each 2 s while the mixer stays plugged in. A device that stops streaming (no feedback for 1 s, or 3 failed transfers in a row on one pipe) is restarted; if that fails too, the daemon releases it and tries again each 2 s.
 - **Sleep**: the daemon holds no sleep assertion. When the Mac sleeps it suspends the stream, and on wake it runs the start sequence again. For long recordings on battery use `caffeinate -i` or a power assertion from the recording app.
 - **Latency**: output is queued as 6 x 4 ms isochronous transfers (24 ms), and the output safety offset Core Audio is told covers that queue: 1344 frames at 44.1 and 48 kHz, 2496 at 96 kHz. The input safety offset is much smaller. These are not yet measured on hardware against the mixer's loopback; see [TODO.md](../TODO.md).
-- **Logs**: the daemon writes `~/Library/Logs/OzzyDaemon.log` only (not the system log). The plug-ins log to the system log: `log stream --predicate 'subsystem == "OzzyHAL" OR subsystem == "OzzyMIDI"'`. `debuglogs.command` collects both.
+- **Logs**: the daemon writes `~/Library/Logs/OzzyDaemon.log` (moved to `OzzyDaemon.log.1` once it passes 5 MB), not the system log; only a failure to open that file goes to the system log, as `ozzy-daemon: no log file`. The plug-ins log to the system log: `log stream --predicate 'subsystem == "OzzyHAL" OR subsystem == "OzzyMIDI"'`. `debuglogs.command` collects both.
 
 ## Security
 

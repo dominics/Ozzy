@@ -14,7 +14,7 @@ cd "$DIR"
 TIMESTAMP=$(date "+%Y-%m-%d_%H-%M-%S")
 LOGFILE="$HOME/Desktop/Ozzy_Debug_Log_$TIMESTAMP.txt"
 
-PREDICATE='(process == "kernel" AND (composedMessage CONTAINS "[OzzyKext]" OR composedMessage CONTAINS "[Ploytec]")) OR subsystem == "OzzyHAL" OR subsystem == "OzzyMIDI"'
+PREDICATE='(process == "kernel" AND (composedMessage CONTAINS "[OzzyKext]" OR composedMessage CONTAINS "[Ploytec]")) OR subsystem == "OzzyHAL" OR subsystem == "OzzyMIDI" OR process == "OzzyDaemon"'
 
 clear
 echo "====================================================="
@@ -62,6 +62,11 @@ echo "OZZY DEBUG LOG - $(date)" >> "$LOGFILE"
         fi
         DAEMON_LOG="$HOME/Library/Logs/OzzyDaemon.log"
         if [ -f "$DAEMON_LOG" ]; then
+            # Just after a rotation the current file is short: the end of the previous one first
+            if [ -f "$DAEMON_LOG.1" ] && [ "$(wc -l < "$DAEMON_LOG")" -lt 2000 ]; then
+                echo "PREVIOUS DAEMON LOG ($DAEMON_LOG.1, last 1000 lines)"
+                tail -n 1000 "$DAEMON_LOG.1"
+            fi
             echo "DAEMON LOG ($DAEMON_LOG, last 2000 lines)"
             tail -n 2000 "$DAEMON_LOG"
         else
