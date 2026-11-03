@@ -217,7 +217,7 @@ bool ozzy_isoc_output_complete(struct ozzy_isoc_output *out, uint8_t pipe, void 
 			else if (isoc_fb_packet(&out->fb, pkt, len))
 				ozzy_log("isoc: more than %u feedback packets were not %u bytes long, PCM out runs at the nominal rate",
 					 out->fb.cfg.max_errors, out->fb.cfg.packet_size);
-			if (out->fb.uframes && len == out->fb.cfg.packet_size)
+			if (out->fb.uframes && isoc_fb_in_range(&out->fb, pkt, len))
 				out->fb_valid_time = packets[p].time ? packets[p].time : ozzy_bus_time(out->bus);
 		}
 		submit_feedback(out, i);

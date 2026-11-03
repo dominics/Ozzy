@@ -254,22 +254,27 @@ static void check_out_queue(uint16_t vid, uint16_t pid, uint32_t transfers)
 	free(e);
 }
 
-/* Feedback as the CMS sends it (48 frames a millisecond), or none once it has halted */
+/* Once halted, feedback packets are 3 bytes of 0 rather than empty */
+static bool halt_as_zero;
+/* Frames a millisecond at the rate the device runs at */
+static uint8_t fb_frames = 48;
+
+/* Feedback as the CMS sends it (@fb_frames a millisecond), or none once it has halted */
 static void fill_feedback(struct fake_xfer *x, void *arg)
 {
 	bool halted = *(bool *)arg;
 	uint32_t k;
 
 	for (k = 0; x->isoc && k < x->count; k++) {
-		x->buf[x->packets[k].offset] = 48;
-		x->packets[k].actual = halted ? 0 : x->packets[k].length;
+		x->buf[x->packets[k].offset] = halted && halt_as_zero ? 0 : fb_frames;
+		x->packets[k].actual = halted && !halt_as_zero ? 0 : x->packets[k].length;
 	}
 }
 
 /*
  * A device whose feedback goes silent (the CMS firmware halted): the bus hears of it once,
  * OZZY_FB_STALL_MS after the last valid feedback, not before, also when packet times run ahead
- * of the completions
+ * of the completions, and also when the packets keep their length but carry a value out of range
  */
 static void check_stall(uint64_t packet_lead)
 {
@@ -292,6 +297,7 @@ static void check_stall(uint64_t packet_lead)
 	ozzy_engine_set_endpoint(e, OZZY_PIPE_FEEDBACK, 0x81, 1, 3, 4);
 	ozzy_engine_attach(e, &fb.bus, &shm);
 	CHECK(ozzy_engine_start(e), "CMS start");
+	fb_frames = (uint8_t)(shm.audio.sample_rate / 1000);
 	for (i = 0; i < 2000 && fake_bus_pop(&fb, &x); i++) {
 		if (x.pipe == 0x81 || x.pipe == 0x02)
 			fb.now += 2000;   /* 4 ms per transfer, two pipes */
@@ -386,6 +392,9 @@ int main(void)
 	check_out_queue(0x09E8, 0x0010, ISOC_OUT_TRANSFERS);        /* EIE Pro */
 	check_stall(0);
 	check_stall(3000);   /* packet times a bus clock puts after the completion */
+	halt_as_zero = true;
+	check_stall(0);
+	halt_as_zero = false;
 	check_feedback_latch(0, false);   /* lost by the bus */
 	check_feedback_latch(1, true);    /* empty from the device */
 	CHECK(model && model->family == OZZY_FAMILY_PLOYTEC_ISOC, "US-144MKII in the device list");

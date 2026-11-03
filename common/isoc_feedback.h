@@ -196,6 +196,21 @@ static inline uint32_t isoc_fb_value(const struct isoc_fb *fb, const uint8_t *pk
 }
 
 /*
+ * isoc_fb_in_range - Whether @pkt (@len bytes received) is a feedback value the
+ * device could mean: the right length and within the accepted range.
+ */
+static inline bool isoc_fb_in_range(const struct isoc_fb *fb, const uint8_t *pkt, uint32_t len)
+{
+	uint32_t v, whole;
+
+	if (len != fb->cfg.packet_size)
+		return false;
+	v = isoc_fb_value(fb, pkt);
+	whole = fb->cfg.format == ISOC_FB_Q16_16 ? v >> 16 : v;
+	return whole >= fb->lo && whole <= fb->hi;
+}
+
+/*
  * isoc_fb_take - Fill the ring entries of one feedback packet's interval: from
  * @pkt (@len bytes received), or at the nominal rate when @lost (the bus lost
  * the packet, @pkt unused). Returns true once, when the wrong-length packets
@@ -206,8 +221,7 @@ static inline bool isoc_fb_take(struct isoc_fb *fb, const uint8_t *pkt, uint32_t
 	uint32_t u = fb->uframes;
 	uint32_t valid = !lost && len == fb->cfg.packet_size;
 	uint32_t v = valid ? isoc_fb_value(fb, pkt) : 0;
-	uint32_t whole = fb->cfg.format == ISOC_FB_Q16_16 ? v >> 16 : v;
-	uint32_t ok = valid & (whole >= fb->lo) & (whole <= fb->hi) & !fb->broken;
+	uint32_t ok = valid && isoc_fb_in_range(fb, pkt, len) && !fb->broken;
 	uint32_t k, n, lap_end;
 	bool was_broken = fb->broken;
 
