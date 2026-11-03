@@ -385,7 +385,8 @@ The generic parts, for any isochronous-out device:
   fails that check.
 - Linux core:
   - With `info->out_isoc`, the core runs the whole isochronous output: 3 × 32-microframe URBs,
-    packets sized from the ring, ALSA's samples copied as they are, and 2 feedback URBs. The Xone
+    packets sized from the ring, ALSA's samples copied as they are, and 8 feedback URBs
+    (ISOC_FB_TRANSFERS; 2 at first, as the official driver). The Xone
     bulk/interrupt handlers are unchanged.
   - Endpoints are `struct ozzy_ep`: a fixed number (the Xones) or "first endpoint of these types
     on interface N" (the EIE, like the kext). They are resolved at probe. Probe fails if a PCM

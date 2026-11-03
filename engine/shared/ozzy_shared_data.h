@@ -104,8 +104,10 @@ typedef std::atomic<bool>     ozzy_atomic_bool;
 #define OZZY_DEVICE_FLAG_SPDIF_MIRROR   (1u << 2)    /* Ploytec bulk, 8 out: lanes 9/10 mirror a pair (ESU1808) */
 #define OZZY_DEVICE_FLAG_PLAIN_INPUT    (1u << 3)    /* input_buffer starts with a ring of plain interleaved frames */
 
-/* Isochronous IN transfers (feedback): 2 in flight, up to 32 packets of up to 256 bytes each */
-#define OZZY_ISOC_IN_BUFFER_SIZE        (2 * 32 * 256)
+/* Isochronous IN transfers (feedback): ISOC_FB_TRANSFERS (8) in flight, up to 32 packets of up to
+ * 64 bytes each. The size is the layout's (it was 2 x 32 x 256): a larger wMaxPacketSize doesn't
+ * fit, and output runs at the nominal rate (ozzy_isoc_output_start) */
+#define OZZY_ISOC_IN_BUFFER_SIZE        (8 * 32 * 64)
 
 #define OZZY_MIDI_RING_SIZE             1024
 #define OZZY_MIDI_RING_MASK             (OZZY_MIDI_RING_SIZE - 1)

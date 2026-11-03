@@ -10,6 +10,10 @@
 
 static const struct isoc_fb_config no_feedback = { ISOC_FB_NONE, 0, 0 };
 
+/* The shared memory's feedback buffer holds the transfers in flight at a 64-byte wMaxPacketSize */
+typedef char ozzy_isoc_in_fits[ISOC_FB_TRANSFERS * OZZY_DMA_ROUND(ISOC_TRANSFER_UFRAMES * 64) <=
+				 OZZY_ISOC_IN_BUFFER_SIZE ? 1 : -1];
+
 /*
  * submit_out - OUT transfer @i: the frames the device consumed in each packet's interval
  * (isoc_fb_layout, shared with Linux), pointed at in the frame ring.
@@ -89,7 +93,8 @@ bool ozzy_isoc_output_start(struct ozzy_isoc_output *out, const struct ozzy_bus 
 	fb_fits = config->fb_addr && config->fb_buf &&
 		  ISOC_FB_TRANSFERS * OZZY_DMA_ROUND(ISOC_TRANSFER_UFRAMES * config->fb_max_packet) <= config->fb_size;
 	if (config->fb_addr && !fb_fits)
-		ozzy_log("isoc: feedback wMaxPacketSize %u too large", config->fb_max_packet);
+		ozzy_log("isoc: feedback wMaxPacketSize %u too large for %u transfers in flight", config->fb_max_packet,
+			 ISOC_FB_TRANSFERS);
 	if (!isoc_fb_init(&out->fb, config->rate, fb_fits ? &config->feedback : &no_feedback,
 			  fb_fits ? config->fb_interval : 0))
 		ozzy_log("isoc: feedback bInterval %u not supported, PCM out runs at the nominal rate",

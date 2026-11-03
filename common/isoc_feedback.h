@@ -68,7 +68,14 @@ extern "C" {
 #define ISOC_OUT_TRANSFERS       3      /* OUT transfers in flight */
 #define ISOC_OUT_TRANSFERS_DEEP  6      /* OUT transfers in flight for OZZY_QUIRK_DEEP_OUT_QUEUE (24 ms) */
 #define ISOC_OUT_TRANSFERS_MAX   6      /* the most OUT transfers any device keeps in flight */
-#define ISOC_FB_TRANSFERS        2      /* feedback transfers in flight */
+/* Feedback transfers in flight: 32 ms, more than the official driver's two
+ * (.claude/re/akai_eie_pro.md), as 0.3.0 kept 40 ms (8 x 5 packets): a completion thread
+ * held up longer than one transfer then still finds feedback queued, where with two the bus
+ * misses packets and the pacing replays the previous lap for them. More queued adds no
+ * latency, each completes at the end of its own interval. 8 is the most the Linux and Windows
+ * buses keep per pipe, and what fits OZZY_ISOC_IN_BUFFER_SIZE at the CMS's 64-byte
+ * wMaxPacketSize */
+#define ISOC_FB_TRANSFERS        8
 
 enum isoc_fb_format {
 	ISOC_FB_NONE,      /* no feedback endpoint: nominal rate */
