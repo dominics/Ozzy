@@ -30,11 +30,9 @@ var client = MIDIClientRef()
 MIDIClientCreate("midiport" as CFString, nil, nil, &client)
 var inPort = MIDIPortRef()
 MIDIInputPortCreateWithBlock(client, "in" as CFString, &inPort) { list, _ in
-    var p = list.pointee.packet
-    for _ in 0..<list.pointee.numPackets {
-        let bytes = withUnsafeBytes(of: p.data) { Array($0.prefix(Int(p.length))) }
+    for pkt in list.unsafeSequence() {
+        let bytes = Array(UnsafeRawBufferPointer(start: UnsafeRawPointer(pkt) + MemoryLayout<MIDITimeStamp>.size + MemoryLayout<UInt16>.size, count: Int(pkt.pointee.length)))
         lock.lock(); received += bytes; lock.unlock()
-        p = MIDIPacketNext(&p).pointee
     }
 }
 MIDIPortConnectSource(inPort, src, nil)
@@ -50,11 +48,11 @@ if args[1] == "listen" {
 
 var sent = [UInt8]()
 func send(_ b: [UInt8]) {
-    var buf = [UInt8](repeating: 0, count: 1024)
+    var buf = [UInt8](repeating: 0, count: 65536)
     buf.withUnsafeMutableBytes { raw in
         let pl = raw.baseAddress!.assumingMemoryBound(to: MIDIPacketList.self)
         var pkt = MIDIPacketListInit(pl)
-        pkt = MIDIPacketListAdd(pl, 1024, pkt, 0, b.count, b)
+        pkt = MIDIPacketListAdd(pl, 65536, pkt, 0, b.count, b)
         MIDISend(outPort, dst, pl)
     }
     sent += b
@@ -62,7 +60,7 @@ func send(_ b: [UInt8]) {
 Thread.sleep(forTimeInterval: 0.5)
 if args[1] == "sysex" {
     // Non-commercial SysEx only (0x7D), safe on SystemCtrl, which drives the FX processors.
-    for len in [1, 2, 3, 4, 5, 7, 8, 13, 24, 100, 250] {
+    for len in [1, 2, 3, 4, 5, 7, 8, 13, 24, 100, 250, 1024, 4096] {
         send([0xF0, 0x7D] + (0..<len).map { UInt8(($0 + len) & 0x7F) } + [0xF7])
         Thread.sleep(forTimeInterval: 0.02)
     }
@@ -75,7 +73,7 @@ send([0xF0, 0x7E, 0x7F, 0x06, 0x01, 0xF7])                          // identity 
 send([0xF0, 0x7D] + (0..<100).map { UInt8($0 & 0x7F) } + [0xF7])   // 103-byte SysEx
 for _ in 0..<64 { send([0x90, 60, 64]); send([0x80, 60, 0]) }       // burst, no gaps
 }
-Thread.sleep(forTimeInterval: 3.0)
+Thread.sleep(forTimeInterval: 6.0)
 lock.lock(); let r = received; lock.unlock()
 print("sent \(sent.count) bytes, received \(r.count) bytes, identical: \(r == sent)")
 if r != sent {
