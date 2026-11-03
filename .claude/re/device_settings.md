@@ -257,12 +257,12 @@ of a 10-frame sub-packet) and `_IN_FRAMES` (8-200, steps of 8), device-kind (a r
 isochronous); the families add them through `setting_quirks` (`OZZY_QUIRK_PCM_OUT_FRAMES` /
 `_IN_FRAMES`, not in the .def). With them, the transfers in flight per direction,
 `OZZY_SETTING_PCM_OUT_QUEUE` / `_IN_QUEUE` (1-4; `OZZY_QUIRK_PCM_OUT_QUEUE` / `_IN_QUEUE`): the
-Xones have both (default 4), the isochronous family the in queue with its own default of 2 (a
-family's default: `ozzy_engine_ops.setting_default`, taken at attach). Out, every transfer
+Xones have both (default 4), the isochronous family the in queue, also 4 by default (2 until
+0.4.2, through its own default: `ozzy_engine_ops.setting_default`, taken at attach). Out, every transfer
 queued is latency (the safety offset is queue x frames); in, a frame is there once its own
 transfer completes, so the queue is margin, not latency. The HAL's input safety offset still is
 queue x frames, as it ran before the settings on the Xones (the isochronous family's was its
-output's, 135-147 frames, now queue x frames, 160 at its defaults, so it never shrinks below
+output's, 135-147 frames, now queue x frames, 320 at its defaults (160 until 0.4.2), so it never shrinks below
 that when the transfers shrink): conservative, to be lowered once hardware shows the completion
 jitter. Both reported offsets have a floor of 1 ms (`OZZY_SAFETY_MIN_US`,
 `ozzy_engine_safety_offset`): room for the HAL's clock interpolation between anchors and the

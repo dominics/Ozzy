@@ -217,7 +217,7 @@ static void demo_init(void)
 		d->out_channels = m->out_channels;
 		demo_info(d, m);
 		/* The transfer settings come with the engine family, as its setting_quirks add them; the
-		 * isochronous family's in queue starts at 2 (its setting_default) */
+		 * isochronous family's in queue starts at the setting's own default, 4, as the Xones' */
 		for (id = 0; id < OZZY_NUM_SETTINGS; id++)
 			if (ozzy_setting_values(m->quirks | (m->family == OZZY_FAMILY_PLOYTEC_ISOC ?
 						OZZY_QUIRK_PCM_IN_FRAMES | OZZY_QUIRK_PCM_IN_QUEUE :
@@ -226,8 +226,6 @@ static void demo_init(void)
 						OZZY_QUIRK_CLOCK_ANCHORS,   /* as on macOS */
 						m->in_channels, m->out_channels, id))
 				d->available |= 1u << id;
-		if (m->family == OZZY_FAMILY_PLOYTEC_ISOC)
-			d->settings.value[OZZY_SETTING_PCM_IN_QUEUE] = 1;
 		demo_transfers(d);
 		d->has_clock = (d->available & (1u << OZZY_SETTING_CLOCK_SOURCE)) != 0;
 		if (d->has_clock)

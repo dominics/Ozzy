@@ -447,13 +447,13 @@ int main(void)
 	ozzy_engine_set_pcm_ring(e, OZZY_PCM_OUT, &ro);
 	ozzy_engine_set_pcm_ring(e, OZZY_PCM_IN, &ri);
 	CHECK(ozzy_engine_start(e), "start");
-	/* The family's own defaults: 80-frame in transfers, 2 in flight, input safety what they queue */
+	/* The family's own defaults: 80-frame in transfers, 4 in flight, input safety what they queue */
 	CHECK(ozzy_engine_has_setting(e, OZZY_SETTING_PCM_IN_QUEUE) && !ozzy_engine_has_setting(e, OZZY_SETTING_PCM_OUT_QUEUE) &&
 	      !ozzy_engine_has_setting(e, OZZY_SETTING_PCM_OUT_FRAMES), "isoc: the wrong transfer settings");
-	CHECK(ozzy_pcm_queue(e->settings.value[OZZY_SETTING_PCM_IN_QUEUE]) == 2 &&
-	      shm.info.pipes[OZZY_PIPE_PCM_IN].in_flight == 2, "isoc: in queue %u by default, %u in flight",
+	CHECK(ozzy_pcm_queue(e->settings.value[OZZY_SETTING_PCM_IN_QUEUE]) == 4 &&
+	      shm.info.pipes[OZZY_PIPE_PCM_IN].in_flight == 4, "isoc: in queue %u by default, %u in flight",
 	      ozzy_pcm_queue(e->settings.value[OZZY_SETTING_PCM_IN_QUEUE]), shm.info.pipes[OZZY_PIPE_PCM_IN].in_flight);
-	CHECK(shm.audio.input_safety_offset_frames == 2 * 80, "isoc: input safety %u", shm.audio.input_safety_offset_frames);
+	CHECK(shm.audio.input_safety_offset_frames == 4 * 80, "isoc: input safety %u", shm.audio.input_safety_offset_frames);
 
 	for (i = 0; i < 300 && fake_bus_pop(&fb, &x); i++) {
 		if (x.isoc && !(x.pipe & 0x80))

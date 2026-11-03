@@ -187,7 +187,7 @@ enum ozzy_esi_level {
  * transfer queued is latency (a frame waits behind them all); in, the frames are there once
  * their one transfer completes, and the others queued are margin, buffers the device can fill
  * while the host is late. The default, 4, is what ran before the setting (the isochronous
- * family's in queue: 2, its engine's setting_default).
+ * family's in queue was 2, its engine's setting_default; it is 4 too now).
  */
 #define OZZY_NUM_PCM_QUEUES 4
 

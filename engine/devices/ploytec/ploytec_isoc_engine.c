@@ -10,7 +10,8 @@
 #include "../../../common/devices/ploytec/ploytec_handshake.h"
 #include "../../shared/ozzy_log.h"
 
-#define IN_QUEUE_DEFAULT   1   /* OZZY_SETTING_PCM_IN_QUEUE: 2 transfers in flight, as before the setting */
+#define IN_QUEUE_DEFAULT   3   /* OZZY_SETTING_PCM_IN_QUEUE: 4 transfers in flight, the most the setting offers
+				 * (2 before 0.4.2; 0.3.0 kept 8 of 144 frames, about 24 ms) */
 
 /* Feedback format (ploytec_defs.h) */
 static const struct isoc_fb_config feedback = PLOYTEC_ISOC_FEEDBACK;
@@ -116,7 +117,8 @@ static bool isoc_start(struct ozzy_engine *e)
 	shm->audio.safety_offset_frames = ozzy_isoc_output_safety_offset(pe->sample_rate,
 									  ozzy_engine_isoc_out_transfers(e));
 	/* Input: the transfers queued (it shrinks with them; before the setting it was the output's
-	 * offset, 135-147 frames, now 160 at the defaults), at least the jitter floor */
+	 * offset, 135-147 frames, then 160 at 2 in flight, now 320 at the defaults), at least the
+	 * jitter floor, as the bulk family keeps it (ploytec_engine.c) */
 	shm->audio.input_safety_offset_frames = ozzy_engine_safety_offset(pe->in_queue * pe->in_frames, pe->sample_rate);
 	ozzy_engine_publish_settings(e, &hs.clock);
 	ploytec_report(e, &hs);
@@ -296,7 +298,7 @@ static uint32_t isoc_setting_quirks(const struct ozzy_engine *e)
 	       (e->anchors ? OZZY_QUIRK_CLOCK_ANCHORS : 0);
 }
 
-/* The in queue starts at 2 here (the setting's own default is the Xones' 4) */
+/* The in queue starts at 4 here, the setting's own default (the Xones' 4) too */
 static int isoc_setting_default(const struct ozzy_engine *e, unsigned int id)
 {
 	(void)e;
