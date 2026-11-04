@@ -96,10 +96,26 @@ public:
     void RestartMonoTimelines() {
         for (unsigned int i = 0; i < OZZY_MAX_MONO_INPUTS; i++) ozzy_timeline_restart(&mMonoTimeline[i]);
     }
+    /* Monitor thread: a driver came back within the main device's grace, a new clock under the
+     * mono devices' running timelines (ozzy_timeline_rebase) */
+    void RebaseMonoTimelines() {
+        for (unsigned int i = 0; i < OZZY_MAX_MONO_INPUTS; i++) ozzy_timeline_rebase(&mMonoTimeline[i]);
+    }
+    /* Monitor thread: the main device was withdrawn (its grace ran out), and its mono devices with
+     * it: their IO and any change pending end, and their timelines start over */
+    void Withdraw() {
+        for (unsigned int i = 0; i < OZZY_MAX_MONO_INPUTS; i++) {
+            mMonoIO[i].store(0);
+            mMonoChanging[i].store(false);
+        }
+        RestartMonoTimelines();
+    }
     /* Its IO thread's decode buffer (each device has an IO thread of its own) */
     float mMonoScratch[OZZY_MAX_MONO_INPUTS][kOzzyMonoChunkFrames * kOzzyMonoMaxChannels];
 
-    /* The device came up as @uid: what storage has for it (defaults where it has nothing) */
+    /* The device came up as @uid: what storage has for it (defaults where it has nothing), and
+     * its mono devices' IO from nothing. A driver back within the grace doesn't come through here,
+     * so a MON or AUX recording spanning it keeps its count and timeline. */
     void Restore(AudioServerPlugInHostRef host, CFStringRef uid) {
         if (mUID) CFRelease(mUID);
         mUID = uid ? (CFStringRef)CFRetain(uid) : nullptr;

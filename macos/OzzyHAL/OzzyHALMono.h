@@ -15,6 +15,9 @@
  * CoreAudio for one on each mono device; when that comes (IO stopped), its timeline starts over
  * on the new layout.
  *
+ * They follow the main device's publication: kept, silent and on a running clock, while it is
+ * in its grace (a driver restart or replug, OzzyHAL.h kOzzyGraceNs), withdrawn with it after.
+ *
  * Templates over the device class, so the dispatch can use OzzyHALDevice's own getters; included
  * by OzzyHAL.mm only. C++ (OzzyHAL).
  */
@@ -324,9 +327,7 @@ static OSStatus OzzyMonoGetZeroTimeStamp(Device* dev, uint32_t kind, Float64* sa
     int i = OzzyMonoIndex(kind);
     if (!dev->Extras().Mono(i)) return kAudioHardwareBadObjectError;
     uint64_t s = 0, h = 0, n = 0;
-    bool got = false;
-    if (!dev->ReadClock(&got, &s, &h) || !ozzy_timeline_anchor(&dev->Extras().mMonoTimeline[i], got, &s, &h, &n))
-        return kAudioHardwareNotRunningError;
+    if (!dev->ServeAnchor(&dev->Extras().mMonoTimeline[i], &s, &h, &n)) return kAudioHardwareNotRunningError;
     if (sampleTime) *sampleTime = (Float64)s;
     if (hostTime) *hostTime = h;
     if (seed) *seed = n;

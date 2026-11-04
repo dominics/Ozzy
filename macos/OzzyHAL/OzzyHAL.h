@@ -28,6 +28,10 @@
 // Source setting), then the fork's (OzzyHALExtras.h, from +4).
 // A slot keeps its IDs and UID when its device is replugged.
 #define kOzzyMaxDevices         8
+// How long a published device that lost its driver (a daemon restart, an unplug) stays published,
+// silent and on a clock at the nominal rate, for its driver to come back as the same device (UID):
+// CoreAudio's clients keep the device object then, where a withdrawal would leave them stalled
+#define kOzzyGraceNs            3000000000ULL
 #define kOzzyObjectIDBase       100
 #define kOzzyObjectsPerDevice   16
 static_assert(kOzzyObjectKinds <= kOzzyObjectsPerDevice, "a device's objects (OzzyHALObjects.h) fit its slot");
@@ -50,6 +54,8 @@ public:
     void Unmap();
     bool CheckHealth();
     bool UpdateConnectionState(AudioServerPlugInHostRef host);   // true if it changed
+    // Lost its driver while published, and still within kOzzyGraceNs (monitor thread)
+    bool InGrace() const { return mGraceUntilNs != 0; }
 
     // CoreAudio state
     bool IsConnected() const { return mConnected; }
@@ -65,8 +71,10 @@ public:
     // OZZY_PROPERTY_CLIENTS's data: a new CFArray of the clients doing IO
     CFArrayRef CopyClientsArray() const;
     HRESULT GetZeroTimeStamp(Float64* outSampleTime, UInt64* outHostTime, UInt64* outSeed);
-    // The engine's clock (struct ozzy_timestamp): false while unmapped; *got: the read succeeded
-    bool ReadClock(bool* got, uint64_t* sampleTime, uint64_t* hostTime);
+    // IO thread of the device or a mono device: the anchor @t (OzzyTimeline.h) hands out, from the
+    // engine's clock (struct ozzy_timestamp) while the driver serves the device, else its last one
+    // moved on at the nominal rate. False if @t has no anchor.
+    bool ServeAnchor(struct ozzy_timeline* t, uint64_t* sampleTime, uint64_t* hostTime, uint64_t* seed);
     OSStatus ioOperation(UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo, void* ioMainBuffer);
 
     Float64 GetNominalSampleRate() const;
@@ -154,6 +162,7 @@ private:
     uint32_t mOutRingFrames = 1;   // frames in the shared memory's output ring (the engine's layout)
     uint32_t mInRingFrames = 1;
     uint32_t mTimestampFrames = OZZY_TIMESTAMP_FRAMES;   // between the engine's clock anchors
+    uint64_t mPeriodHost = 0;      // host ticks between them at the nominal rate (ApplyDeviceConfig)
     uint32_t mSafetyOffset = 160; // frames the engine reads output ahead of the clock
     uint32_t mInputSafetyOffset = 160;   // frames behind the clock input is complete
     uint32_t mInputChannels = 8;    // published by the kext per model (16 for the WZ4)
@@ -185,6 +194,15 @@ private:
 
     bool mConnected = false;     // published to CoreAudio
     bool mIOStarted = false;
+    // The grace after losing the driver while published (monitor thread): its end in
+    // CLOCK_UPTIME_RAW ns, 0 when not in one; and whether a driver has been mapped in it since
+    uint64_t mGraceUntilNs = 0;
+    bool mRemapped = false;
+    // The IO thread has served a real anchor from the current mapping: its IO may use the rings
+    std::atomic<bool> mSynced { false };
+    // A driver that came back within the grace runs another layout or settings, and the
+    // configuration change that applies the HAL's is under way: IO silent, clock moved on
+    std::atomic<bool> mRestorePending { false };
 
     struct Client {
         UInt32 id;
@@ -217,6 +235,12 @@ private:
 
     ozzy_shared_memory* AcquireSHM();
     void ReleaseSHM();
+    // AcquireSHM for the IO path: null unless the driver serves the device (mSynced, no restore
+    // pending); ReleaseSHM after it either way
+    ozzy_shared_memory* AcquireRings();
+    bool Detach();   // Unmap without ending the timelines (the grace); false if not mapped
+    void Resume(AudioServerPlugInHostRef host);
+    bool DeviceSettingsDiffer(const ozzy_shared_memory* shm) const;
     void ApplyDeviceConfig();
     // ApplyDeviceConfig, keeping the layout it applies (mLayout); with the mapping held
     void ApplyLayout(const ozzy_shared_memory* shm);
