@@ -185,6 +185,15 @@ static void check_stall(struct ozzy_isoc_output *out)
 	ozzy_bus_pcm_stalled(out->bus);
 }
 
+void ozzy_isoc_output_lost(struct ozzy_isoc_output *out)
+{
+	if (!out->running || out->fb_stalled)
+		return;
+	out->fb_stalled = true;
+	ozzy_log("isoc: a transfer couldn't be submitted again: stopping the streams");
+	ozzy_bus_pcm_stalled(out->bus);
+}
+
 bool ozzy_isoc_output_complete(struct ozzy_isoc_output *out, uint8_t pipe, void *xfer, int status,
 			       struct ozzy_isoc_packet *packets, uint32_t count)
 {
@@ -198,7 +207,8 @@ bool ozzy_isoc_output_complete(struct ozzy_isoc_output *out, uint8_t pipe, void 
 		check_stall(out);
 		if (!out->config.xfer[0])
 			clear_sent(out, &out->out[i]);
-		submit_out(out, i);
+		if (!submit_out(out, i))
+			ozzy_isoc_output_lost(out);
 		return true;
 	}
 	if (pipe == out->config.fb_addr && out->config.fb_addr) {
@@ -212,13 +222,16 @@ bool ozzy_isoc_output_complete(struct ozzy_isoc_output *out, uint8_t pipe, void 
 				out->fb_logged = true;
 				ozzy_log("isoc: first feedback packet: %u bytes %02x %02x %02x", len, pkt[0], pkt[1], pkt[2]);
 			}
-			if (isoc_fb_packet(&out->fb, pkt, len))
+			if (packets[p].status != 0)
+				isoc_fb_lost(&out->fb);   /* the bus's error, not the device's wrong length */
+			else if (isoc_fb_packet(&out->fb, pkt, len))
 				ozzy_log("isoc: more than %u feedback packets were not %u bytes long, PCM out runs at the nominal rate",
 					 out->fb.cfg.max_errors, out->fb.cfg.packet_size);
-			if (out->fb.uframes && len == out->fb.cfg.packet_size)
+			if (out->fb.uframes && isoc_fb_in_range(&out->fb, pkt, len))
 				out->fb_valid_time = packets[p].time ? packets[p].time : ozzy_bus_time(out->bus);
 		}
-		submit_feedback(out, i);
+		if (!submit_feedback(out, i))
+			ozzy_isoc_output_lost(out);
 		return true;
 	}
 	return false;

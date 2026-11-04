@@ -219,8 +219,9 @@ void ozzy_pcm_progress(struct ozzy_chip *chip, enum ozzy_pcm_dir dir, uint64_t f
 
 /*
  * ozzy_pcm_stalled - Completion path: the device stopped streaming (its feedback went silent,
- * ozzy_bus_ops.pcm_stalled). The running streams stop with an xrun instead of playing into
- * nothing; their next prepare restarts the engine, whose handshake brings the device back.
+ * or a PCM transfer couldn't be submitted again; ozzy_bus_ops.pcm_stalled). The running streams
+ * stop with an xrun instead of playing into nothing or on a short queue; their next prepare
+ * restarts the engine, whose handshake brings the device back.
  */
 void ozzy_pcm_stalled(struct ozzy_chip *chip)
 {

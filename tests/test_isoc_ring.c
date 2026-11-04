@@ -12,6 +12,7 @@
 #include "common/devices/ploytec/ploytec_protocol.h"
 #include "common/devices/ploytec/ploytec_codec.h"
 #include "engine/core/ozzy_isoc_output.h"
+#include "engine/devices/ploytec/ploytec_isoc_engine.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -253,22 +254,27 @@ static void check_out_queue(uint16_t vid, uint16_t pid, uint32_t transfers)
 	free(e);
 }
 
-/* Feedback as the CMS sends it (48 frames a millisecond), or none once it has halted */
+/* Once halted, feedback packets are 3 bytes of 0 rather than empty */
+static bool halt_as_zero;
+/* Frames a millisecond at the rate the device runs at */
+static uint8_t fb_frames = 48;
+
+/* Feedback as the CMS sends it (@fb_frames a millisecond), or none once it has halted */
 static void fill_feedback(struct fake_xfer *x, void *arg)
 {
 	bool halted = *(bool *)arg;
 	uint32_t k;
 
 	for (k = 0; x->isoc && k < x->count; k++) {
-		x->buf[x->packets[k].offset] = 48;
-		x->packets[k].actual = halted ? 0 : x->packets[k].length;
+		x->buf[x->packets[k].offset] = halted && halt_as_zero ? 0 : fb_frames;
+		x->packets[k].actual = halted && !halt_as_zero ? 0 : x->packets[k].length;
 	}
 }
 
 /*
  * A device whose feedback goes silent (the CMS firmware halted): the bus hears of it once,
  * OZZY_FB_STALL_MS after the last valid feedback, not before, also when packet times run ahead
- * of the completions
+ * of the completions, and also when the packets keep their length but carry a value out of range
  */
 static void check_stall(uint64_t packet_lead)
 {
@@ -291,6 +297,7 @@ static void check_stall(uint64_t packet_lead)
 	ozzy_engine_set_endpoint(e, OZZY_PIPE_FEEDBACK, 0x81, 1, 3, 4);
 	ozzy_engine_attach(e, &fb.bus, &shm);
 	CHECK(ozzy_engine_start(e), "CMS start");
+	fb_frames = (uint8_t)(shm.audio.sample_rate / 1000);
 	for (i = 0; i < 2000 && fake_bus_pop(&fb, &x); i++) {
 		if (x.pipe == 0x81 || x.pipe == 0x02)
 			fb.now += 2000;   /* 4 ms per transfer, two pipes */
@@ -309,6 +316,92 @@ static void check_stall(uint64_t packet_lead)
 	CHECK(fb.pcm_stalled == 1 && !early, "stall reported %u times, %u too early", fb.pcm_stalled, early);
 	CHECK(stall_at && stall_at <= last_valid + OZZY_FB_STALL_MS * 1000 + 8000, "stall reported %llu us after the last feedback",
 	      (unsigned long long)(stall_at - last_valid));
+	free(e);
+}
+
+/* Feedback packets from @from to @to (counted across the run) arrive as @how: 0 lost by the bus
+ * (an error status, nothing received), 1 empty (the firmware's own empty packet), the rest
+ * valid. A lost or empty packet carries no bytes. */
+struct fb_window {
+	unsigned int seen, from, to;
+	int how;
+};
+
+static void fill_feedback_window(struct fake_xfer *x, void *arg)
+{
+	struct fb_window *w = arg;
+	uint32_t k;
+
+	for (k = 0; x->isoc && k < x->count; k++, w->seen++) {
+		bool in = w->seen >= w->from && w->seen < w->to;
+
+		x->buf[x->packets[k].offset] = 48;
+		x->packets[k].status = in && w->how == 0 ? -71 : 0;   /* -EPROTO, as Linux reports it */
+		x->packets[k].actual = in ? 0 : x->packets[k].length;
+	}
+}
+
+/*
+ * More than PLOYTEC_ISOC_FB_MAX_ERRORS feedback packets without a clean lap, through the
+ * submit and complete path: packets the bus lost (an error status) leave the feedback in use,
+ * as the official driver and 0.3.0 skipped them; empty packets the device sent switch it off
+ */
+static void check_feedback_latch(int how, bool want_broken)
+{
+	const struct ozzy_device *model = ozzy_device_lookup(0x0562, 0x03EB);
+	static struct ozzy_shared_memory shm;
+	struct fb_window w = { 0, 40, 40 + 3 * PLOYTEC_ISOC_FB_MAX_ERRORS, how };
+	struct fake_bus fb;
+	struct fake_xfer x;
+	struct ozzy_engine *e;
+	unsigned int i;
+
+	memset(&shm, 0, sizeof(shm));
+	fake_bus_init(&fb, &shm, true, NULL);
+	e = ozzy_engine_init(malloc(ozzy_engine_size(model)), model);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_OUT, 0x02, 1, 156, 1);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_IN, 0x86, 2, 512, 1);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_FEEDBACK, 0x81, 1, 3, 4);
+	ozzy_engine_attach(e, &fb.bus, &shm);
+	CHECK(ozzy_engine_start(e), "CMS start");
+	for (i = 0; i < 2000 && w.seen < w.to + 64 && fake_bus_pop(&fb, &x); i++)
+		fake_bus_complete(&fb, e, &x, x.pipe == 0x81 ? fill_feedback_window : NULL, &w);
+	CHECK(w.seen >= w.to + 64, "only %u feedback packets", w.seen);
+	CHECK(((struct ploytec_isoc_engine *)e)->output.fb.broken == want_broken,
+	      "%u %s feedback packets: feedback %s", w.to - w.from, how == 0 ? "lost" : "empty",
+	      want_broken ? "still in use" : "switched off");
+	free(e);
+}
+
+/*
+ * A PCM transfer that can't be submitted again from its completion (OUT, feedback or PCM in):
+ * the bus hears of it once, so the streams stop rather than run on a short queue
+ */
+static void check_lost_resubmit(uint8_t pipe)
+{
+	const struct ozzy_device *model = ozzy_device_lookup(0x0562, 0x03EB);
+	static struct ozzy_shared_memory shm;
+	struct fake_bus fb;
+	struct fake_xfer x;
+	struct ozzy_engine *e;
+	unsigned int i, done = 0;
+
+	memset(&shm, 0, sizeof(shm));
+	fake_bus_init(&fb, &shm, true, NULL);
+	e = ozzy_engine_init(malloc(ozzy_engine_size(model)), model);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_OUT, 0x02, 1, 156, 1);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_PCM_IN, 0x86, 2, 512, 1);
+	ozzy_engine_set_endpoint(e, OZZY_PIPE_FEEDBACK, 0x81, 1, 3, 4);
+	ozzy_engine_attach(e, &fb.bus, &shm);
+	CHECK(ozzy_engine_start(e), "CMS start");
+	for (i = 0; i < 400 && fake_bus_pop(&fb, &x); i++) {
+		if (i == 40)
+			fb.refuse_pipe = pipe;   /* from here on its resubmissions fail */
+		done += i >= 40 && x.pipe == pipe;
+		fake_bus_complete(&fb, e, &x, fill, NULL);
+	}
+	CHECK(done && fb.pcm_stalled == 1, "pipe 0x%02x: %u resubmissions failed, the bus told %u times", pipe, done,
+	      fb.pcm_stalled);
 	free(e);
 }
 
@@ -331,6 +424,14 @@ int main(void)
 	check_out_queue(0x09E8, 0x0010, ISOC_OUT_TRANSFERS);        /* EIE Pro */
 	check_stall(0);
 	check_stall(3000);   /* packet times a bus clock puts after the completion */
+	halt_as_zero = true;
+	check_stall(0);
+	halt_as_zero = false;
+	check_feedback_latch(0, false);   /* lost by the bus */
+	check_feedback_latch(1, true);    /* empty from the device */
+	check_lost_resubmit(0x02);
+	check_lost_resubmit(0x81);
+	check_lost_resubmit(0x86);
 	CHECK(model && model->family == OZZY_FAMILY_PLOYTEC_ISOC, "US-144MKII in the device list");
 	for (i = 0; i < sizeof(out_ring); i++)
 		out_ring[i] = (uint8_t)(i * 7 + 3);
