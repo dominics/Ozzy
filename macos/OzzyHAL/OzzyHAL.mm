@@ -5,6 +5,8 @@
 #include "../Shared/OzzyKextClient.h"
 #include "../../common/ozzy_version.h"
 #include <CoreAudio/CoreAudio.h>
+#include <mach/mach_time.h>
+#include <time.h>
 
 static CFStringRef SafeCreateString(const char* str) {
     if (!str || str[0] == 0) return nullptr;
@@ -103,6 +105,12 @@ void OzzyHALDevice::ReleaseSHM() {
     mSHMUsers.fetch_sub(1, std::memory_order_release);
 }
 
+ozzy_shared_memory* OzzyHALDevice::AcquireRings() {
+    ozzy_shared_memory* shm = AcquireSHM();
+    if (!mSynced.load(std::memory_order_relaxed) || mRestorePending.load(std::memory_order_relaxed)) return nullptr;
+    return shm;
+}
+
 void OzzyHALDevice::ClearOutputBuffer() {
     ozzy_shared_memory* shm = AcquireSHM();
     if (shm && mClearOutput) mClearOutput(shm->audio.output_buffer, mOutRingFrames);
@@ -160,29 +168,50 @@ bool OzzyHALDevice::Map(const OzzyBackend& backend, uint64_t registryID, uint32_
     mRegistryID = registryID;
     mLocationID = locationID;
     mSessionID = shm->session_id;
+    mSynced.store(false);
+    if (mGraceUntilNs) {
+        // Back within the grace: a new clock under the running timelines, and the grace runs on
+        // from here for the driver's handshake (UpdateConnectionState resumes once it is ready)
+        mRemapped = true;
+        mGraceUntilNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + kOzzyGraceNs;
+        ozzy_timeline_rebase(&mTimeline);
+        mExtras.RebaseMonoTimelines();
+    }
     mSHM.store(shm, std::memory_order_release);
-    LogOzzyHAL("device %{public}u: attached to %{public}s (session: 0x%{public}08X)", mSlot,
-               backend.kind == OzzyBackendKind::Daemon ? "daemon" : "kext", mSessionID);
+    LogOzzyHAL("device %{public}u: attached to %{public}s (session: 0x%{public}08X)%{public}s", mSlot,
+               backend.kind == OzzyBackendKind::Daemon ? "daemon" : "kext", mSessionID,
+               mRemapped ? ", within the grace" : "");
     return true;
 }
 
 /* Monitor thread. Waits for CoreAudio threads still using the mapping (at most one I/O
- * cycle) before unmapping, so they never touch unmapped memory. */
-void OzzyHALDevice::Unmap() {
-    if (!mSHM.exchange(nullptr, std::memory_order_seq_cst)) return;
+ * cycle) before unmapping, so they never touch unmapped memory. Leaves the timelines and a
+ * configuration change CoreAudio still owes a call for alone (the grace needs both). */
+bool OzzyHALDevice::Detach() {
+    if (!mSHM.exchange(nullptr, std::memory_order_seq_cst)) return false;
     while (mSHMUsers.load(std::memory_order_seq_cst)) usleep(100);
     mBackend.Close();
     mRegistryID = 0;
+    mSynced.store(false);
+    // The next mapping's layout is checked afresh
+    mLayoutDiffers = false;
+    return true;
+}
+
+/* Monitor thread: Detach, and the device's timelines end with the driver */
+void OzzyHALDevice::Unmap() {
+    if (!Detach()) return;
     // The anchors were the driver's: none survives it
     ozzy_timeline_restart(&mTimeline);
     mExtras.RestartMonoTimelines();
     // Nor a layout check's request: the next mapping is checked afresh
     mRelayoutRequested.store(false);
-    mLayoutDiffers = false;
 }
 
 /* Unmap if the driver went away or restarted (a daemon also when its heartbeat stopped).
- * Returns true while still mapped. */
+ * Returns true while still mapped. A published device stays published for the grace
+ * (kOzzyGraceNs): its IO goes on silent and its clock at the nominal rate, for the driver to
+ * come back as the same device (UpdateConnectionState). */
 bool OzzyHALDevice::CheckHealth() {
     ozzy_shared_memory* shm = mSHM.load(std::memory_order_relaxed);
     if (!shm) return false;
@@ -192,7 +221,15 @@ bool OzzyHALDevice::CheckHealth() {
     if (magicValid && hwPresent && alive) return true;
     LogOzzyHAL("device %{public}u: disconnected (magic: %{public}d, hw: %{public}d, alive: %{public}d)", mSlot,
                magicValid, hwPresent, alive);
-    Unmap();
+    if (!mConnected) {
+        Unmap();
+        return false;
+    }
+    Detach();
+    mGraceUntilNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + kOzzyGraceNs;
+    mRemapped = false;
+    LogOzzyHAL("device %{public}u: lost its driver; kept published for %{public}llu ms (silent IO) for it to come back",
+               mSlot, kOzzyGraceNs / 1000000);
     return false;
 }
 
@@ -248,17 +285,48 @@ void OzzyHALDevice::ApplyDeviceConfig() {
           PLOYTEC_FRAMES_PER_OUT_SUBPKT;
     uint32_t inMax = OZZY_PCM_RING_BYTES / (plainIn ? mInputChannels * 3 : PLOYTEC_IN_FRAME_SIZE);
     bool fits = FitFrames(&mOutRingFrames, outMax) & FitFrames(&mInRingFrames, inMax);
-    if (!(FitFrames(&mTimestampFrames, mOutRingFrames) & fits))
+    // The anchors no closer together than the smallest IO buffer setting puts them (CoreAudio
+    // caps its IO buffer at 3/8 of their spacing), and both rings hold a whole spacing
+    if (mTimestampFrames < ozzy_anchor_frames(0, 1)) {
+        LogOzzyHALError("device %{public}u: the driver's anchors are %{public}u frames apart, raised to %{public}u",
+                        mSlot, mTimestampFrames, ozzy_anchor_frames(0, 1));
+        mTimestampFrames = ozzy_anchor_frames(0, 1);
+    }
+    if (!(FitFrames(&mTimestampFrames, mOutRingFrames < mInRingFrames ? mOutRingFrames : mInRingFrames) & fits))
         LogOzzyHALError("device %{public}u: the driver's ring layout doesn't fit its buffers, cut to %{public}u out / %{public}u in frames, anchors every %{public}u",
                         mSlot, mOutRingFrames, mInRingFrames, mTimestampFrames);
+    // Each side reads ahead of (output) or behind (input) the clock by less than its ring
+    bool outSafe = FitFrames(&mSafetyOffset, mOutRingFrames - 1);
+    bool inSafe = FitFrames(&mInputSafetyOffset, mInRingFrames - 1);
+    if (!(outSafe & inSafe))
+        LogOzzyHALError("device %{public}u: the driver's safety offsets don't fit its rings, cut to %{public}u out / %{public}u in frames",
+                        mSlot, mSafetyOffset, mInputSafetyOffset);
     RebuildStreamConfigs();
     LogOzzyHAL("device %{public}u: Ploytec codec (%{public}s output, %{public}s input, %{public}u in / %{public}u out) for VID:0x%{public}04X",
                mSlot, plain ? "plain" : isBulk ? "bulk" : "interrupt", plainIn ? "plain" : "Ploytec", mInputChannels,
                mOutputChannels, shm->vendor_id);
 
+    // The device's model: its rates, here and for the rates CoreAudio may pick below
+    const struct ozzy_device* model = ozzy_device_lookup(shm->vendor_id, shm->product_id);
+    mModel = model;
+
     uint32_t rate = shm->audio.sample_rate.load();
+    // None, or a rate the model doesn't run at: its highest, the one a start asks for without a
+    // request (the engines refuse to run at a rate the model doesn't list)
+    uint32_t modelRates[OZZY_MAX_RATES];
+    unsigned int modelRateCount = model ? ozzy_device_rates(model, modelRates) : 0;
+    if (modelRateCount && !ozzy_device_has_rate(model, rate)) {
+        if (rate)
+            LogOzzyHALError("device %{public}u: the driver published %{public}u Hz, which the %{public}s doesn't run at; using %{public}u Hz",
+                            mSlot, rate, model->name, modelRates[modelRateCount - 1]);
+        rate = modelRates[modelRateCount - 1];
+    }
     if (rate == 0) rate = 96000;
     mCurrentStreamFormat.mSampleRate = rate;
+    // The anchors' spacing in host ticks, for a clock with no driver behind it (ServeAnchor)
+    static mach_timebase_info_data_t timebase;
+    if (!timebase.denom) mach_timebase_info(&timebase);
+    mPeriodHost = (uint64_t)((double)mTimestampFrames * 1e9 / rate * timebase.denom / timebase.numer + 0.5);
 
     // Device settings as the kext applied them, and the clock status of its last handshake.
     // Routes are the HAL's own (it routes in its codecs); they stay as they are.
@@ -277,8 +345,6 @@ void OzzyHALDevice::ApplyDeviceConfig() {
     }
 
     // The rates CoreAudio may pick: the device's, or only the S/PDIF lock rate
-    const struct ozzy_device* model = ozzy_device_lookup(shm->vendor_id, shm->product_id);
-    mModel = model;
     mHostRateCount = model ? ozzy_device_host_rates(model, mClockLocked ? mLockRate : 0, mHostRates) : 0;
     if (!mHostRateCount) {
         mHostRates[0] = rate;
@@ -481,10 +547,11 @@ void OzzyHALDevice::ApplyLayout(const ozzy_shared_memory* shm) {
 
 /* Monitor thread: a layout the driver published after the change that asked for it (a rate
  * change that outlived the mailbox's 3 s) or by itself is applied through a configuration
- * change of its own, so CoreAudio stops IO first */
+ * change of its own, so CoreAudio stops IO first. Not in a grace: a driver coming back is
+ * still publishing its layout, and Resume compares it once it is ready. */
 void OzzyHALDevice::CheckLayout(AudioServerPlugInHostRef host) {
     ozzy_shared_memory* shm = mSHM.load(std::memory_order_relaxed);
-    if (!host || !shm || !mConnected || mChanging.load() || mRelayoutRequested.load()) return;
+    if (!host || !shm || !mConnected || mGraceUntilNs || mChanging.load() || mRelayoutRequested.load()) return;
     OzzyLayout now = OzzyLayout::Of(shm);
     {
         std::lock_guard<std::mutex> lock(mLayoutLock);
@@ -506,7 +573,10 @@ void OzzyHALDevice::CheckLayout(AudioServerPlugInHostRef host) {
 }
 
 void OzzyHALDevice::AbortConfigurationChange(UInt64 action) {
-    if (action == kRelayoutAction) mRelayoutRequested.store(false);
+    if (action != kRelayoutAction) return;
+    mRelayoutRequested.store(false);
+    // A driver back within the grace: its own layout, which CheckLayout then asks to apply
+    mRestorePending.store(false);
 }
 
 OSStatus OzzyHALDevice::SetSampleRate(AudioServerPlugInHostRef host, Float64 rate) {
@@ -532,6 +602,8 @@ kern_return_t OzzyHALDevice::CallSetRate(uint32_t rate) {
 
 OSStatus OzzyHALDevice::PerformConfigurationChange(AudioServerPlugInHostRef host, UInt64 action) {
     bool relayout = action == kRelayoutAction;
+    // A driver back within the grace (Resume): give it the HAL's rate and device settings back
+    bool restore = relayout && mRestorePending.load();
     bool rateChange = !relayout && (action & kRateChangeAction);
     unsigned int id = (unsigned int)(action >> 32);
     uint32_t value = (uint32_t)action;
@@ -541,11 +613,22 @@ OSStatus OzzyHALDevice::PerformConfigurationChange(AudioServerPlugInHostRef host
     mChanging.store(true);
     OzzyMonoChangeBegins(this);   // the engine restarts under MON and AUX too
     ozzy_shared_memory* shm = AcquireSHM();
-    kern_return_t kr = !shm ? kIOReturnNotAttached : relayout ? KERN_SUCCESS
+    uint32_t rate = (uint32_t)mCurrentStreamFormat.mSampleRate;
+    bool restoreRate = restore && shm && shm->audio.sample_rate.load() != rate && ozzy_device_has_rate(mModel, rate);
+    // A relayout with no driver (lost again in a grace): nothing to apply, and IO restarts anyway
+    kern_return_t kr = !shm ? (relayout ? KERN_SUCCESS : kIOReturnNotAttached)
+                     : restoreRate ? CallSetRate(rate) : relayout ? KERN_SUCCESS
                      : rateChange ? CallSetRate(value) : CallApplySetting(id, value);
     ApplyLayout(shm);
+    if (restore && shm) {
+        LogOzzyHAL("device %{public}u: restoring %{public}u Hz and the stored settings to the driver", mSlot, rate);
+        RestoreSettings(host);   // applies the layout again if a setting changed
+    }
     ReleaseSHM();
-    if (relayout) mRelayoutRequested.store(false);
+    if (relayout) {
+        mRelayoutRequested.store(false);
+        mRestorePending.store(false);
+    }
 
     if (kr == KERN_SUCCESS && !rateChange && !relayout) StoreSetting(host, id, value);
     // The rate may have changed (S/PDIF lock), and the clock source item names say the lock
@@ -629,13 +712,67 @@ void OzzyHALDevice::NotifyDeviceChanged(AudioServerPlugInHostRef host) {
     OzzyMonoNotify(this, host);
 }
 
-/* Publish the device once the engine is up, withdraw it when it goes down */
+/* Monitor thread: the driver came back as the same device within the grace, and is ready. The
+ * device stays published with its IO running: the new clock is a new seed (Map rebased the
+ * timelines), and a rate or device settings other than the HAL's are given back to the driver
+ * through a configuration change, so CoreAudio stops IO first and the codecs never change under
+ * a running IO thread. */
+void OzzyHALDevice::Resume(AudioServerPlugInHostRef host) {
+    ozzy_shared_memory* shm = mSHM.load(std::memory_order_relaxed);
+    mGraceUntilNs = 0;
+    mRemapped = false;
+    OzzyLayout now = OzzyLayout::Of(shm);
+    bool same;
+    {
+        std::lock_guard<std::mutex> lock(mLayoutLock);
+        same = now == mLayout;
+    }
+    if (same && !DeviceSettingsDiffer(shm)) {
+        LogOzzyHAL("device %{public}u: its driver is back, same layout and settings; IO carries on", mSlot);
+        return;
+    }
+    LogOzzyHAL("device %{public}u: its driver is back at %{public}u Hz with other settings or layout; restoring the HAL's through a configuration change",
+               mSlot, now.rate);
+    mRestorePending.store(true);
+    mRelayoutRequested.store(true);   // before the request: its Perform may come at once
+    if (host && host->RequestDeviceConfigurationChange(host, GetDeviceID(), kRelayoutAction, nullptr) == kAudioHardwareNoError)
+        return;
+    LogOzzyHALError("device %{public}u: the configuration change was refused; the driver's own layout applies", mSlot);
+    mRelayoutRequested.store(false);
+    mRestorePending.store(false);
+}
+
+/* A device setting the driver has at a value other than the HAL's (a restarted driver starts
+ * with the defaults) */
+bool OzzyHALDevice::DeviceSettingsDiffer(const ozzy_shared_memory* shm) const {
+    if (shm->audio.settings.available != mSettingsAvailable) return true;
+    for (unsigned int id = 0; id < OZZY_NUM_SETTINGS; id++)
+        if (HasSetting(id) && ozzy_setting_descs[id].kind == OZZY_SETTING_DEVICE &&
+            shm->audio.settings.value[id] != mSettings.value[id])
+            return true;
+    return false;
+}
+
+/* Publish the device once the engine is up, withdraw it when it goes down; one that lost its
+ * driver (CheckHealth) only once the grace is over without the driver coming back */
 bool OzzyHALDevice::UpdateConnectionState(AudioServerPlugInHostRef host) {
     ozzy_shared_memory* shm = mSHM.load(std::memory_order_relaxed);
     bool hwReady = (shm && shm->audio.hardware_present.load(std::memory_order_acquire));
     bool drvReady = (shm && shm->audio.driver_ready.load(std::memory_order_acquire));
     bool metaReady = (shm && shm->product_name[0] != 0);
     bool currentlyConnected = (hwReady && drvReady && metaReady);
+    if (mGraceUntilNs) {
+        // Ready again: only a driver mapped in the grace can be (CheckHealth unmapped the old)
+        if (currentlyConnected) {
+            Resume(host);
+            return false;
+        }
+        if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < mGraceUntilNs) return false;
+        mGraceUntilNs = 0;
+        LogOzzyHAL("device %{public}u: its driver %{public}s within the grace; withdrawing it", mSlot,
+                   mRemapped ? "didn't get ready" : "didn't come back");
+        mRemapped = false;
+    }
     if (currentlyConnected == mConnected) return false;
 
     if (currentlyConnected) {
@@ -646,13 +783,20 @@ bool OzzyHALDevice::UpdateConnectionState(AudioServerPlugInHostRef host) {
         mExtras.Restore(host, mDeviceUID);
         char name[sizeof(shm->product_name) + 1];
         LogOzzyHAL("device %{public}u ready: '%{public}s'", mSlot, OzzyCopyName(name, shm->product_name, ""));
-    } else if (mIOStarted) {
-        mIOStarted = false;
+    } else {
+        // The timelines and any request were kept for the grace: they end with the device. Its
+        // mono devices' IO goes with it, as the main device's below.
         ozzy_timeline_restart(&mTimeline);
-        LogOzzyHAL("device %{public}u: auto-stopped I/O due to disconnect", mSlot);
-        std::lock_guard<std::mutex> lock(mClientLock);
-        for (int k = 0; k < mClientCount; k++) mClients[k].io = false;
-        mIOCount = 0;
+        mExtras.Withdraw();
+        mRelayoutRequested.store(false);
+        mRestorePending.store(false);
+        if (mIOStarted) {
+            mIOStarted = false;
+            LogOzzyHAL("device %{public}u: auto-stopped I/O due to disconnect", mSlot);
+            std::lock_guard<std::mutex> lock(mClientLock);
+            for (int k = 0; k < mClientCount; k++) mClients[k].io = false;
+            mIOCount = 0;
+        }
     }
 
     mConnected = currentlyConnected;
@@ -772,23 +916,28 @@ void OzzyHALDevice::StopDeviceIO() {
     ClearOutputBuffer();
 }
 
-bool OzzyHALDevice::ReadClock(bool* got, uint64_t* sampleTime, uint64_t* hostTime) {
+bool OzzyHALDevice::ServeAnchor(struct ozzy_timeline* t, uint64_t* sampleTime, uint64_t* hostTime, uint64_t* seed) {
     ozzy_shared_memory* shm = AcquireSHM();
-    *got = shm && ozzy_timestamp_read(&shm->audio.timestamp, sampleTime, hostTime);
+    // Not from a driver whose layout is being restored: its clock may run at another rate
+    bool got = shm && !mRestorePending.load(std::memory_order_relaxed) &&
+               ozzy_timestamp_read(&shm->audio.timestamp, sampleTime, hostTime);
     ReleaseSHM();
-    return shm != nullptr;
+    bool real = got && *hostTime != 0;
+    if (!ozzy_timeline_anchor(t, got, sampleTime, hostTime, seed, mach_absolute_time(), mTimestampFrames, mPeriodHost))
+        return false;
+    if (real) mSynced.store(true, std::memory_order_relaxed);
+    return true;
 }
 
 HRESULT OzzyHALDevice::GetZeroTimeStamp(Float64* outSampleTime, UInt64* outHostTime, UInt64* outSeed) {
     uint64_t sTime = 0, hTime = 0, seed = 0;
-    bool got = false;
-    if (!ReadClock(&got, &sTime, &hTime)) return kAudioHardwareNotRunningError;
 
     // Host time 0 is the engine's "no anchor yet" (a start or restart); a failed read, a
-    // writer that kept the seqlock busy. Either way serve the last real anchor, and never
-    // hand CoreAudio a (0, 0) one. The clock going back (the engine restarted under running
-    // IO: watchdog, wake) starts a new seed.
-    if (!ozzy_timeline_anchor(&mTimeline, got, &sTime, &hTime, &seed)) return kAudioHardwareNotRunningError;
+    // writer that kept the seqlock busy, or no driver (the grace). Either way serve the last
+    // real anchor, moved on at the nominal rate, and never hand CoreAudio a (0, 0) one. The
+    // clock going back (the engine restarted under running IO: watchdog, wake, a driver back
+    // within the grace) starts a new seed.
+    if (!ServeAnchor(&mTimeline, &sTime, &hTime, &seed)) return kAudioHardwareNotRunningError;
 
     if (outSampleTime) *outSampleTime = (Float64)sTime;
     if (outHostTime) *outHostTime = hTime;
@@ -798,9 +947,13 @@ HRESULT OzzyHALDevice::GetZeroTimeStamp(Float64* outSampleTime, UInt64* outHostT
 }
 
 OSStatus OzzyHALDevice::ioOperation(UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo, void* ioMainBuffer) {
-    ozzy_shared_memory* shm = AcquireSHM();
+    // No driver serving the device (the grace, or before its clock is synced): input is silence,
+    // output goes nowhere
+    ozzy_shared_memory* shm = AcquireRings();
     if (!shm) {
         ReleaseSHM();
+        if (inOperationID == kAudioServerPlugInIOOperationReadInput && ioMainBuffer)
+            memset(ioMainBuffer, 0, (size_t)inIOBufferFrameSize * mInputChannels * sizeof(float));
         return kAudioHardwareNoError;
     }
 
@@ -819,6 +972,7 @@ OSStatus OzzyHALDevice::ioOperation(UInt32 inOperationID, UInt32 inIOBufferFrame
             uint64_t sampleTime = (uint64_t)inIOCycleInfo->mInputTime.mSampleTime;
             mReadInput((float*)ioMainBuffer, shm->audio.input_buffer, sampleTime, inIOBufferFrameSize, mInRingFrames);
             ozzy_route_frames((uint8_t*)ioMainBuffer, inIOBufferFrameSize, &mInRoute, 2 * sizeof(float));
+            mExtras.ApplyInputGain((float*)ioMainBuffer, inIOBufferFrameSize, mInputChannels);
         }
     }
     ReleaseSHM();
@@ -827,7 +981,7 @@ OSStatus OzzyHALDevice::ioOperation(UInt32 inOperationID, UInt32 inIOBufferFrame
 
 void OzzyHALDevice::ReadInputChannel(uint32_t channel, UInt32 frames, const AudioServerPlugInIOCycleInfo* cycle, float* out,
                                      float* scratch, uint32_t chunk) {
-    ozzy_shared_memory* shm = AcquireSHM();
+    ozzy_shared_memory* shm = AcquireRings();   // none: silence
     // The device's channel, before the capture routing (the routes are the main device's)
     ozzy_mono_read(mReadInput, shm ? shm->audio.input_buffer : nullptr, mInRingFrames, mInputChannels, channel,
                    (uint64_t)cycle->mInputTime.mSampleTime, frames, out, scratch, chunk);
@@ -937,11 +1091,11 @@ UInt32 OzzyHAL::GetDeviceList(AudioObjectID* outIDs, UInt32 maxIDs) const {
     return count;
 }
 
-/* A slot for a device with this UID: the one it had before, else a never-used one, else
- * any slot whose device is gone */
+/* A slot for a device with this UID: the one it had before (still published if it is within
+ * its grace), else a never-used one, else any slot whose device is gone */
 OzzyHALDevice* OzzyHAL::SlotForUID(const char* uid) {
     for (uint32_t i = 0; i < kOzzyMaxDevices; i++)
-        if (!mDevices[i].IsMapped() && !mDevices[i].IsConnected() && mDevices[i].HasDeviceUID(uid)) return &mDevices[i];
+        if (!mDevices[i].IsMapped() && mDevices[i].HasDeviceUID(uid)) return &mDevices[i];
     for (uint32_t i = 0; i < kOzzyMaxDevices; i++)
         if (!mDevices[i].IsUsed()) return &mDevices[i];
     for (uint32_t i = 0; i < kOzzyMaxDevices; i++)
@@ -1348,12 +1502,11 @@ extern "C" HRESULT OzzyGetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
             case kAudioObjectPropertyBaseClass: return WriteClassID(inMax, outSize, outData, kAudioObjectClassID);
             case kAudioObjectPropertyClass: return WriteClassID(inMax, outSize, outData, kAudioDeviceClassID);
             case kAudioObjectPropertyControlList: {
-                // The clock source (if any), then the fork's volume and mute
+                // The clock source (if any), then the fork's volume and mute, output and input
                 AudioObjectID ids[1 + kOzzyExtraControls];
                 UInt32 count = 0;
                 if (hasClock) ids[count++] = dev->GetClockControlID();
-                ids[count++] = dev->GetDeviceID() + kOzzyObjectVolumeControl;
-                ids[count++] = dev->GetDeviceID() + kOzzyObjectMuteControl;
+                for (UInt32 kind : kOzzyExtraControlKinds) ids[count++] = dev->GetDeviceID() + kind;
                 if (outData && inMax < count * sizeof(AudioObjectID)) return kAudioHardwareBadPropertySizeError;
                 if (outData) memcpy(outData, ids, count * sizeof(AudioObjectID));
                 if (outSize) *outSize = count * sizeof(AudioObjectID);
@@ -1385,7 +1538,7 @@ extern "C" HRESULT OzzyGetPropertyData(AudioServerPlugInDriverRef, AudioObjectID
                 if (outData && inMax < count * sizeof(AudioObjectID)) return kAudioHardwareBadPropertySizeError;
                 AudioObjectID* list = (AudioObjectID*)outData;
                 if (list) { list[0] = dev->GetOutputStreamID(); list[1] = dev->GetInputStreamID(); if (hasClock) list[2] = dev->GetClockControlID(); }
-                if (list) { list[count - 2] = dev->GetDeviceID() + kOzzyObjectVolumeControl; list[count - 1] = dev->GetDeviceID() + kOzzyObjectMuteControl; }
+                if (list) for (UInt32 i = 0; i < kOzzyExtraControls; i++) list[count - kOzzyExtraControls + i] = dev->GetDeviceID() + kOzzyExtraControlKinds[i];
                 if (outSize) *outSize = count * sizeof(AudioObjectID); return kAudioHardwareNoError;
             }
             case kAudioDevicePropertyStreamConfiguration: {

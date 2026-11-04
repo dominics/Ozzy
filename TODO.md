@@ -15,6 +15,7 @@ Run with the mixer's loopback (outputs 1-2 and 3-4 back into inputs 1-2), record
 - [ ] A failed start is retried: unplug and replug during the handshake, and power-cycle the mixer with USB connected.
 - [ ] No false watchdog recoveries in 10 minutes idle and 10 minutes streaming, including bulk 0x86 while no app has the device open.
 - [ ] Upgrades from 0.4.0 and from 0.3.0 keep a lowered output volume and mute.
+- [ ] The input volume and mute in Sound settings lower and silence the loopback recording without clicks, and both are kept across a replug and a `coreaudiod` restart.
 - [ ] Linux: a forced underrun stops the stream with an XRUN, and a failed rate change leaves the mixer stopped rather than resetting its USB.
 
 ## Values to measure on hardware
@@ -31,17 +32,16 @@ These were set without a measurement behind them.
 
 ## Open issues
 
-- [ ] An app that holds the device across a replug never resumes, because the HAL publishes it under a new AudioObjectID. Compare with 0.3.0's HAL before deciding whether to keep the object across replugs.
+- [ ] An app that holds the device across a replug or a daemon restart never resumes, because the HAL withdrew the device and coreaudiod publishes it again under a new AudioObjectID (0.3.0's HAL withdrew it too). The HAL now keeps a device that lost its driver published for 3 s (`kOzzyGraceNs`), silent and on a clock moved on at the nominal rate, and maps a driver that comes back with the same UID into the same slot; a different rate or device settings go back to the driver through a configuration change. To check on hardware: `launchctl kickstart -k gui/$UID/com.ozzy.daemon` with an app playing to the main device and another recording MON and AUX (both carry on, after a short gap), the same with a replug on the same port inside 3 s, and a replug after more than 3 s (withdrawn, as before).
 - [ ] A possible stale byte 0 on bulk PCM IN: in some 48 kHz sessions started right after a rate change (0.3.x, OzzyDaemon over IOUSBLib), byte 0 of the 64-byte input frame repeated the previous frame's in about 8% of frames. It holds bit 23 of inputs 1 and 3, so quiet signals there click at full scale. Not reproduced since, and a later rate change cleared it; suspect it first if inputs 1 or 3 click. Notes in [.claude/re/open_questions.md](.claude/re/open_questions.md).
 - [ ] Check whether OzzyMIDI still drops MIDI bytes after a MIDIServer restart until the device-online block has run, and whether the HAL still sends a duplicate `PropertiesChanged(NominalSampleRate)` (both seen with 0.3.x).
 - [ ] Linux has only been compiled for 0.4.x, never run on the CMS 600-3: 5-minute runs at each rate, both MIDI ports, unplug while streaming. Also from the port: the minimum playback period is now 768 frames (JACK `-p 256` and `-p 512` are refused) and the rawmidi port names are cut at 32 characters.
-- [ ] CI runs only on pushes to `release` and on `v*` tags, so a regression on the trunk shows up at release time. Run the host tests on trunk pushes too.
+- [x] CI ran only on pushes to `release` and on `v*` tags, so a regression on the trunk showed up at release time. Pushes to `dynacord-cms600` now run the lint and host tests too, without building the package.
 
 ## Features asked for
 
-- [ ] A system-wide input mute.
-- [ ] Input volume, like the output volume (`macos/OzzyHAL/OzzyVolume.h`). Settle first how to keep apps' automatic gain control (video call apps, browsers) from driving it; mute has no such conflict, so it can go first.
+- [x] Input volume and mute, like the output ones, on the main device's input (`macos/OzzyHAL/OzzyHALExtras.h`).
 
 ## Test tools
 
-- [ ] The hardware test tools used for releases (a duplex loopback recorder with a two-tone analyser, and a MIDI port loop / SysEx echo by port name) live outside the repo. Commit them if more hardware testing is coming.
+- [x] The hardware test tools used for releases (a duplex loopback recorder with a two-tone analyser, and a MIDI port loop / SysEx echo by port name) are in `tools/cms600`, with `loopback.sh` for the release run.

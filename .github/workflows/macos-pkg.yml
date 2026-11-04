@@ -2,7 +2,7 @@ name: macOS package
 
 on:
   push:
-    branches: [release]
+    branches: [release, dynacord-cms600]
     tags: ['v*']
   workflow_dispatch:
 
@@ -32,12 +32,15 @@ jobs:
       - name: Plug-in backend tests (fake-daemon)
         run: make -C macos/Backends/OzzyDaemon/tools check
       - name: Build package
+        if: github.ref != 'refs/heads/dynacord-cms600'
         run: macos/packaging/build-pkg.sh
       - name: Check package
+        if: github.ref != 'refs/heads/dynacord-cms600'
         run: |
           v="$(cat macos/build/pkg/VERSION)"
           macos/packaging/check-pkg.sh "macos/build/pkg/Ozzy-CMS600-$v.pkg" "$v"
       - uses: actions/upload-artifact@v7
+        if: github.ref != 'refs/heads/dynacord-cms600'
         with:
           name: ozzy-cms600-pkg
           path: |

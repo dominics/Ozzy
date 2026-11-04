@@ -81,4 +81,11 @@ void segment_beat_stop(struct segment *seg);
  */
 void segment_destroy(struct segment *seg);
 
+/*
+ * segment_abandon - segment_destroy, but the mapping is left in place (and so lost): for a
+ * segment that transfers IOKit hasn't given back may still write into. The plug-ins see the
+ * device go, and the name is unlinked, as segment_destroy does.
+ */
+void segment_abandon(struct segment *seg);
+
 #endif

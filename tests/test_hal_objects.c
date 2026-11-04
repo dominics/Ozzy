@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * OzzyHAL's object dispatch for the fork's objects (macos/OzzyHAL/OzzyHALObjects.h): which
- * object kinds are the volume and mute controls, the mono devices and their streams and which
+ * object kinds are the output and input volume and mute controls, the mono devices and their streams and which
  * mono input each belongs to, nothing for upstream's kinds or past the last mono input, and the
  * related devices of a CMS 600-3 (main, MON, AUX) and of a device without mono inputs.
  */
@@ -20,10 +20,15 @@ int main(void)
 	/* Upstream's device, streams and clock control are none of the fork's */
 	for (kind = 0; kind < kOzzyObjectVolumeControl; kind++)
 		CHECK(OzzyMonoIndex(kind) == -1 && !OzzyIsMonoObject(kind) && !OzzyIsExtraControl(kind), "kind %u", kind);
-	CHECK(OzzyIsExtraControl(kOzzyObjectVolumeControl) && OzzyIsExtraControl(kOzzyObjectMuteControl), "controls");
-	CHECK(!OzzyIsMonoObject(kOzzyObjectVolumeControl) && !OzzyIsMonoObject(kOzzyObjectMuteControl), "controls not mono");
+	for (kind = kOzzyObjectVolumeControl; kind <= kOzzyObjectInputMuteControl; kind++)
+		CHECK(OzzyIsExtraControl(kind) && !OzzyIsMonoObject(kind), "control %u", kind);
+	CHECK(OzzyIsVolumeControl(kOzzyObjectVolumeControl) && OzzyIsVolumeControl(kOzzyObjectInputVolumeControl) &&
+	      !OzzyIsVolumeControl(kOzzyObjectMuteControl) && !OzzyIsVolumeControl(kOzzyObjectInputMuteControl), "volume vs mute");
+	CHECK(OzzyIsInputControl(kOzzyObjectInputVolumeControl) && OzzyIsInputControl(kOzzyObjectInputMuteControl) &&
+	      !OzzyIsInputControl(kOzzyObjectVolumeControl) && !OzzyIsInputControl(kOzzyObjectMuteControl), "input vs output");
+	CHECK(!OzzyIsExtraControl(kOzzyObjectMonoDevice), "mono device not a control");
 
-	/* Mono input i: its device at 6 + 2i, its stream next to it */
+	/* Mono input i: its device at 8 + 2i, its stream next to it */
 	for (n = 0; n < OZZY_MAX_MONO_INPUTS; n++) {
 		uint32_t dev = OzzyMonoDeviceKind(n);
 
@@ -38,7 +43,7 @@ int main(void)
 	/* The CMS 600-3: main, MON (input 4) and AUX (input 3), related to each other */
 	n = ozzy_mono_inputs_for(cms, mono);
 	CHECK(n == 2, "CMS 600-3 mono inputs: %u", n);
-	CHECK(ozzy_related_devices(100, n, related) == 3 && related[0] == 100 && related[1] == 106 && related[2] == 108,
+	CHECK(ozzy_related_devices(100, n, related) == 3 && related[0] == 100 && related[1] == 108 && related[2] == 110,
 	      "CMS 600-3 related devices");
 	/* A device without mono inputs is related only to itself */
 	n = ozzy_mono_inputs_for(db4, mono);

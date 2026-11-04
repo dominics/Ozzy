@@ -20,7 +20,9 @@
  *
  * Packets of the wrong length are counted. Past @max_errors without a clean ring
  * lap in between, feedback is ignored (the official Ploytec driver stops the
- * stream after 40 there; this keeps playing at the nominal rate).
+ * stream after 40 there; this keeps playing at the nominal rate). A packet the
+ * bus lost (an error status, isoc_fb_lost) plays its interval at the nominal
+ * rate and is not counted, though its lap doesn't count as clean either.
  *
  * The two sides share only the ring, with no lock: each side owns its own
  * index, and entries are single bytes. High Speed only.
@@ -106,7 +108,7 @@ struct isoc_fb {
 	uint32_t lo, hi;        /* accepted frames per packet (COUNT) or per microframe (Q16_16) */
 	uint32_t q_acc;         /* Q16_16: fractional frames carried to the next microframe */
 	uint32_t errors;        /* wrong-length packets since the last clean lap */
-	uint32_t lap_errors;    /* wrong-length packets in this lap */
+	uint32_t lap_errors;    /* wrong-length or lost packets in this lap */
 	bool broken;            /* errors passed the limit: feedback is ignored */
 };
 
@@ -194,17 +196,32 @@ static inline uint32_t isoc_fb_value(const struct isoc_fb *fb, const uint8_t *pk
 }
 
 /*
- * isoc_fb_packet - Take one feedback packet (@len bytes received) and fill the
- * ring entries of its interval. Returns true once, when the wrong-length packets
+ * isoc_fb_in_range - Whether @pkt (@len bytes received) is a feedback value the
+ * device could mean: the right length and within the accepted range.
+ */
+static inline bool isoc_fb_in_range(const struct isoc_fb *fb, const uint8_t *pkt, uint32_t len)
+{
+	uint32_t v, whole;
+
+	if (len != fb->cfg.packet_size)
+		return false;
+	v = isoc_fb_value(fb, pkt);
+	whole = fb->cfg.format == ISOC_FB_Q16_16 ? v >> 16 : v;
+	return whole >= fb->lo && whole <= fb->hi;
+}
+
+/*
+ * isoc_fb_take - Fill the ring entries of one feedback packet's interval: from
+ * @pkt (@len bytes received), or at the nominal rate when @lost (the bus lost
+ * the packet, @pkt unused). Returns true once, when the wrong-length packets
  * pass the limit and feedback stops being used.
  */
-static inline bool isoc_fb_packet(struct isoc_fb *fb, const uint8_t *pkt, uint32_t len)
+static inline bool isoc_fb_take(struct isoc_fb *fb, const uint8_t *pkt, uint32_t len, bool lost)
 {
 	uint32_t u = fb->uframes;
-	uint32_t valid = len == fb->cfg.packet_size;
+	uint32_t valid = !lost && len == fb->cfg.packet_size;
 	uint32_t v = valid ? isoc_fb_value(fb, pkt) : 0;
-	uint32_t whole = fb->cfg.format == ISOC_FB_Q16_16 ? v >> 16 : v;
-	uint32_t ok = valid & (whole >= fb->lo) & (whole <= fb->hi) & !fb->broken;
+	uint32_t ok = valid && isoc_fb_in_range(fb, pkt, len) && !fb->broken;
 	uint32_t k, n, lap_end;
 	bool was_broken = fb->broken;
 
@@ -220,7 +237,7 @@ static inline bool isoc_fb_packet(struct isoc_fb *fb, const uint8_t *pkt, uint32
 	}
 	fb->wr += u;
 
-	fb->errors += !valid;
+	fb->errors += !valid && !lost;   /* a lost packet isn't the device's wrong length */
 	fb->lap_errors += !valid;
 	lap_end = u && (fb->wr & (ISOC_FB_RING - 1)) < u;
 	fb->errors *= !(lap_end && fb->lap_errors == 0);
@@ -228,6 +245,25 @@ static inline bool isoc_fb_packet(struct isoc_fb *fb, const uint8_t *pkt, uint32
 	fb->broken |= fb->cfg.max_errors && fb->errors > fb->cfg.max_errors;
 
 	return fb->broken && !was_broken;
+}
+
+/*
+ * isoc_fb_packet - Take one feedback packet (@len bytes received) and fill the
+ * ring entries of its interval. Returns true once, when the wrong-length packets
+ * pass the limit and feedback stops being used.
+ */
+static inline bool isoc_fb_packet(struct isoc_fb *fb, const uint8_t *pkt, uint32_t len)
+{
+	return isoc_fb_take(fb, pkt, len, false);
+}
+
+/*
+ * isoc_fb_lost - A feedback packet the bus lost (an error status, no data): its
+ * interval plays at the nominal rate, and it doesn't count towards @max_errors.
+ */
+static inline void isoc_fb_lost(struct isoc_fb *fb)
+{
+	isoc_fb_take(fb, (const uint8_t *)0, 0, true);
 }
 
 /*

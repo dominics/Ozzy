@@ -313,9 +313,15 @@ static void close_device(struct daemon_device *d)
 {
 	remove_timer(&d->poll);
 	remove_timer(&d->watch);
-	ubus_close(&d->bus);
-	segment_destroy(&d->seg);
-	free(d->engine_mem);
+	if (ubus_close(&d->bus)) {
+		segment_destroy(&d->seg);
+		free(d->engine_mem);
+	} else {
+		/* Transfers IOKit still holds point into the segment and the engine's memory: leave
+		 * both in place, so nothing reuses memory the kernel may still write */
+		ozzy_log("  leaving the engine and its segment allocated after a stuck abort");
+		segment_abandon(&d->seg);
+	}
 	d->engine_mem = NULL;
 	d->engine = NULL;
 	memset(&d->bus, 0, sizeof(d->bus));

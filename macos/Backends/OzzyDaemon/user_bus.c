@@ -853,9 +853,10 @@ uint32_t ubus_pipe_refused(struct user_bus *b, uint8_t address)
 	return p ? __atomic_load_n(&p->refused, __ATOMIC_RELAXED) : 0;
 }
 
-void ubus_close(struct user_bus *b)
+bool ubus_close(struct user_bus *b)
 {
 	unsigned int i;
+	int pending;
 
 	ubus_stop_timer(b);
 	if (b->dev && b->intf_count)
@@ -888,9 +889,18 @@ void ubus_close(struct user_bus *b)
 		IOObjectRelease(b->service);
 		b->service = IO_OBJECT_NULL;
 	}
-	free(b->requests);
-	free(b->bounce_mem);
+	/* With the I/O thread gone no completion runs, so this is final. A transfer IOKit still holds
+	 * may yet write into its request and bounce buffer: leave them allocated rather than free
+	 * memory under it */
+	pending = __atomic_load_n(&b->pending, __ATOMIC_ACQUIRE);
+	if (pending > 0) {
+		ozzy_log("%d transfers still outstanding at close: leaving their requests and buffers allocated", pending);
+	} else {
+		free(b->requests);
+		free(b->bounce_mem);
+	}
 	b->requests = NULL;
 	b->bounce_mem = NULL;
 	b->free_requests = NULL;
+	return pending <= 0;
 }

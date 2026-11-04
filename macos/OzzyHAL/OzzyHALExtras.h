@@ -2,7 +2,9 @@
 /*
  * The fork's additions to an OzzyHAL device, kept out of OzzyHAL.mm, which only calls in here:
  * - output volume and mute controls (OzzyVolume.h), applied where the HAL writes the output
- *   ring, as each device's objects kOzzyObjectVolumeControl and kOzzyObjectMuteControl
+ *   ring, as each device's objects kOzzyObjectVolumeControl and kOzzyObjectMuteControl, and
+ *   input ones on the same curve, applied where it reads the input ring, as
+ *   kOzzyObjectInputVolumeControl and kOzzyObjectInputMuteControl
  * - channel names (kAudioObjectPropertyElementName), speaker labels in the preferred channel
  *   layout and a preferred stereo pair per direction, per device-table model (OzzyChannels.h)
  * - mono input devices next to the main one (the CMS 600-3's MON and AUX, OzzyChannels.h), as
@@ -31,8 +33,11 @@
 static const uint32_t kOzzyMonoChunkFrames = 256;
 static const uint32_t kOzzyMonoMaxChannels = OZZY_MONO_MAX_CHANNELS;
 
-/* The controls each device has, in its control list after the clock source */
-static const UInt32 kOzzyExtraControls = 2;
+/* The controls each device has, in its control list after the clock source, in this order */
+static const UInt32 kOzzyExtraControls = 4;
+static const UInt32 kOzzyExtraControlKinds[kOzzyExtraControls] = {
+    kOzzyObjectVolumeControl, kOzzyObjectMuteControl, kOzzyObjectInputVolumeControl, kOzzyObjectInputMuteControl,
+};
 
 /*
  * The driver's layout as the device last applied it (ApplyDeviceConfig), as the shared memory
@@ -91,25 +96,43 @@ public:
     void RestartMonoTimelines() {
         for (unsigned int i = 0; i < OZZY_MAX_MONO_INPUTS; i++) ozzy_timeline_restart(&mMonoTimeline[i]);
     }
+    /* Monitor thread: a driver came back within the main device's grace, a new clock under the
+     * mono devices' running timelines (ozzy_timeline_rebase) */
+    void RebaseMonoTimelines() {
+        for (unsigned int i = 0; i < OZZY_MAX_MONO_INPUTS; i++) ozzy_timeline_rebase(&mMonoTimeline[i]);
+    }
+    /* Monitor thread: the main device was withdrawn (its grace ran out), and its mono devices with
+     * it: their IO and any change pending end, and their timelines start over */
+    void Withdraw() {
+        for (unsigned int i = 0; i < OZZY_MAX_MONO_INPUTS; i++) {
+            mMonoIO[i].store(0);
+            mMonoChanging[i].store(false);
+        }
+        RestartMonoTimelines();
+    }
     /* Its IO thread's decode buffer (each device has an IO thread of its own) */
     float mMonoScratch[OZZY_MAX_MONO_INPUTS][kOzzyMonoChunkFrames * kOzzyMonoMaxChannels];
 
-    /* The device came up as @uid: what storage has for it (defaults where it has nothing) */
+    /* The device came up as @uid: what storage has for it (defaults where it has nothing), and
+     * its mono devices' IO from nothing. A driver back within the grace doesn't come through here,
+     * so a MON or AUX recording spanning it keeps its count and timeline. */
     void Restore(AudioServerPlugInHostRef host, CFStringRef uid) {
         if (mUID) CFRelease(mUID);
         mUID = uid ? (CFStringRef)CFRetain(uid) : nullptr;
-        float volume = 1.0f;
-        bool muted = false;
+        float volume[2] = { 1.0f, 1.0f };
+        bool muted[2] = { false, false };
         uint32_t pairs[2] = { kDefaultPair, kDefaultPair };
         CFPropertyListRef v;
         MigrateLegacy(host);
-        if ((v = Copy(host, kVolumeKey))) {
-            if (CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)v, kCFNumberFloat32Type, &volume);
-            CFRelease(v);
-        }
-        if ((v = Copy(host, kMuteKey))) {
-            if (CFGetTypeID(v) == CFBooleanGetTypeID()) muted = CFBooleanGetValue((CFBooleanRef)v);
-            CFRelease(v);
+        for (int in = 0; in < 2; in++) {
+            if ((v = Copy(host, in ? kInVolumeKey : kVolumeKey))) {
+                if (CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)v, kCFNumberFloat32Type, &volume[in]);
+                CFRelease(v);
+            }
+            if ((v = Copy(host, in ? kInMuteKey : kMuteKey))) {
+                if (CFGetTypeID(v) == CFBooleanGetTypeID()) muted[in] = CFBooleanGetValue((CFBooleanRef)v);
+                CFRelease(v);
+            }
         }
         for (int out = 0; out < 2; out++) {
             if (!(v = Copy(host, out ? kOutPairKey : kInPairKey))) continue;
@@ -123,17 +146,22 @@ public:
             mMonoChanging[i].store(false);
         }
         RestartMonoTimelines();
-        mVolume.store(ozzy_volume_clamp(volume));
-        mMuted.store(muted);
+        for (int in = 0; in < 2; in++) {
+            mLevel[in].volume.store(ozzy_volume_clamp(volume[in]));
+            mLevel[in].muted.store(muted[in]);
+        }
         mPairIn.store(pairs[0]);
         mPairOut.store(pairs[1]);
     }
 
-    /* IO thread, WriteMix: the volume and mute on @frames frames of @channels, in place */
+    /* IO thread, WriteMix: the output volume and mute on @frames frames of @channels, in place */
     void ApplyOutputGain(float* samples, uint32_t frames, uint32_t channels) {
-        float gain = mMuted.load(std::memory_order_relaxed) ? 0.0f : ozzy_volume_gain(mVolume.load(std::memory_order_relaxed));
-        if (frames) ozzy_volume_ramp(samples, frames, channels, mAppliedGain, gain);
-        mAppliedGain = gain;
+        mLevel[kOut].Apply(samples, frames, channels);
+    }
+
+    /* IO thread, ReadInput: the input volume and mute on @frames frames of @channels, in place */
+    void ApplyInputGain(float* samples, uint32_t frames, uint32_t channels) {
+        mLevel[kIn].Apply(samples, frames, channels);
     }
 
     /* The label of channel @index (0-based) in @scope's preferred layout */
@@ -245,7 +273,7 @@ public:
         return true;
     }
 
-    // --- The volume and mute control objects (OzzyIsExtraControl kinds) ---
+    // --- The volume and mute control objects, output and input (OzzyIsExtraControl kinds) ---
 
     static bool HasControlProperty(uint32_t kind, const AudioObjectPropertyAddress* a) {
         switch (a->mSelector) {
@@ -254,16 +282,16 @@ public:
             case kAudioControlPropertyScope: case kAudioControlPropertyElement: return true;
             case kAudioLevelControlPropertyScalarValue: case kAudioLevelControlPropertyDecibelValue:
             case kAudioLevelControlPropertyDecibelRange: case kAudioLevelControlPropertyConvertScalarToDecibels:
-            case kAudioLevelControlPropertyConvertDecibelsToScalar: return kind == kOzzyObjectVolumeControl;
-            case kAudioBooleanControlPropertyValue: return kind == kOzzyObjectMuteControl;
+            case kAudioLevelControlPropertyConvertDecibelsToScalar: return OzzyIsVolumeControl(kind);
+            case kAudioBooleanControlPropertyValue: return OzzyIsExtraControl(kind) && !OzzyIsVolumeControl(kind);
         }
         return false;
     }
 
     static bool IsControlPropertySettable(uint32_t kind, const AudioObjectPropertyAddress* a) {
-        if (kind == kOzzyObjectVolumeControl)
+        if (OzzyIsVolumeControl(kind))
             return a->mSelector == kAudioLevelControlPropertyScalarValue || a->mSelector == kAudioLevelControlPropertyDecibelValue;
-        return kind == kOzzyObjectMuteControl && a->mSelector == kAudioBooleanControlPropertyValue;
+        return OzzyIsExtraControl(kind) && a->mSelector == kAudioBooleanControlPropertyValue;
     }
 
     static OSStatus GetControlPropertyDataSize(uint32_t kind, const AudioObjectPropertyAddress* a, UInt32* size) {
@@ -290,19 +318,23 @@ public:
         if (outData && inMax < size) return kAudioHardwareBadPropertySizeError;
         if (outSize) *outSize = size;
         if (!outData) return kAudioHardwareNoError;
-        bool volume = kind == kOzzyObjectVolumeControl;
+        bool volume = OzzyIsVolumeControl(kind), in = OzzyIsInputControl(kind);
+        const Level& level = mLevel[in ? kIn : kOut];
         switch (a->mSelector) {
             case kAudioObjectPropertyBaseClass:
                 *(AudioClassID*)outData = volume ? kAudioLevelControlClassID : kAudioBooleanControlClassID; break;
             case kAudioObjectPropertyClass:
                 *(AudioClassID*)outData = volume ? kAudioVolumeControlClassID : kAudioMuteControlClassID; break;
             case kAudioObjectPropertyName:
-                *(CFStringRef*)outData = volume ? CFSTR("Output Volume") : CFSTR("Output Mute"); break;
+                *(CFStringRef*)outData = in ? (volume ? CFSTR("Input Volume") : CFSTR("Input Mute"))
+                                            : (volume ? CFSTR("Output Volume") : CFSTR("Output Mute"));
+                break;
             case kAudioObjectPropertyOwner: *(AudioObjectID*)outData = device; break;
-            case kAudioControlPropertyScope: *(UInt32*)outData = kAudioObjectPropertyScopeOutput; break;
+            case kAudioControlPropertyScope:
+                *(UInt32*)outData = in ? kAudioObjectPropertyScopeInput : kAudioObjectPropertyScopeOutput; break;
             case kAudioControlPropertyElement: *(UInt32*)outData = kAudioObjectPropertyElementMain; break;
-            case kAudioLevelControlPropertyScalarValue: *(Float32*)outData = mVolume.load(); break;
-            case kAudioLevelControlPropertyDecibelValue: *(Float32*)outData = ozzy_volume_scalar_to_db(mVolume.load()); break;
+            case kAudioLevelControlPropertyScalarValue: *(Float32*)outData = level.volume.load(); break;
+            case kAudioLevelControlPropertyDecibelValue: *(Float32*)outData = ozzy_volume_scalar_to_db(level.volume.load()); break;
             case kAudioLevelControlPropertyDecibelRange:
                 *(AudioValueRange*)outData = AudioValueRange { ozzy_volume_min_db, ozzy_volume_max_db }; break;
             // The value to convert comes in outData and is converted in place
@@ -310,7 +342,7 @@ public:
                 *(Float32*)outData = ozzy_volume_scalar_to_db(*(Float32*)outData); break;
             case kAudioLevelControlPropertyConvertDecibelsToScalar:
                 *(Float32*)outData = ozzy_volume_db_to_scalar(*(Float32*)outData); break;
-            case kAudioBooleanControlPropertyValue: *(UInt32*)outData = mMuted.load() ? 1 : 0; break;
+            case kAudioBooleanControlPropertyValue: *(UInt32*)outData = level.muted.load() ? 1 : 0; break;
         }
         return kAudioHardwareNoError;
     }
@@ -318,21 +350,23 @@ public:
     OSStatus SetControlPropertyData(AudioServerPlugInHostRef host, AudioObjectID device, uint32_t kind,
                                     const AudioObjectPropertyAddress* a, UInt32 size, const void* data) {
         if (!IsControlPropertySettable(kind, a)) return kAudioHardwareUnsupportedOperationError;
-        if (!data || size < (kind == kOzzyObjectVolumeControl ? sizeof(Float32) : sizeof(UInt32)))
+        bool volume = OzzyIsVolumeControl(kind), in = OzzyIsInputControl(kind);
+        if (!data || size < (volume ? sizeof(Float32) : sizeof(UInt32)))
             return kAudioHardwareBadPropertySizeError;
         AudioObjectID control = device + kind;
-        if (kind == kOzzyObjectVolumeControl) {
+        Level& level = mLevel[in ? kIn : kOut];
+        if (volume) {
             Float32 v = *(const Float32*)data;
             if (a->mSelector == kAudioLevelControlPropertyDecibelValue) v = ozzy_volume_db_to_scalar(v);
             v = ozzy_volume_clamp(v);
-            if (mVolume.exchange(v) == v) return kAudioHardwareNoError;
-            Store(host, kVolumeKey, CFNumberCreate(NULL, kCFNumberFloat32Type, &v));
+            if (level.volume.exchange(v) == v) return kAudioHardwareNoError;
+            Store(host, in ? kInVolumeKey : kVolumeKey, CFNumberCreate(NULL, kCFNumberFloat32Type, &v));
             Notify(host, control, kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal);
             Notify(host, control, kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal);
         } else {
             bool muted = *(const UInt32*)data != 0;
-            if (mMuted.exchange(muted) == muted) return kAudioHardwareNoError;
-            Store(host, kMuteKey, CFRetain(muted ? kCFBooleanTrue : kCFBooleanFalse));
+            if (level.muted.exchange(muted) == muted) return kAudioHardwareNoError;
+            Store(host, in ? kInMuteKey : kMuteKey, CFRetain(muted ? kCFBooleanTrue : kCFBooleanFalse));
             Notify(host, control, kAudioBooleanControlPropertyValue, kAudioObjectPropertyScopeGlobal);
         }
         return kAudioHardwareNoError;
@@ -342,6 +376,8 @@ private:
     static constexpr uint32_t kDefaultPair = 1u << 16 | 2u;   // ozzy_stereo_pair_pack({ 1, 2 })
     static constexpr const char* kVolumeKey = "Output Volume";
     static constexpr const char* kMuteKey = "Output Mute";
+    static constexpr const char* kInVolumeKey = "Input Volume";
+    static constexpr const char* kInMuteKey = "Input Mute";
     static constexpr const char* kInPairKey = "Input Stereo Pair";
     static constexpr const char* kOutPairKey = "Output Stereo Pair";
     // Ozzy 0.3.0's keys, one per plug-in (it drove one device): see MigrateLegacy
@@ -354,9 +390,20 @@ private:
     const struct ozzy_mono_input* mMono[OZZY_MAX_MONO_INPUTS] = {};
     unsigned int mMonoCount = 0;
     CFStringRef mUID = nullptr;
-    std::atomic<float> mVolume { 1.0f };
-    std::atomic<bool> mMuted { false };
-    float mAppliedGain = 1.0f;   // the IO thread's, where its last ramp ended
+    /* One direction's volume and mute */
+    struct Level {
+        std::atomic<float> volume { 1.0f };
+        std::atomic<bool> muted { false };
+        float appliedGain = 1.0f;   // the IO thread's, where its last ramp ended
+
+        void Apply(float* samples, uint32_t frames, uint32_t channels) {
+            float gain = muted.load(std::memory_order_relaxed) ? 0.0f : ozzy_volume_gain(volume.load(std::memory_order_relaxed));
+            if (frames) ozzy_volume_ramp(samples, frames, channels, appliedGain, gain);
+            appliedGain = gain;
+        }
+    };
+    static constexpr int kOut = 0, kIn = 1;
+    Level mLevel[2];
     std::atomic<uint32_t> mPairIn { kDefaultPair }, mPairOut { kDefaultPair };
 
     static bool IsOutput(AudioObjectPropertyScope scope) {
@@ -410,7 +457,7 @@ private:
         CFPropertyListRef mute = CopyLegacy(host, kLegacyMuteKey);
         if (!volume && !mute) return;
         bool own = false;
-        for (const char* what : { kVolumeKey, kMuteKey, kInPairKey, kOutPairKey }) {
+        for (const char* what : { kVolumeKey, kMuteKey, kInVolumeKey, kInMuteKey, kInPairKey, kOutPairKey }) {
             CFPropertyListRef v = Copy(host, what);
             if (v) { own = true; CFRelease(v); }
         }

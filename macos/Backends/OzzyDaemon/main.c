@@ -14,6 +14,7 @@
 #include <SystemConfiguration/SystemConfiguration.h>
 #include <dispatch/dispatch.h>
 #include <errno.h>
+#include <os/log.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -291,6 +292,41 @@ static void quit(void)
 
 static FILE *log_file;
 static pthread_t log_thread;
+static char log_path[1100];
+static off_t log_bytes;   /* in log_file */
+
+/* A log file this large is moved to OzzyDaemon.log.1 (replacing the one there) and started again */
+#define LOG_ROTATE_BYTES (5 * 1024 * 1024)
+
+/*
+ * A log file that can't be written, where it can still be seen: Console / `log show` (under
+ * launchd stderr goes nowhere), and stderr too while it is still the terminal's (@to_stderr)
+ */
+static void log_failure(const char *what, int err, bool to_stderr)
+{
+	if (to_stderr)
+		fprintf(stderr, "ozzy-daemon: no log file: %s %s: %s\n", what, log_path, strerror(err));
+	os_log_error(OS_LOG_DEFAULT, "ozzy-daemon: no log file: %{public}s %{public}s: %{public}s", what, log_path,
+		     strerror(err));
+}
+
+/* log_path for appending, moved to log_path.1 first once it has reached LOG_ROTATE_BYTES */
+static FILE *log_open(void)
+{
+	char old[sizeof(log_path) + 2];
+	struct stat st;
+	FILE *f;
+
+	if (stat(log_path, &st) == 0 && st.st_size >= LOG_ROTATE_BYTES) {
+		snprintf(old, sizeof(old), "%s.1", log_path);
+		if (rename(log_path, old) != 0)
+			os_log_error(OS_LOG_DEFAULT, "ozzy-daemon: can't rotate %{public}s: %{public}s", log_path,
+				     strerror(errno));
+	}
+	f = fopen(log_path, "a");
+	log_bytes = f && fstat(fileno(f), &st) == 0 ? st.st_size : 0;
+	return f;
+}
 
 /* Copy the stderr pipe (@arg, its read end) to the log file, each line with the local time */
 static void *log_main(void *arg)
@@ -305,20 +341,36 @@ static void *log_main(void *arg)
 	if (!in)
 		return NULL;
 	while (fgets(line, sizeof(line), in)) {
+		/* Rotated between lines; a file that can't be opened again drops the lines, so the
+		 * engine never blocks on a full pipe */
+		if (line_start && log_file && log_bytes >= LOG_ROTATE_BYTES) {
+			fclose(log_file);
+			log_file = log_open();
+			if (!log_file)
+				log_failure("reopening", errno, false);
+		}
+		if (!log_file) {
+			n = strlen(line);
+			line_start = n && line[n - 1] == '\n';
+			continue;
+		}
 		if (line_start) {
 			gettimeofday(&tv, NULL);
 			localtime_r(&tv.tv_sec, &tm);
 			n = strftime(stamp, sizeof(stamp), "%F %T", &tm);
 			snprintf(stamp + n, sizeof(stamp) - n, ".%03d ", (int)(tv.tv_usec / 1000));
 			fputs(stamp, log_file);
+			log_bytes += (off_t)strlen(stamp);
 		}
 		fputs(line, log_file);
 		n = strlen(line);
+		log_bytes += (off_t)n;
 		line_start = n && line[n - 1] == '\n';
 		if (line_start)
 			fflush(log_file);
 	}
-	fflush(log_file);
+	if (log_file)
+		fflush(log_file);
 	fclose(in);
 	return NULL;
 }
@@ -331,27 +383,41 @@ static void log_drain(void)
 	pthread_join(log_thread, NULL);
 }
 
-/* stderr (the engine's log) to ~/Library/Logs/OzzyDaemon.log, each line timestamped */
+/*
+ * stderr (the engine's log) to ~/Library/Logs/OzzyDaemon.log, each line timestamped, the file
+ * moved to OzzyDaemon.log.1 each time it passes LOG_ROTATE_BYTES. A failure is reported
+ * (log_failure) and leaves stderr as it was.
+ */
 static void log_to_file(void)
 {
 	const char *home = getenv("HOME");
-	char dir[1024], path[1100];
+	char dir[1024];
 	int fds[2];
 
-	if (!home)
+	if (!home) {
+		snprintf(log_path, sizeof(log_path), "~/Library/Logs/OzzyDaemon.log");
+		log_failure("no HOME for", ENOENT, true);
 		return;
+	}
 	snprintf(dir, sizeof(dir), "%s/Library/Logs", home);
-	if (mkdir(dir, 0755) != 0 && errno != EEXIST)
+	snprintf(log_path, sizeof(log_path), "%s/OzzyDaemon.log", dir);
+	if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
+		log_failure("creating the folder of", errno, true);
 		return;
-	snprintf(path, sizeof(path), "%s/OzzyDaemon.log", dir);
-	log_file = fopen(path, "a");
-	if (!log_file)
+	}
+	log_file = log_open();
+	if (!log_file) {
+		log_failure("opening", errno, true);
 		return;
+	}
 	if (pipe(fds) != 0 || dup2(fds[1], STDERR_FILENO) < 0) {
-		/* no copier: the file without timestamps */
+		/* no copier: the file without timestamps (rotated only here, at the start) */
 		fclose(log_file);
-		if (freopen(path, "a", stderr))
+		log_file = NULL;
+		if (freopen(log_path, "a", stderr))
 			setvbuf(stderr, NULL, _IOLBF, 0);
+		else
+			log_failure("reopening stderr as", errno, false);
 		return;
 	}
 	close(fds[1]);

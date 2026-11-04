@@ -71,11 +71,17 @@ static std::atomic<bool> gThreadShouldRun{false};
 static pthread_t gPollThread = nullptr;
 static CFRunLoopTimerRef gScanTimer = nullptr;
 
+/* The name of the device in @shm as a port keeps it: bounded to OzzyMidiPort::name, so the
+ * CoreMIDI device, the port and PortForDevice all see the same string */
+static const char* PortName(char (&buf)[sizeof(OzzyMidiPort::name)], const ozzy_shared_memory* shm) {
+	return OzzyCopyName(buf, shm->product_name, "Ozzy MIDI");
+}
+
 /* The device of @port for the device in @shm on USB port @locationID: the port's own (renamed if
  * it was another's), else a new one, added to the MIDI setup */
 static void SetPortDevice(OzzyMidiPort* port, const ozzy_shared_memory* shm, uint32_t locationID) {
-	char nameBuf[sizeof(shm->product_name) + 1], mfgBuf[sizeof(shm->manufacturer_name) + 1];
-	const char* name = OzzyCopyName(nameBuf, shm->product_name, "Ozzy MIDI");
+	char nameBuf[sizeof(port->name)], mfgBuf[sizeof(shm->manufacturer_name) + 1];
+	const char* name = PortName(nameBuf, shm);
 	const char* mfg = OzzyCopyName(mfgBuf, shm->manufacturer_name, "Ozzy");
 	CFStringRef deviceName = CFStringCreateWithCString(NULL, name, kCFStringEncodingUTF8);
 	CFStringRef vendorName = CFStringCreateWithCString(NULL, mfg, kCFStringEncodingUTF8);
@@ -183,7 +189,8 @@ static void AttachBackend(OzzyBackend& backend, uint64_t registryID, uint32_t lo
 	} else if (!shm->audio.hardware_present.load()) {
 		// Not started yet; try again on the next scan
 	} else {
-		port = PortForDevice(shm->product_name[0] ? shm->product_name : "Ozzy MIDI", locationID);
+		char nameBuf[sizeof(OzzyMidiPort::name)];
+		port = PortForDevice(PortName(nameBuf, shm), locationID);
 		if (!port) LogOzzyMIDIError("too many devices");
 	}
 	if (!port) {
