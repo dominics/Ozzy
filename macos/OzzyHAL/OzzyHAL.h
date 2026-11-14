@@ -60,6 +60,8 @@ public:
     // CoreAudio state
     bool IsConnected() const { return mConnected; }
     bool IsRunning() const { return mIOStarted; }
+    // Its PerformConfigurationChange is running (the engine may be mid-switch)
+    bool IsChanging() const { return mChanging.load(); }
     // Clients (AddDeviceClient / RemoveDeviceClient) and their IO. The device runs IO from the
     // first StartIO to the StopIO that balances it: AudioServerPlugIn.h has them come per client,
     // but coreaudiod (macOS 26) counts its clients itself, sending StartIO for the first and
