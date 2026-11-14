@@ -127,11 +127,11 @@ echo "     • No SIP modification needed"
 echo "     • System Extension approval required"
 echo "     • NOT YET IMPLEMENTED"
 echo ""
-echo "  3) Userspace Daemon Driver (All macOS) [Future]"
+echo "  3) Userspace Daemon Driver (Dynacord CMS 600-3)"
 echo "     • Pure userspace implementation"
 echo "     • Shared memory model"
 echo "     • No kernel extensions required"
-echo "     • NOT YET IMPLEMENTED"
+echo "     • Builds and installs the .pkg (install-userspace.command)"
 echo ""
 read -p "Select option (1, 2, or 3): " -n 1 -r INSTALL_CHOICE
 echo
@@ -144,12 +144,7 @@ if [[ $INSTALL_CHOICE == "2" ]]; then
     read -p "Press [Enter] to exit..."
     exit 0
 elif [[ $INSTALL_CHOICE == "3" ]]; then
-    echo "⚠️  Userspace Daemon installation not yet implemented."
-    echo "   This option will install the userspace daemon driver"
-    echo "   using the shared memory model in the future."
-    echo ""
-    read -p "Press [Enter] to exit..."
-    exit 0
+    exec "$DIR/install-userspace.command"
 elif [[ $INSTALL_CHOICE != "1" ]]; then
     echo "Invalid choice. Exiting."
     exit 1
