@@ -39,24 +39,29 @@ DEXT_INSTALLED=false
 DAEMON_INSTALLED=false
 LEGACY_HAL=false
 
+# Check for Userspace Daemon installation (install-userspace.command / the .pkg). It installs
+# OzzyHAL.driver too, so with it present the HAL is not evidence of the kext or a legacy install.
+if [ -f "/Library/Application Support/Ozzy/OzzyDaemon" ] || [ -f "/Library/LaunchAgents/com.ozzy.daemon.plist" ]; then
+    DAEMON_INSTALLED=true
+fi
+HAL_ALONE=false
+if [ -d "/Library/Audio/Plug-Ins/HAL/OzzyHAL.driver" ] && ! $DAEMON_INSTALLED; then
+    HAL_ALONE=true
+fi
+
 # Check for Kext-based installation
-if [ -d "/Library/Extensions/OzzyKext.kext" ] || [ -d "/Library/Audio/Plug-Ins/HAL/OzzyHAL.driver" ]; then
+if [ -d "/Library/Extensions/OzzyKext.kext" ] || $HAL_ALONE; then
     KEXT_INSTALLED=true
 fi
 
 # Check for legacy HAL + Daemon (old install-mac.command style)
-if [ -d "/Library/Audio/Plug-Ins/HAL/OzzyHAL.driver" ] || [ -f "/usr/local/bin/Ozzy" ] || [ -f "/Library/LaunchDaemons/Ozzy.plist" ]; then
+if $HAL_ALONE || [ -f "/usr/local/bin/Ozzy" ] || [ -f "/Library/LaunchDaemons/Ozzy.plist" ]; then
     LEGACY_HAL=true
 fi
 
 # Check for DriverKit installation
 if [ -d "/Applications/Ploytec Driver Extension.app" ]; then
     DEXT_INSTALLED=true
-fi
-
-# Check for Userspace Daemon installation (future)
-if [ -f "/usr/local/bin/OzzyDaemon" ]; then
-    DAEMON_INSTALLED=true
 fi
 
 # Show conflict warning if any installation exists
@@ -83,7 +88,12 @@ if $KEXT_INSTALLED || $DEXT_INSTALLED || $DAEMON_INSTALLED || $LEGACY_HAL; then
     echo "   conflicts and prevent your audio device from working!"
     echo ""
     echo "You must uninstall the existing driver first using:"
-    echo "  ./uninstall.command"
+    if $DAEMON_INSTALLED; then
+        echo "  ./uninstall-userspace.command"
+    fi
+    if $KEXT_INSTALLED || $LEGACY_HAL || $DEXT_INSTALLED; then
+        echo "  ./uninstall.command"
+    fi
     echo ""
     echo "Or manually remove:"
     if $KEXT_INSTALLED; then
@@ -100,7 +110,10 @@ if $KEXT_INSTALLED || $DEXT_INSTALLED || $DAEMON_INSTALLED || $LEGACY_HAL; then
         echo "  - /Applications/Ploytec Driver Extension.app"
     fi
     if $DAEMON_INSTALLED; then
-        echo "  - /usr/local/bin/OzzyDaemon"
+        echo "  - /Library/Application Support/Ozzy/OzzyDaemon"
+        echo "  - /Library/LaunchAgents/com.ozzy.daemon.plist"
+        echo "  - /Library/Audio/Plug-Ins/HAL/OzzyHAL.driver"
+        echo "  - /Library/Audio/MIDI Drivers/OzzyMIDI.plugin"
     fi
     echo ""
     echo "Then reboot before installing."
