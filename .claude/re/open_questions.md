@@ -139,5 +139,8 @@ related to level metering or some control protocol. Has its own pipe assignment 
   changes), 102,492 IN transfers, 8.2 M frames decoded with ploytec_decode_frame_8ch, no sample
   above -18 dBFS, first transfers after each restart included (scanner:
   `tools/linux_usbmon/in_glitch.c` in the investigation folder). nkurence's kext run didn't report
-  it either. So most likely the userspace reading path (buffer reuse, a read completing early),
-  not the device; open until a kext or Linux run on a WZ4 or CMS 600-3 shows it.
+  it either. The CMS 600-3 on Linux settled it (2026-11-04): the clicks reproduce there,
+  and a usbmon capture of a bad session shows byte 0 already stale in the EP 0x86 data the mixer
+  sends (equal to the previous frame's in 77 to 99% of bad frames, spread evenly over packet
+  slots), only at 48 and 96 kHz, with gaps clustering at 1 and 2 ms. So it is the mixer, not the
+  driver's reading path; see [TODO.md](../../TODO.md).
