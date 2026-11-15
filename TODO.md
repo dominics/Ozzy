@@ -1,6 +1,6 @@
 # TODO
 
-Open work on this fork's Dynacord CMS 600-3 support (the macOS userspace driver, the MIDI second port and the CMS rows of the shared engine and Linux module), as of 0.4.2. Upstream's own devices and its kext are out of scope here.
+Open work on this fork's Dynacord CMS 600-3 support (the macOS userspace driver, the MIDI second port and the CMS rows of the shared engine and Linux module), as of 0.4.3. Upstream's own devices and its kext are out of scope here.
 
 ## Hardware checks before tagging a release
 
