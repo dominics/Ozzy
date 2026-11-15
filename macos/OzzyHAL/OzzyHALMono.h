@@ -301,13 +301,19 @@ static OSStatus OzzyMonoSetPropertyData(Device* dev, AudioServerPlugInHostRef ho
 }
 
 /* IO, counted per mono device: its timeline restarts when its IO starts and stops, like the main
- * device's, and only then: the main device's IO doesn't touch it */
+ * device's, and only then: the main device's IO doesn't touch it. The first StartIO outside the
+ * main device's change also ends a change still marked pending: the engine has switched by then,
+ * and a request CoreAudio accepted for an idle mono device but never performed would otherwise
+ * leave it reading silence until it is unmapped. */
 template <class Device>
 static OSStatus OzzyMonoStartIO(Device* dev, uint32_t kind) {
     int i = OzzyMonoIndex(kind);
     if (!dev->Extras().Mono(i)) return kAudioHardwareBadObjectError;
     if (!dev->IsConnected()) return kAudioHardwareNotRunningError;
-    if (dev->Extras().mMonoIO[i].fetch_add(1) == 0) ozzy_timeline_restart(&dev->Extras().mMonoTimeline[i]);
+    if (dev->Extras().mMonoIO[i].fetch_add(1) == 0) {
+        if (!dev->IsChanging()) dev->Extras().mMonoChanging[i].store(false);
+        ozzy_timeline_restart(&dev->Extras().mMonoTimeline[i]);
+    }
     return kAudioHardwareNoError;
 }
 

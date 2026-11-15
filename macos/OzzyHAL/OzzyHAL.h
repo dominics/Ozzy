@@ -60,6 +60,8 @@ public:
     // CoreAudio state
     bool IsConnected() const { return mConnected; }
     bool IsRunning() const { return mIOStarted; }
+    // Its PerformConfigurationChange is running (the engine may be mid-switch)
+    bool IsChanging() const { return mChanging.load(); }
     // Clients (AddDeviceClient / RemoveDeviceClient) and their IO. The device runs IO from the
     // first StartIO to the StopIO that balances it: AudioServerPlugIn.h has them come per client,
     // but coreaudiod (macOS 26) counts its clients itself, sending StartIO for the first and
@@ -124,6 +126,9 @@ public:
     // The monitor thread: true once for a change in the stats' incidents (ozzy_stats_incidents)
     bool StatsChanged();
     bool InfoChanged();
+    // The monitor thread, after InfoChanged: the driver restarted the engine on its own, so IO
+    // restarts on its new clock (RestartIOOnNewClock) unless the layout changed (CheckLayout's)
+    void DriverRestarted(AudioServerPlugInHostRef host);
     // The custom properties the device has (kAudioObjectPropertyCustomPropertyInfoList): the
     // info, the stats, and the settings if it has any
     UInt32 CustomPropertyCount() const { return HasSettings() ? 4 : 3; }
@@ -240,6 +245,7 @@ private:
     ozzy_shared_memory* AcquireRings();
     bool Detach();   // Unmap without ending the timelines (the grace); false if not mapped
     void Resume(AudioServerPlugInHostRef host);
+    void RestartIOOnNewClock(AudioServerPlugInHostRef host, const char* why);
     bool DeviceSettingsDiffer(const ozzy_shared_memory* shm) const;
     void ApplyDeviceConfig();
     // ApplyDeviceConfig, keeping the layout it applies (mLayout); with the mapping held
