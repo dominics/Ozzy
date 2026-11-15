@@ -579,6 +579,34 @@ void OzzyHALDevice::AbortConfigurationChange(UInt64 action) {
     mRestorePending.store(false);
 }
 
+/*
+ * Monitor thread: the engine's clock started over under running IO (the driver recovered the
+ * device, woke, or came back within the grace). A new seed alone doesn't move CoreAudio: its IO
+ * goes on at the old timeline's sample times, which then fall anywhere in the rings. So ask for a
+ * configuration change: CoreAudio stops IO, PerformConfigurationChange applies the layout as it
+ * is, and IO starts again on the new clock. @why is for the log.
+ */
+void OzzyHALDevice::RestartIOOnNewClock(AudioServerPlugInHostRef host, const char* why) {
+    if (!host || !IsRunning() || mChanging.load() || mRelayoutRequested.exchange(true)) return;
+    LogOzzyHAL("device %{public}u: %{public}s; restarting IO on the new clock", mSlot, why);
+    if (host->RequestDeviceConfigurationChange(host, GetDeviceID(), kRelayoutAction, nullptr) == kAudioHardwareNoError)
+        return;
+    LogOzzyHALError("device %{public}u: the configuration change was refused; IO keeps the old timeline", mSlot);
+    mRelayoutRequested.store(false);
+}
+
+void OzzyHALDevice::DriverRestarted(AudioServerPlugInHostRef host) {
+    ozzy_shared_memory* shm = AcquireSHM();
+    bool same = false;
+    if (shm) {
+        OzzyLayout now = OzzyLayout::Of(shm);
+        std::lock_guard<std::mutex> lock(mLayoutLock);
+        same = now == mLayout;
+    }
+    ReleaseSHM();
+    if (same) RestartIOOnNewClock(host, "the driver restarted the engine");
+}
+
 OSStatus OzzyHALDevice::SetSampleRate(AudioServerPlugInHostRef host, Float64 rate) {
     uint32_t hz = (uint32_t)rate;
     if (!host) return kAudioHardwareIllegalOperationError;
@@ -713,10 +741,10 @@ void OzzyHALDevice::NotifyDeviceChanged(AudioServerPlugInHostRef host) {
 }
 
 /* Monitor thread: the driver came back as the same device within the grace, and is ready. The
- * device stays published with its IO running: the new clock is a new seed (Map rebased the
- * timelines), and a rate or device settings other than the HAL's are given back to the driver
- * through a configuration change, so CoreAudio stops IO first and the codecs never change under
- * a running IO thread. */
+ * device stays published. Its clock is a new one (Map rebased the timelines), so running IO
+ * restarts on it through a configuration change (RestartIOOnNewClock); a rate or device settings
+ * other than the HAL's are given back to the driver in the same way, so CoreAudio stops IO first
+ * and the codecs never change under a running IO thread. */
 void OzzyHALDevice::Resume(AudioServerPlugInHostRef host) {
     ozzy_shared_memory* shm = mSHM.load(std::memory_order_relaxed);
     mGraceUntilNs = 0;
@@ -728,7 +756,8 @@ void OzzyHALDevice::Resume(AudioServerPlugInHostRef host) {
         same = now == mLayout;
     }
     if (same && !DeviceSettingsDiffer(shm)) {
-        LogOzzyHAL("device %{public}u: its driver is back, same layout and settings; IO carries on", mSlot);
+        LogOzzyHAL("device %{public}u: its driver is back, same layout and settings", mSlot);
+        RestartIOOnNewClock(host, "its driver is back");
         return;
     }
     LogOzzyHAL("device %{public}u: its driver is back at %{public}u Hz with other settings or layout; restoring the HAL's through a configuration change",
@@ -1211,6 +1240,7 @@ void OzzyHAL::MonitorLoop() {
             if (mDevices[i].InfoChanged()) {
                 AudioObjectPropertyAddress infoAddr = { OZZY_PROPERTY_INFO, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
                 mHost->PropertiesChanged(mHost, mDevices[i].GetDeviceID(), 1, &infoAddr);
+                mDevices[i].DriverRestarted(mHost);
             }
         }
         if (listChanged && mHost) {
