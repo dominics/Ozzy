@@ -15,6 +15,11 @@ ENGINE   := ../engine/core/ozzy_engine.c ../engine/core/ozzy_isoc_output.c ../en
 TESTS    := test_endpoints test_settings test_info test_transfers test_midi_queue test_ump test_trace test_routing test_isoc_ring test_memory test_running_status test_layout test_stats test_latency test_clock test_cport test_isoc_input test_isoc_feedback test_watch test_short_in test_start_failures test_isoc_golden test_midi2
 HEADERS  := $(wildcard ../engine/*/*.h ../engine/devices/*/*.h ../common/*.h ../common/*.def ../common/devices/*/*.h fixtures/*.h) fake_bus.h check.h
 
+# The fork's OzzyHAL extras (macos/OzzyHAL/)
+TESTS    += test_volume test_channels test_timeline test_hal_objects
+HEADERS  += ../macos/OzzyHAL/OzzyVolume.h ../macos/OzzyHAL/OzzyChannels.h ../macos/OzzyHAL/OzzyTimeline.h \
+            ../macos/OzzyHAL/OzzyHALObjects.h
+
 all: $(addprefix $(BUILD)/,$(TESTS))
 
 $(BUILD):

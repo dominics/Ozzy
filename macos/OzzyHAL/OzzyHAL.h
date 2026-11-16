@@ -13,20 +13,28 @@
 #include "../../engine/shared/ozzy_shared_data.h"
 #include "../../common/ozzy_devices.h"
 #include "PloytecCodec.h"   // the codec function pointer types
+#include "../Shared/OzzyBackend.h"
+#include "OzzyHALExtras.h"
+#include "OzzyTimeline.h"
 
 /* The macOS 12 SDK renamed kAudioObjectPropertyElementMaster; older SDKs only have that name */
 #ifndef __MAC_12_0
 #define kAudioObjectPropertyElementMain kAudioObjectPropertyElementMaster
 #endif
 
-// One audio device per OzzyKext instance with audio, or per device with audio the userspace
-// daemon drives (macos/Shared/ozzy_daemon.h). Device slot i owns four object IDs:
-// the device (kOzzyObjectIDBase + 4i), its input stream (+1), its output stream (+2) and its
-// clock source control (+3, published only for devices with the Clock Source setting).
+// One audio device per OzzyKext instance with audio. Device slot i owns the object IDs from
+// kOzzyObjectIDBase + kOzzyObjectsPerDevice * i: the device (+0), its input stream (+1), its
+// output stream (+2), its clock source control (+3, published only for devices with the Clock
+// Source setting), then the fork's (OzzyHALExtras.h, from +4).
 // A slot keeps its IDs and UID when its device is replugged.
 #define kOzzyMaxDevices         8
+// How long a published device that lost its driver (a daemon restart, an unplug) stays published,
+// silent and on a clock at the nominal rate, for its driver to come back as the same device (UID):
+// CoreAudio's clients keep the device object then, where a withdrawal would leave them stalled
+#define kOzzyGraceNs            3000000000ULL
 #define kOzzyObjectIDBase       100
-#define kOzzyObjectsPerDevice   4
+#define kOzzyObjectsPerDevice   16
+static_assert(kOzzyObjectKinds <= kOzzyObjectsPerDevice, "a device's objects (OzzyHALObjects.h) fit its slot");
 
 class OzzyHALDevice {
 public:
@@ -37,21 +45,23 @@ public:
     AudioObjectID GetOutputStreamID() const { return GetDeviceID() + 2; }
     AudioObjectID GetClockControlID() const { return GetDeviceID() + 3; }
 
-    // Connection to the kext or the daemon (monitor thread)
+    // Connection to the driver, the kext or a daemon (monitor thread)
     bool IsMapped() const { return mSHM.load(std::memory_order_relaxed) != nullptr; }
     bool IsUsed() const { return mDeviceUID != nullptr; }   // has been published before
     uint64_t GetRegistryID() const { return mRegistryID; }
-    // A kext connection (@connect, its mapping at @address) or a daemon's device (@connect
-    // IO_OBJECT_NULL, @address mapped by ozzy_daemon_map, @daemonPID the daemon's)
-    bool Map(io_connect_t connect, mach_vm_address_t address, mach_vm_size_t size, uint64_t registryID, uint32_t locationID,
-             uint32_t daemonPID);
+    uint32_t GetLocationID() const { return mLocationID; }
+    bool Map(const OzzyBackend& backend, uint64_t registryID, uint32_t locationID);
     void Unmap();
     bool CheckHealth();
     bool UpdateConnectionState(AudioServerPlugInHostRef host);   // true if it changed
+    // Lost its driver while published, and still within kOzzyGraceNs (monitor thread)
+    bool InGrace() const { return mGraceUntilNs != 0; }
 
     // CoreAudio state
     bool IsConnected() const { return mConnected; }
     bool IsRunning() const { return mIOStarted; }
+    // Its PerformConfigurationChange is running (the engine may be mid-switch)
+    bool IsChanging() const { return mChanging.load(); }
     // Clients (AddDeviceClient / RemoveDeviceClient) and their IO. The device runs IO from the
     // first StartIO to the StopIO that balances it: AudioServerPlugIn.h has them come per client,
     // but coreaudiod (macOS 26) counts its clients itself, sending StartIO for the first and
@@ -63,6 +73,10 @@ public:
     // OZZY_PROPERTY_CLIENTS's data: a new CFArray of the clients doing IO
     CFArrayRef CopyClientsArray() const;
     HRESULT GetZeroTimeStamp(Float64* outSampleTime, UInt64* outHostTime, UInt64* outSeed);
+    // IO thread of the device or a mono device: the anchor @t (OzzyTimeline.h) hands out, from the
+    // engine's clock (struct ozzy_timestamp) while the driver serves the device, else its last one
+    // moved on at the nominal rate. False if @t has no anchor.
+    bool ServeAnchor(struct ozzy_timeline* t, uint64_t* sampleTime, uint64_t* hostTime, uint64_t* seed);
     OSStatus ioOperation(UInt32 inOperationID, UInt32 inIOBufferFrameSize, const AudioServerPlugInIOCycleInfo* inIOCycleInfo, void* ioMainBuffer);
 
     Float64 GetNominalSampleRate() const;
@@ -112,6 +126,9 @@ public:
     // The monitor thread: true once for a change in the stats' incidents (ozzy_stats_incidents)
     bool StatsChanged();
     bool InfoChanged();
+    // The monitor thread, after InfoChanged: the driver restarted the engine on its own, so IO
+    // restarts on its new clock (RestartIOOnNewClock) unless the layout changed (CheckLayout's)
+    void DriverRestarted(AudioServerPlugInHostRef host);
     // The custom properties the device has (kAudioObjectPropertyCustomPropertyInfoList): the
     // info, the stats, and the settings if it has any
     UInt32 CustomPropertyCount() const { return HasSettings() ? 4 : 3; }
@@ -119,6 +136,10 @@ public:
     // CoreAudio stopped IO for a setting or rate change: send it to the kext, re-read the
     // format, keep it
     OSStatus PerformConfigurationChange(AudioServerPlugInHostRef host, UInt64 action);
+    void AbortConfigurationChange(UInt64 action);
+    // The monitor thread: if the driver's layout is no longer the one applied (and no change is
+    // under way), ask CoreAudio for a configuration change that applies it
+    void CheckLayout(AudioServerPlugInHostRef host);
 
     AudioChannelLayout* GetPreferredChannelLayout(AudioObjectPropertyScope inScope);
     UInt32 GetPreferredChannelLayoutSize(AudioObjectPropertyScope inScope) const;
@@ -127,6 +148,13 @@ public:
     // devices without one (all Ploytec devices so far) its model and USB port
     static void MakeDeviceUID(const ozzy_shared_memory* shm, uint32_t locationID, char* buf, size_t size);
     bool HasDeviceUID(const char* uid) const;
+
+    // The fork's volume, mute, channel names and stereo pairs (OzzyHALExtras.h)
+    OzzyHALExtras& Extras() { return mExtras; }
+    // IO thread of a mono input device (OzzyHALMono.h): device input @channel (1-based) of the
+    // cycle into @out, decoded @chunk frames at a time through @scratch (@chunk x 16 floats)
+    void ReadInputChannel(uint32_t channel, UInt32 frames, const AudioServerPlugInIOCycleInfo* cycle, float* out,
+                          float* scratch, uint32_t chunk);
 
 private:
     uint32_t mSlot = 0;
@@ -139,6 +167,7 @@ private:
     uint32_t mOutRingFrames = 1;   // frames in the shared memory's output ring (the engine's layout)
     uint32_t mInRingFrames = 1;
     uint32_t mTimestampFrames = OZZY_TIMESTAMP_FRAMES;   // between the engine's clock anchors
+    uint64_t mPeriodHost = 0;      // host ticks between them at the nominal rate (ApplyDeviceConfig)
     uint32_t mSafetyOffset = 160; // frames the engine reads output ahead of the clock
     uint32_t mInputSafetyOffset = 160;   // frames behind the clock input is complete
     uint32_t mInputChannels = 8;    // published by the kext per model (16 for the WZ4)
@@ -170,6 +199,15 @@ private:
 
     bool mConnected = false;     // published to CoreAudio
     bool mIOStarted = false;
+    // The grace after losing the driver while published (monitor thread): its end in
+    // CLOCK_UPTIME_RAW ns, 0 when not in one; and whether a driver has been mapped in it since
+    uint64_t mGraceUntilNs = 0;
+    bool mRemapped = false;
+    // The IO thread has served a real anchor from the current mapping: its IO may use the rings
+    std::atomic<bool> mSynced { false };
+    // A driver that came back within the grace runs another layout or settings, and the
+    // configuration change that applies the HAL's is under way: IO silent, clock moved on
+    std::atomic<bool> mRestorePending { false };
 
     struct Client {
         UInt32 id;
@@ -185,25 +223,39 @@ private:
     kern_return_t StartDeviceIO();
     void StopDeviceIO();
     void NotifyClients(AudioServerPlugInHostRef host);
-    uint32_t mTimestampSeed = 1;
+    // GetZeroTimeStamp's anchors and seed (OzzyTimeline.h)
+    struct ozzy_timeline mTimeline = { 1, 0, 0, 0, 0 };
 
-    // Kext or daemon connection. The monitor thread maps and unmaps; CoreAudio's threads use the
+    // Kext connection. The monitor thread maps and unmaps; CoreAudio's threads use the
     // mapping between AcquireSHM and ReleaseSHM, and Unmap waits for them to finish.
     std::atomic<ozzy_shared_memory*> mSHM { nullptr };
     std::atomic<uint32_t> mSHMUsers { 0 };
-    io_connect_t mKextConnect = IO_OBJECT_NULL;
-    mach_vm_address_t mKextMapAddress = 0;
-    mach_vm_size_t mKextMapSize = 0;
-    uint64_t mRegistryID = 0;
+    OzzyBackend mBackend;       // the kext's user client or a daemon's device (OzzyBackend.h)
+    uint64_t mRegistryID = 0;   // the OzzyKext instance's, or the USB device's for a daemon
     uint32_t mLocationID = 0;   // USB port (IOUSBHostDevice locationID)
     uint32_t mSessionID = 0;
-    uint32_t mDaemonPID = 0;    // the daemon's device (no kext connection); 0: the kext's
 
     alignas(16) uint8_t mChannelLayoutBuffer[0x50C];
+    OzzyHALExtras mExtras;
 
     ozzy_shared_memory* AcquireSHM();
     void ReleaseSHM();
+    // AcquireSHM for the IO path: null unless the driver serves the device (mSynced, no restore
+    // pending); ReleaseSHM after it either way
+    ozzy_shared_memory* AcquireRings();
+    bool Detach();   // Unmap without ending the timelines (the grace); false if not mapped
+    void Resume(AudioServerPlugInHostRef host);
+    void RestartIOOnNewClock(AudioServerPlugInHostRef host, const char* why);
+    bool DeviceSettingsDiffer(const ozzy_shared_memory* shm) const;
     void ApplyDeviceConfig();
+    // ApplyDeviceConfig, keeping the layout it applies (mLayout); with the mapping held
+    void ApplyLayout(const ozzy_shared_memory* shm);
+    OzzyLayout mLayout = {};           // the layout ApplyLayout applied last (mLayoutLock)
+    std::mutex mLayoutLock;
+    std::atomic<bool> mChanging { false };            // PerformConfigurationChange is running
+    std::atomic<bool> mRelayoutRequested { false };   // CheckLayout asked CoreAudio for a change
+    bool mLayoutDiffers = false;       // CheckLayout's last poll saw mDifferentLayout (monitor thread)
+    OzzyLayout mDifferentLayout = {};
     kern_return_t CallSetRate(uint32_t rate);
     kern_return_t CallApplySetting(unsigned int id, uint32_t value);
     CFStringRef CopySettingKey(unsigned int id) const;
@@ -246,7 +298,7 @@ private:
     // The userspace daemon's devices (macos/Shared/ozzy_daemon.h), next to the kext's
     const struct ozzy_daemon_table* mDaemonTable = nullptr;
     void ScanDaemon();
-    void ConnectDaemon(const struct ozzy_daemon_entry& entry);
+    void Attach(OzzyBackend& backend, uint64_t registryID, uint32_t locationID);
     OzzyHALDevice* SlotForUID(const char* uid);
 };
 
