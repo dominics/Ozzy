@@ -1,6 +1,8 @@
 #include "OzzyMIDI.h"
 #include "../../engine/shared/ozzy_shared_data.h"
 #include "../../common/midi_ump.h"
+#include "../../common/ozzy_devices.h"
+#include "../../common/devices/ploytec/dynacord_midi.h"
 #include "../Shared/OzzyLog.h"
 #include "../Shared/OzzyKextClient.h"
 #include "../Shared/ozzy_daemon.h"
@@ -23,6 +25,12 @@
  * there while holding its own lock, and those calls take that lock too, so making them on the
  * poll thread deadlocks Stop's join. The poll thread only drains the input rings and calls
  * MIDIReceived.
+ *
+ * A device with a second MIDI port (OZZY_QUIRK_MIDI_PORT2: the CMS 600-3's "SystemCtrl", the
+ * mixer's FX control) gets a second entity on its MIDI device, on the shared memory's midi2
+ * rings: entity 0 is then "USB-MIDI" (the DIN sockets), entity 1 "SystemCtrl". A destination's
+ * refCon2 is its entity's index, so Send can tell them apart. Port 2's MIDI out needs no
+ * OZZY_METHOD_MIDI_OUT_PENDING: the isoc engine sends a MIDI transfer each millisecond anyway.
  */
 #define kMaxPorts 8
 
@@ -30,6 +38,8 @@
 // device takes 2500 bytes/s and the ring holds 1 KB. 64 KB like the official driver's MIDI
 // queue (26 s of MIDI).
 #define kPendingSize 65536
+// The second port's (FX control, so less)
+#define kPending2Size 8192
 
 struct OzzyMidiPort {
 	// Connection to one OzzyKext instance or daemon device; shm is null while disconnected
@@ -54,6 +64,13 @@ struct OzzyMidiPort {
 	// bytes are reported once it drains
 	struct ozzy_midi_queue pending;
 	Byte pendingBuf[kPendingSize];
+
+	// The second MIDI port (OZZY_QUIRK_MIDI_PORT2): entity 1's source, kept across reconnects
+	// like the device; port2 while connected to a device that has it (gPortLock)
+	MIDIEndpointRef source2;
+	bool port2;
+	struct ozzy_midi_queue pending2;
+	Byte pending2Buf[kPending2Size];
 };
 
 /*
@@ -65,6 +82,7 @@ struct OzzyMidiPort {
 struct OzzyMidiParser {
 	uint32_t generation;
 	struct midi_ump_encoder encoder;
+	struct midi_ump_encoder encoder2;   // the second port's
 };
 
 static OzzyMidiPort gPorts[kMaxPorts];
@@ -81,6 +99,49 @@ static pthread_mutex_t gPortLock = PTHREAD_MUTEX_INITIALIZER;
 static std::atomic<bool> gThreadShouldRun{false};
 static pthread_t gPollThread = nullptr;
 static CFRunLoopTimerRef gScanTimer = nullptr;
+
+/* Whether the device in @shm has a second MIDI port */
+static bool HasPort2(const ozzy_shared_memory* shm) {
+	const struct ozzy_device* model = ozzy_device_lookup(shm->vendor_id, shm->product_id);
+	return model && (model->quirks & OZZY_QUIRK_MIDI_PORT2);
+}
+
+static void SetName(MIDIObjectRef obj, CFStringRef name) {
+	MIDIObjectSetStringProperty(obj, kMIDIPropertyName, name);
+}
+
+/* Destination refCon2 of entity @index */
+static void* EntityRefCon(int index) {
+	return (void*)(intptr_t)index;
+}
+
+/* Give @port's device the entities for a device with (@two) or without a second MIDI port:
+ * entity 0 stays (connections to it survive) and is renamed, a second is added, renamed or
+ * removed. Main thread. */
+static void SetPortEntities(OzzyMidiPort* port, bool two) {
+	ItemCount have = MIDIDeviceGetNumberOfEntities(port->device);
+	if (have < 1) return;
+	SetName(MIDIDeviceGetEntity(port->device, 0), two ? CFSTR(DYNACORD_MIDI_PORT_USB_NAME) : CFSTR("MIDI"));
+	if (!two) {
+		while (have-- > 1) MIDIDeviceRemoveEntity(port->device, MIDIDeviceGetEntity(port->device, have));
+		port->source2 = 0;
+		return;
+	}
+	MIDIEntityRef ent = 0;
+	if (have >= 2) {
+		ent = MIDIDeviceGetEntity(port->device, 1);
+		SetName(ent, CFSTR(DYNACORD_MIDI_PORT_SYSCTRL_NAME));
+	} else {
+		OSStatus err = MIDIDeviceAddEntity(port->device, CFSTR(DYNACORD_MIDI_PORT_SYSCTRL_NAME), false, 1, 1, &ent);
+		if (err != noErr) {
+			LogOzzyMIDIError("failed to add the second MIDI entity: %{public}d", (int)err);
+			port->source2 = 0;
+			return;
+		}
+	}
+	MIDIEndpointSetRefCons(MIDIEntityGetDestination(ent, 0), port, EntityRefCon(1));
+	port->source2 = MIDIEntityGetSource(ent, 0);
+}
 
 /* The device of @port for the device in @shm on USB port @locationID: the port's own (renamed if
  * it was another's), else a new one, added to the MIDI setup */
@@ -111,6 +172,7 @@ static void SetPortDevice(OzzyMidiPort* port, const ozzy_shared_memory* shm, uin
 		}
 	}
 	if (port->device) {
+		SetPortEntities(port, HasPort2(shm));
 		MIDIObjectSetIntegerProperty(port->device, kLocationProperty, (SInt32)locationID);
 		MIDIObjectSetIntegerProperty(port->device, kMIDIPropertyOffline, 0);
 	}
@@ -136,6 +198,8 @@ static void UnmapPort(OzzyMidiPort* port) {
 	port->shm = nullptr;
 	port->registryID = 0;
 	port->pending.head = port->pending.tail = 0;
+	port->port2 = false;
+	port->pending2.head = port->pending2.tail = 0;
 	pthread_mutex_unlock(&gPortLock);
 }
 
@@ -206,6 +270,9 @@ static bool AttachPort(ozzy_shared_memory* shm, io_connect_t connect, mach_vm_si
 	port->generation++;
 	port->pending.buf = port->pendingBuf;
 	port->pending.mask = kPendingSize - 1;
+	port->pending2.buf = port->pending2Buf;
+	port->pending2.mask = kPending2Size - 1;
+	port->port2 = port->source2 != 0;
 	port->shm = shm;
 	pthread_mutex_unlock(&gPortLock);
 	LogOzzyMIDI("connected to '%{public}s' through %{public}s (session: 0x%{public}08X)", port->name,
@@ -315,24 +382,9 @@ static void InListAdd(OzzyMidiInList* in, const Byte* data, unsigned int length)
 	if (packet) in->packet = packet;
 }
 
-/* Drain the port's midiIn ring into CoreMIDI. Returns true if there was data. */
-static bool DrainInput(OzzyMidiPort* port, OzzyMidiParser* parser) {
-	Byte bytes[OZZY_MIDI_RING_SIZE];
-	uint32_t count = 0;
-
-	// Copy the ring out under the lock, so the main thread can't unmap it meanwhile
-	pthread_mutex_lock(&gPortLock);
-	ozzy_shared_memory* shm = port->shm;
-	MIDIEndpointRef source = port->source;
-	uint32_t generation = port->generation;
-	if (shm) count = ozzy_midi_ring_pop(&shm->midi_in, bytes, sizeof(bytes));
-	pthread_mutex_unlock(&gPortLock);
-
-	if (parser->generation != generation) {
-		*parser = OzzyMidiParser{};
-		parser->generation = generation;
-	}
-	if (!count || !source) return count != 0;
+/* @count bytes from the device through @encoder to @source (0: dropped) as complete messages */
+static void ReceiveBytes(struct midi_ump_encoder* encoder, MIDIEndpointRef source, const Byte* bytes, uint32_t count) {
+	if (!count || !source) return;
 
 	OzzyMidiInList in;
 	in.source = source;
@@ -340,7 +392,7 @@ static bool DrainInput(OzzyMidiPort* port, OzzyMidiParser* parser) {
 
 	for (uint32_t i = 0; i < count; i++) {
 		uint32_t words[MIDI_UMP_ENCODE_MAX_WORDS];
-		unsigned int n = midi_ump_encode_byte(&parser->encoder, 0, bytes[i], words);
+		unsigned int n = midi_ump_encode_byte(encoder, 0, bytes[i], words);
 
 		for (unsigned int w = 0; w < n; w += midi_ump_words(words[w])) {
 			uint8_t msg[8];
@@ -348,7 +400,29 @@ static bool DrainInput(OzzyMidiPort* port, OzzyMidiParser* parser) {
 		}
 	}
 	InListSend(&in);
-	return true;
+}
+
+/* Drain the port's input rings into CoreMIDI. Returns true if there was data. */
+static bool DrainInput(OzzyMidiPort* port, OzzyMidiParser* parser) {
+	Byte bytes[OZZY_MIDI_RING_SIZE], bytes2[OZZY_MIDI_RING_SIZE];
+	uint32_t count = 0, count2 = 0;
+
+	// Copy the rings out under the lock, so the main thread can't unmap them meanwhile
+	pthread_mutex_lock(&gPortLock);
+	ozzy_shared_memory* shm = port->shm;
+	MIDIEndpointRef source = port->source, source2 = port->source2;
+	uint32_t generation = port->generation;
+	if (shm) count = ozzy_midi_ring_pop(&shm->midi_in, bytes, sizeof(bytes));
+	if (shm && port->port2) count2 = ozzy_midi_ring_pop(&shm->midi2_in, bytes2, sizeof(bytes2));
+	pthread_mutex_unlock(&gPortLock);
+
+	if (parser->generation != generation) {
+		*parser = OzzyMidiParser{};
+		parser->generation = generation;
+	}
+	ReceiveBytes(&parser->encoder, source, bytes, count);
+	ReceiveBytes(&parser->encoder2, source2, bytes2, count2);
+	return count || count2;
 }
 
 /* Move waiting MIDI out into the shared ring as the kext drains it. Returns true if any moved. */
@@ -362,6 +436,12 @@ static bool FlushMidiOut(OzzyMidiPort* port) {
 	if (!ozzy_midi_queue_pending(&port->pending)) {
 		dropped = port->pending.dropped;
 		port->pending.dropped = 0;
+	}
+	if (port->shm && port->port2 && ozzy_midi_queue_pending(&port->pending2))
+		moved |= ozzy_midi_queue_write(&port->shm->midi2_out, &port->pending2, nullptr, 0);
+	if (!ozzy_midi_queue_pending(&port->pending2)) {
+		dropped += port->pending2.dropped;
+		port->pending2.dropped = 0;
 	}
 	pthread_mutex_unlock(&gPortLock);
 
@@ -436,6 +516,13 @@ static void AdoptDevice(MIDIDeviceRef dev) {
 	port->locationID = (uint32_t)location;
 	port->source = MIDIEntityGetSource(ent, 0);
 	MIDIEndpointSetRefCons(MIDIEntityGetDestination(ent, 0), port, nullptr);
+	if (MIDIDeviceGetNumberOfEntities(dev) >= 2) {   // a second port's entity
+		MIDIEntityRef ent2 = MIDIDeviceGetEntity(dev, 1);
+		if (MIDIEntityGetNumberOfSources(ent2) >= 1 && MIDIEntityGetNumberOfDestinations(ent2) >= 1) {
+			MIDIEndpointSetRefCons(MIDIEntityGetDestination(ent2, 0), port, EntityRefCon(1));
+			port->source2 = MIDIEntityGetSource(ent2, 0);
+		}
+	}
 	MIDIObjectSetIntegerProperty(dev, kMIDIPropertyOffline, 1);
 	LogOzzyMIDI("'%{public}s' from the MIDI setup", port->name);
 }
@@ -507,25 +594,30 @@ static OSStatus Stop(MIDIDriverRef self) {
  * with the next PCM packet anyway; the Xone:1D sends only when told. */
 static OSStatus Send(MIDIDriverRef self, const MIDIPacketList *pktlist, void *destRefCon1, void *destRefCon2) {
 	OzzyMidiPort* port = (OzzyMidiPort*)destRefCon1;
+	bool second = destRefCon2 == EntityRefCon(1);   // the second port's entity
 	if (!port) return kMIDINoConnection;
 
 	pthread_mutex_lock(&gPortLock);
-	if (!port->shm) {
+	if (!port->shm || (second && !port->port2)) {
 		pthread_mutex_unlock(&gPortLock);
 		return kMIDINoConnection;
 	}
 
-	uint32_t droppedBefore = port->pending.dropped;
+	ozzy_midi_ring* ring = second ? &port->shm->midi2_out : &port->shm->midi_out;
+	struct ozzy_midi_queue* pending = second ? &port->pending2 : &port->pending;
+	uint32_t droppedBefore = pending->dropped;
 	const MIDIPacket *packet = &pktlist->packet[0];
 	for (unsigned int i = 0; i < pktlist->numPackets; ++i) {
-		ozzy_midi_queue_write(&port->shm->midi_out, &port->pending, packet->data, packet->length);
+		ozzy_midi_queue_write(ring, pending, packet->data, packet->length);
 		packet = MIDIPacketNext(packet);
 	}
-	NotifyMidiOut(port);
-	bool startedDropping = droppedBefore == 0 && port->pending.dropped != 0;
+	if (!second) NotifyMidiOut(port);
+	bool startedDropping = droppedBefore == 0 && pending->dropped != 0;
 	pthread_mutex_unlock(&gPortLock);
 
-	if (startedDropping) LogOzzyMIDIError("'%{public}s': MIDI out queue full (64 KB), dropping", port->name);
+	if (startedDropping)
+		LogOzzyMIDIError("'%{public}s': MIDI out queue full (%{public}u KB), dropping", port->name,
+		                 (second ? kPending2Size : kPendingSize) / 1024);
 	return noErr;
 }
 
