@@ -132,15 +132,18 @@ related to level metering or some control protocol. Has its own pipe assignment 
 - **A wrong byte 0 in Ploytec PCM IN frames, seen only by userspace macOS drivers.** Byte 0 of
   the 64-byte input frame holds bit 23 of the first channels, so a wrong byte 0 is a full-scale
   click on a quiet input. nkurence (#85, WZ4, his IOUSBLib harness): one frame near the start of a
-  capture, bit 23 flipped on several odd channels, 2 of 6 captures. dominics/Ozzy TODO.md
+  capture, bit 23 flipped on several odd channels, 2 of 6 captures. [TODO.md](../../TODO.md)
   (CMS 600-3, OzzyDaemon over IOUSBLib): byte 0 repeating the previous frame's in ~8% of frames in
   some 48 kHz sessions started right after a rate change, gone after another change. Not on the
   DB4 with the Linux module (2026-11-01): usbmon of 9 starts (attach, PipeWire's change, 7 rate
   changes), 102,492 IN transfers, 8.2 M frames decoded with ploytec_decode_frame_8ch, no sample
   above -18 dBFS, first transfers after each restart included (scanner:
   `tools/linux_usbmon/in_glitch.c` in the investigation folder). nkurence's kext run didn't report
-  it either. So most likely the userspace reading path (buffer reuse, a read completing early),
-  not the device; open until a kext or Linux run on a WZ4 or CMS 600-3 shows it.
+  it either. The CMS 600-3 on Linux settled it (2026-11-04): the clicks reproduce there,
+  and a usbmon capture of a bad session shows byte 0 already stale in the EP 0x86 data the mixer
+  sends (equal to the previous frame's in 77 to 99% of bad frames, spread evenly over packet
+  slots), only at 48 and 96 kHz, with gaps clustering at 1 and 2 ms. So it is the mixer, not the
+  driver's reading path; see [TODO.md](../../TODO.md).
 
 - **One short PCM IN transfer at some starts: the DB4 starts its IN stream with half a packet**
   (fw 1.4.1, Linux usbmon, 2026-11-14, log line from 022bed5). On an attach, with Ozzy's 4 IN
