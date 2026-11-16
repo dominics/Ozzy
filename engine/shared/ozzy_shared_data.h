@@ -29,7 +29,7 @@ typedef std::atomic<bool>     ozzy_atomic_bool;
 
 #define OZZY_SHARED_MEM_NAME            "/ozzy_shared_mem"
 #define OZZY_MAGIC                      0x4F5A5A59   /* "OZZY" */
-#define OZZY_SHARED_VERSION             13           /* bump when ozzy_shared_memory changes layout */
+#define OZZY_SHARED_VERSION             14           /* bump when ozzy_shared_memory changes layout */
 
 /* OzzyKext user client: external method selectors */
 #define OZZY_METHOD_MIDI_OUT_PENDING    0            /* OzzyMIDI queued bytes in midi_out */
@@ -214,6 +214,11 @@ struct ozzy_shared_memory {
 	uint8_t isoc_in_usb_buffer[OZZY_ISOC_IN_BUFFER_SIZE];
 
 	OZZY_CACHE_ALIGN struct ozzy_audio_buffer audio;
+
+	/* A second MIDI port, the same way round (OZZY_QUIRK_MIDI_PORT2: the CMS 600-3's
+	 * SystemCtrl); unused on other devices */
+	struct ozzy_midi_buffer midi2_out;
+	struct ozzy_midi_buffer midi2_in;
 };
 
 /*

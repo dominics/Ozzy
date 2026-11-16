@@ -1,4 +1,4 @@
-version 13 size 2117504
+version 14 size 2120064
 magic                              0
 version                            4
 session_id                         8
@@ -44,6 +44,14 @@ audio.timestamp.host_time          20136
 audio.hal_write_position           20224
 audio.input_buffer                 20296
 audio.output_buffer                1068872
+midi2_out                          2117504
+midi2_out.write_index              2117504
+midi2_out.read_index               2117632
+midi2_out.buffer                   2117700
+midi2_in                           2118784
+midi2_in.write_index               2118784
+midi2_in.read_index                2118912
+midi2_in.buffer                    2118980
 info version 2 size 176
 info.version                       0
 info.size                          4

@@ -6,6 +6,7 @@
  */
 
 #include "ploytec_isoc_engine.h"
+#include "ploytec_midi2.h"
 #include "ploytec_io.h"
 #include "../../../common/devices/ploytec/ploytec_handshake.h"
 #include "../../shared/ozzy_log.h"
@@ -240,6 +241,8 @@ static void isoc_complete(struct ozzy_engine *e, uint8_t pipe, void *xfer, int s
 		if (status == 0)
 			ploytec_midi_in_to_ring(&pe->midi, shm, ploytec_midi_in_slot(e, idx),
 						bytes < PLOYTEC_MIDI_IN_SLOT ? bytes : PLOYTEC_MIDI_IN_SLOT);
+		if (status == 0 && pe->midi2)
+			ploytec_midi2_in(shm, ploytec_midi_in_slot(e, idx), bytes);
 		submit_midi_in(pe, idx);
 	} else if (pipe == pe->midi_out_addr) {
 		if (status != 0)
@@ -268,6 +271,8 @@ static void isoc_timer(struct ozzy_engine *e)
 	buf = e->mem.midi_out;
 	n = ploytec_midi_xfer_begin(&pe->midi, buf);
 	ozzy_midi_ring_pop(&shm->midi_out, buf, n);
+	if (pe->midi2)
+		ploytec_midi2_out(shm, buf, n);
 
 	if (!ozzy_bus_submit(e->bus, pe->midi_out_addr, buf, pe->midi.xfer_size, NULL)) {
 		ploytec_log("isoc: MIDI output submission failed");
@@ -328,6 +333,7 @@ void ploytec_isoc_engine_init(struct ploytec_isoc_engine *pe, const struct ozzy_
 
 	pe->base.ops = &ploytec_isoc_engine_ops;
 	pe->base.model = model;
+	pe->midi2 = ozzy_device_has_midi2(model);
 	pe->default_rate = rates[ozzy_device_rates(model, rates) - 1];
 	pe->sample_rate = pe->default_rate;
 	pe->in_frames = ozzy_pcm_frames(true, ozzy_engine_setting_default(&pe->base, OZZY_SETTING_PCM_IN_FRAMES));

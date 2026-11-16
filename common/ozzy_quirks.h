@@ -169,6 +169,13 @@ enum ozzy_quirk {
 	 * digital out (4 in / 6 out); with digital in Ozzy sends Tascam's block as captured.
 	 */
 	OZZY_QUIRK_US366_ROUTING = 1u << 22,
+
+	/*
+	 * Dynacord CMS 600-3: a second MIDI port ("SystemCtrl", FX control) in bytes 4-7 of the
+	 * M4_C1 MIDI frame (common/devices/ploytec/dynacord_midi.h), on the shared memory's
+	 * midi2_in / midi2_out rings (engine/devices/ploytec/ploytec_midi2.h).
+	 */
+	OZZY_QUIRK_MIDI_PORT2 = 1u << 23,
 };
 
 #endif /* OZZY_QUIRKS_H */

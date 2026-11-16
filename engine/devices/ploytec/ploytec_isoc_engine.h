@@ -28,6 +28,7 @@ extern "C" {
  * @default_rate:  the highest rate (what start asks for without a request)
  * @*_addr etc.:   the endpoints as the platform found them
  * @midi_out_busy: one MIDI OUT transfer in flight
+ * @midi2:         the model has a second MIDI port (OZZY_QUIRK_MIDI_PORT2, ploytec_midi2.h)
  */
 struct ploytec_isoc_engine {
 	struct ozzy_engine base;
@@ -42,6 +43,7 @@ struct ploytec_isoc_engine {
 
 	struct ozzy_isoc_output output;
 	bool midi_out_busy;
+	bool midi2;
 	ploytec_frame_fn decode;   /* PCM in, for the model's channels */
 	uint32_t in_frames;        /* frames per PCM in transfer this run (OZZY_SETTING_PCM_IN_FRAMES) */
 	uint32_t in_queue;         /* PCM in transfers in flight this run (OZZY_SETTING_PCM_IN_QUEUE) */
