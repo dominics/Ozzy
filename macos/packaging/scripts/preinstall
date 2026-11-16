@@ -1,0 +1,23 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+# The kext driver (macos/install.command) claims the same devices and installs its own OzzyHAL and
+# OzzyMIDI; this package leaves it alone and stops instead.
+if [ -d /Library/Extensions/OzzyKext.kext ] || [ -f /Library/LaunchDaemons/com.ozzy.kext.load.plist ]; then
+	echo "The Ozzy kext driver is installed. Run its macos/uninstall.command and reboot first." >&2
+	exit 1
+fi
+if [ -f /usr/local/bin/Ozzy ] || [ -f /Library/LaunchDaemons/Ozzy.plist ]; then
+	echo "A legacy Ozzy daemon install is present. Run uninstall.command and reboot first." >&2
+	exit 1
+fi
+# launchd runs /usr/local/bin/OzzyDaemon as root: anyone who can write a directory on its path
+# could put their own program there
+for d in /usr /usr/local /usr/local/bin; do
+	[ -d "$d" ] || continue
+	if [ "$(stat -f %u "$d")" != 0 ] || [ -n "$(find "$d" -maxdepth 0 -perm -g+w -o -maxdepth 0 -perm -o+w)" ]; then
+		echo "$d is not writable by root alone (owner $(stat -f %Su:%Sg "$d"), mode $(stat -f %Sp "$d")). Run sudo chown root:wheel $d and sudo chmod go-w $d, then install again." >&2
+		exit 1
+	fi
+done
+"$(dirname "$0")/uninstall.sh" --for-upgrade
