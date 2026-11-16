@@ -98,6 +98,20 @@ struct ozzy_daemon_reply {
 #include <signal.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/stat.h>
+
+/*
+ * Whether the object open at @fd is the daemon's: owned by root, at least @size bytes, and, with
+ * @private, writable by its owner alone. The names are public, so any local user could create
+ * one before the daemon does (or after it quit) and hand the clients a table or device of theirs.
+ */
+static inline bool ozzy_daemon_object_trusted(int fd, size_t size, bool private_write)
+{
+	struct stat st;
+
+	return fstat(fd, &st) == 0 && st.st_uid == 0 && (uint64_t)st.st_size >= size &&
+	       (!private_write || !(st.st_mode & (S_IWGRP | S_IWOTH)));
+}
 
 /* Whether process @pid runs (it is root's: EPERM means it does) */
 static inline bool ozzy_daemon_alive(uint32_t pid)
@@ -105,7 +119,7 @@ static inline bool ozzy_daemon_alive(uint32_t pid)
 	return pid && (kill((pid_t)pid, 0) == 0 || errno == EPERM);
 }
 
-/* The table of a running daemon, mapped read-only; NULL if there is none */
+/* The table of a running daemon, mapped read-only; NULL if there is none, or it isn't root's */
 static inline const struct ozzy_daemon_table *ozzy_daemon_table_open(void)
 {
 	int fd = shm_open(OZZY_DAEMON_TABLE_NAME, O_RDONLY);
@@ -113,6 +127,10 @@ static inline const struct ozzy_daemon_table *ozzy_daemon_table_open(void)
 
 	if (fd < 0)
 		return NULL;
+	if (!ozzy_daemon_object_trusted(fd, sizeof(struct ozzy_daemon_table), true)) {
+		close(fd);
+		return NULL;
+	}
 	p = mmap(NULL, sizeof(struct ozzy_daemon_table), PROT_READ, MAP_SHARED, fd, 0);
 	close(fd);
 	return p == MAP_FAILED ? NULL : (const struct ozzy_daemon_table *)p;
@@ -148,7 +166,7 @@ static inline bool ozzy_daemon_table_read(const struct ozzy_daemon_table *t, str
 	return false;
 }
 
-/* Device @e's shared memory, read-write; NULL if it is gone or no longer @e's session */
+/* Device @e's shared memory, read-write; NULL if it is gone, no longer @e's session or not root's */
 static inline struct ozzy_shared_memory *ozzy_daemon_map(const struct ozzy_daemon_entry *e)
 {
 	char name[sizeof(e->shm_name) + 1];
@@ -161,6 +179,11 @@ static inline struct ozzy_shared_memory *ozzy_daemon_map(const struct ozzy_daemo
 	fd = shm_open(name, O_RDWR);
 	if (fd < 0)
 		return NULL;
+	/* 0666 so that coreaudiod and MIDIServer can map it, but created by the root daemon */
+	if (!ozzy_daemon_object_trusted(fd, sizeof(struct ozzy_shared_memory), false)) {
+		close(fd);
+		return NULL;
+	}
 	p = mmap(NULL, sizeof(struct ozzy_shared_memory), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	close(fd);
 	if (p == MAP_FAILED)

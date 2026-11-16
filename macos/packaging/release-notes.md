@@ -11,6 +11,7 @@ This release is rebuilt on upstream Ozzy's own userspace daemon, which upstream 
 - 12 ms of output is queued, not 24 ms, so playback latency is lower. It ran without a dropout on the mixer at 44.1, 48 and 96 kHz.
 - The driver starts the mixer at 96 kHz and then switches to the rate set in Audio MIDI Setup.
 - If the mixer stops streaming, the driver restarts it, as before. A restart that fails now leaves it stopped until you replug it, where 0.4.x kept retrying.
+- The Core Audio and MIDI plug-ins use the daemon's device list and devices only if root created them, so another local user can't stand in for the daemon.
 - Upstream fixes come with it, among them better handling of short input transfers and of the mixer's feedback at start.
 
 ### Upgrading
