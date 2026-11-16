@@ -1,5 +1,35 @@
 # 🎛️ Ozzy - USB Audio & MIDI Driver for Non-Class Compliant Devices
 
+<!-- fork: dominics/Ozzy -->
+## About this fork
+
+This is [dominics/Ozzy](https://github.com/dominics/Ozzy), a fork of [mischa85/Ozzy](https://github.com/mischa85/Ozzy) for the Dynacord CMS 600-3 mixer (USB ID `0562:03eb`) on macOS. The fork's own work lives on its `release` branch; the rest of this README is upstream's.
+
+**A package of the userspace driver.** Upstream's macOS kext driver means lowering the Mac's security settings on Apple silicon. Upstream's userspace daemon (install option 3 below) doesn't: it talks to the mixer through macOS's userspace USB API and feeds the same Core Audio (OzzyHAL) and MIDI (OzzyMIDI) plug-ins, with no kext and no changes to System Integrity Protection. This fork packages it as a signed-for-local-use installer and a Homebrew cask. For now the package is meant for the CMS 600-3.
+
+**CMS 600-3 extras.** Both of the mixer's MIDI ports ("USB-MIDI" for the DIN sockets, "SystemCtrl" for FX control), named channels, output and input volume and mute, the MON and AUX inputs as separate devices, and devices that ride out a daemon restart or a quick replug. The protocol was reverse-engineered from USB captures, kept at [dominics/dynacord-cms-pcap](https://github.com/dominics/dynacord-cms-pcap).
+
+### Install (CMS 600-3, Apple silicon, macOS 26.1 or later)
+
+```bash
+brew install --cask dominics/tap/ozzy-cms600
+```
+
+Or download `Ozzy-CMS600-<version>.pkg` from the [releases page](https://github.com/dominics/Ozzy/releases). The package is not signed with an Apple Developer ID, so Gatekeeper blocks it the first time you open it. Double-click it and close the warning, then open System Settings > Privacy & Security, click **Open Anyway** next to the message about the package, and confirm the warnings that follow. Or skip Gatekeeper from Terminal with `sudo installer -pkg Ozzy-CMS600-*.pkg -target /`.
+
+From source: `macos/packaging/build-pkg.sh` builds the same package into `macos/build/pkg/`. Upstream's `macos/install.command` option 3 installs the same daemon and plug-ins at the same paths.
+
+The package installs `/Library/Audio/Plug-Ins/HAL/OzzyHAL.driver`, `/Library/Audio/MIDI Drivers/OzzyMIDI.plugin` and `/usr/local/bin/OzzyDaemon`, which `/Library/LaunchDaemons/com.ozzy.daemon.plist` runs as root. It replaces a 0.4.x install, whose daemon ran as a per-user LaunchAgent. It refuses to install over upstream's kext driver: both drivers claim the mixer, so run `macos/uninstall.command` and reboot first.
+
+Uninstall: `brew uninstall --cask ozzy-cms600` or `sudo "/Library/Application Support/Ozzy/uninstall.sh"`.
+
+**Power-cycle quirk**: the mixer only enumerates if it is powered on with the USB cable already plugged in. If it does not show up, power it off, plug in the cable, then power it on.
+
+More on how it behaves (sample rates, restarts, sleep, logs, security): [macos/USERSPACE.md](macos/USERSPACE.md). Open follow-ups: [TODO.md](TODO.md).
+
+---
+<!-- /fork -->
+
 **Bringing legacy professional audio hardware back to life.**
 
 Modern operating systems dropped support for non-class compliant USB audio devices—hardware that doesn't follow the standard USB Audio Class specification. These devices require vendor-specific drivers, and when manufacturers abandon them, perfectly good professional equipment becomes unusable.
@@ -60,7 +90,7 @@ These use the same Ploytec chip. Their channels, rates and setup requests come f
 | **Allen & Heath MixWizard WZ4 USB** | 16 / 2 | 44.1–96 kHz |  |
 | **Alesis MultiMix 8 / 8 FX / 16 USB 2.0** | 10 / 2 | 44.1/48 kHz | Channels from a MultiMix 8; the 16 may have more inputs |
 | **Allen & Heath Xone:2D** | 8 / 8 | 44.1–96 kHz |  |
-| **Dynacord CMS 600-3** (Ploytec revision) | 4 / 4 | 44.1/48/96 kHz | First MIDI port (DIN) only. The later class-compliant revision needs no driver; on Windows, don't install Ozzy for it |
+| **Dynacord CMS 600-3** (Ploytec revision) | 4 / 4 | 44.1/48/96 kHz | Both MIDI ports (DIN and SystemCtrl) on Linux and macOS; the Windows driver has the first (DIN) only. The later class-compliant revision needs no driver; on Windows, don't install Ozzy for it |
 | **ESI ESU1808** | 16 / 8 | 44.1–96 kHz | S/PDIF out mirrors outputs 1/2 |
 | **ESI U86 XT** | 8 / 6 | 44.1–96 kHz |  |
 | **ESI U108 PRE** | 10 / 8 | 44.1–96 kHz |  |
